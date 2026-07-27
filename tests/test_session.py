@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import stat
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +33,7 @@ from scraper.session import (
     REQUIRED_COOKIES,
     ChallengeDetected,
     CookieDict,
+    ManualLoginTimeout,
     ShopeeSession,
 )
 
@@ -910,6 +912,470 @@ def test_bootstrap_alias_returns_a_mapping(
     mapping = sess.bootstrap(force=True)
     assert isinstance(mapping, dict)
     assert mapping["csrftoken"] == "csrf-secret"
+
+
+# ---------------------------------------------------------------------------
+# Manual login — the human types, the tool only harvests
+#
+# The doubles below are deliberately *stricter* than the bootstrap fakes: the
+# page raises on every attribute the production code is not allowed to use, so
+# "the form is never touched" is enforced by the mock rather than by review.
+# ---------------------------------------------------------------------------
+
+
+class StrictManualPage:
+    """A page that fails the test the instant the login form is touched.
+
+    Only ``goto``, ``wait_for_timeout`` and ``close`` are permitted. Every other
+    attribute access — ``fill``, ``click``, ``type``, ``press``, ``locator``,
+    ``get_by_label``, ``wait_for_selector``, ``keyboard``, ``evaluate``, anything
+    at all — raises, and is also recorded in :attr:`touched` so a test can assert
+    on it directly.
+    """
+
+    def __init__(
+        self,
+        context: "ManualContext",
+        *,
+        on_goto: Callable[["StrictManualPage", str], None] | None = None,
+    ) -> None:
+        self.context = context
+        self.url = ""
+        self.goto_calls: list[str] = []
+        self.pauses: list[int] = []
+        self.touched: list[str] = []
+        self.closed = False
+        self._on_goto = on_goto
+
+    def goto(self, url: str, **_kwargs: Any) -> None:
+        self.goto_calls.append(url)
+        self.url = url
+        if self._on_goto:
+            self._on_goto(self, url)
+
+    def wait_for_timeout(self, milliseconds: int) -> None:
+        self.pauses.append(milliseconds)
+
+    def close(self) -> None:
+        self.closed = True
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached for attributes not defined above.
+        self.__dict__.setdefault("touched", []).append(name)
+        raise AssertionError(
+            f"the manual login touched page.{name}() — it must never locate, read, "
+            "fill, type into, click or submit anything on the login page"
+        )
+
+
+class ManualContext:
+    """Context whose jar gains ``SPC_EC`` after ``login_after`` reads."""
+
+    def __init__(
+        self,
+        *,
+        login_after: int = 1,
+        cookies_error: BaseException | None = None,
+        page_factory: Callable[["ManualContext"], Any] | None = None,
+    ) -> None:
+        self.reads = 0
+        self.login_after = login_after
+        self.cookies_error = cookies_error
+        self.extra: list[CookieDict] = []
+        self.closed = False
+        self.page: Any = None
+        self._page_factory = page_factory or (lambda ctx: StrictManualPage(ctx))
+
+    def cookies(self) -> list[CookieDict]:
+        self.reads += 1
+        if self.cookies_error is not None and self.reads > 1:
+            raise self.cookies_error
+        jar = anonymous_jar() + list(self.extra)
+        if self.reads > self.login_after:
+            jar.append(cookie("SPC_EC", "logged-in-secret"))
+        return jar
+
+    def new_page(self) -> Any:
+        self.page = self._page_factory(self)
+        return self.page
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ManualBrowser:
+    """Browser handing out one :class:`ManualContext`."""
+
+    def __init__(self, context: ManualContext) -> None:
+        self.context = context
+        self.context_kwargs: dict[str, Any] = {}
+        self.closed = False
+
+    def new_context(self, **kwargs: Any) -> ManualContext:
+        self.context_kwargs = kwargs
+        return self.context
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def install_manual_playwright(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    login_after: int = 1,
+    launch_error: Exception | None = None,
+    cookies_error: BaseException | None = None,
+    page_factory: Callable[[ManualContext], Any] | None = None,
+) -> FakePlaywright:
+    """Patch ``_sync_playwright`` with the strict manual-login driver."""
+    context = ManualContext(
+        login_after=login_after, cookies_error=cookies_error, page_factory=page_factory
+    )
+    browser = ManualBrowser(context)
+    driver = FakePlaywright(FakeChromium(browser, launch_error))  # type: ignore[arg-type]
+    monkeypatch.setattr(session_mod, "_sync_playwright", lambda: driver)
+    return driver
+
+
+def manual_parts(driver: FakePlaywright) -> tuple[ManualBrowser, ManualContext, Any]:
+    """Unpack ``(browser, context, page)`` out of a manual-login driver."""
+    browser = driver.chromium.browser  # type: ignore[assignment]
+    return browser, browser.context, browser.context.page  # type: ignore[return-value]
+
+
+def forbid_login_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the credential-driven login path explode if it is ever entered."""
+
+    def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("manual_login must not use the credential login path")
+
+    monkeypatch.setattr(ShopeeSession, "_attempt_login", _boom)
+    monkeypatch.setattr(ShopeeSession, "_first_selector", _boom)
+
+
+def test_manual_login_forces_a_visible_browser_ignoring_settings(
+    settings: StubSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HEADLESS=true must not produce an invisible window nobody can type into."""
+    settings.headless = True
+    sess = ShopeeSession(settings)  # type: ignore[arg-type]
+    driver = install_manual_playwright(monkeypatch)
+
+    sess.manual_login(timeout_s=30, poll_s=0.01)
+
+    assert driver.chromium.launch_kwargs["headless"] is False
+
+
+def test_manual_login_never_touches_the_login_form(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    forbid_login_helpers(monkeypatch)
+    driver = install_manual_playwright(monkeypatch, login_after=2)
+
+    sess.manual_login(timeout_s=30, poll_s=0.01)
+
+    _browser, _context, page = manual_parts(driver)
+    assert page.touched == [], "no locator/fill/click/type may ever be attempted"
+    assert page.goto_calls == [
+        "https://shopee.co.id/buyer/login",
+        "https://shopee.co.id",
+    ], "the only navigations are to the login page and the post-login warm-up"
+
+
+def executable_source(func: Any) -> str:
+    """Return a function's code with docstrings and comments stripped out.
+
+    Lets a test assert on what the code *does* without tripping over a docstring
+    that legitimately names the very thing the code must not use.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list) or not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            node.body = body[1:] or [ast.Pass()]
+    return ast.unparse(tree)
+
+
+def test_manual_login_code_never_references_the_credential_machinery() -> None:
+    """Structural guard: the form constants must not creep back onto this path."""
+    code = "\n".join(
+        executable_source(func)
+        for func in (
+            ShopeeSession.manual_login,
+            ShopeeSession._run_manual_login_browser,
+            ShopeeSession._poll_for_authenticated_jar,
+            ShopeeSession._settle_after_manual_login,
+            ShopeeSession._close_quietly,
+        )
+    )
+    for forbidden in (
+        "USERNAME_SELECTORS",
+        "PASSWORD_SELECTORS",
+        "SUBMIT_SELECTORS",
+        "shopee_password",
+        "shopee_username",
+        "_attempt_login",
+        "_first_selector",
+        ".fill(",
+        ".click(",
+        "wait_for_selector",
+        "has_credentials",
+    ):
+        assert forbidden not in code, f"{forbidden} must not appear in the manual login path"
+
+
+def test_manual_login_returns_as_soon_as_an_auth_cookie_appears(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = install_manual_playwright(monkeypatch, login_after=3)
+
+    started = time.monotonic()
+    jar = sess.manual_login(timeout_s=60, poll_s=0.01)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5.0, "polling must return promptly, not sit out the timeout"
+    assert any(c["name"] == "SPC_EC" for c in jar)
+    _browser, context, _page = manual_parts(driver)
+    assert context.reads >= 4
+
+
+def test_manual_login_persists_through_the_existing_save_path(
+    settings: StubSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    custom = "Mozilla/5.0 (Macintosh) Chrome/151.0.0.0 Safari/537.36"
+    sess = ShopeeSession(settings, user_agent=custom)  # type: ignore[arg-type]
+    install_manual_playwright(monkeypatch)
+
+    jar = sess.manual_login(timeout_s=30, poll_s=0.01)
+
+    document = json.loads(sess.cookies_path.read_text(encoding="utf-8"))
+    assert document["authenticated"] is True
+    assert document["user_agent"] == custom
+    assert [c["name"] for c in document["cookies"]] == [c["name"] for c in jar]
+    assert stat.S_IMODE(sess.cookies_path.stat().st_mode) == 0o600
+    assert sess.authenticated is True
+
+    reader = ShopeeSession(settings)  # type: ignore[arg-type]
+    reader.load_cookies()
+    assert reader.authenticated is True
+    assert reader.user_agent == custom
+
+
+def test_manual_login_warms_up_and_reharvests_the_settled_jar(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shopee tops the jar up on the first authenticated page load."""
+
+    def add_cookie_on_homepage(page: StrictManualPage, url: str) -> None:
+        if url.rstrip("/") == "https://shopee.co.id":
+            page.context.extra.append(cookie("SPC_ST", "settled-secret"))
+
+    install_manual_playwright(
+        monkeypatch,
+        page_factory=lambda ctx: StrictManualPage(ctx, on_goto=add_cookie_on_homepage),
+    )
+
+    jar = sess.manual_login(timeout_s=30, poll_s=0.01)
+
+    names = [c["name"] for c in jar]
+    assert "SPC_EC" in names and "SPC_ST" in names
+
+
+def test_manual_login_keeps_the_login_jar_when_the_warm_up_fails(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def explode_on_homepage(_page: StrictManualPage, url: str) -> None:
+        if url.rstrip("/") == "https://shopee.co.id":
+            raise RuntimeError("net::ERR_CONNECTION_RESET")
+
+    install_manual_playwright(
+        monkeypatch,
+        page_factory=lambda ctx: StrictManualPage(ctx, on_goto=explode_on_homepage),
+    )
+
+    jar = sess.manual_login(timeout_s=30, poll_s=0.01)
+    assert any(c["name"] == "SPC_EC" for c in jar)
+    assert json.loads(sess.cookies_path.read_text(encoding="utf-8"))["authenticated"] is True
+
+
+def test_manual_login_timeout_raises_and_keeps_the_existing_good_jar(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    good = anonymous_jar() + [cookie("SPC_EC", "previous-login-secret")]
+    sess.authenticated = True
+    sess.save_cookies(good)
+    before = sess.cookies_path.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(session_mod, "MANUAL_LOGIN_HEARTBEAT_S", 0.0)
+    driver = install_manual_playwright(monkeypatch, login_after=10**9)
+
+    with pytest.raises(ManualLoginTimeout) as excinfo:
+        sess.manual_login(timeout_s=1, poll_s=0.05)
+
+    message = str(excinfo.value)
+    assert "1s" in message and "ecom-scraper login" in message
+    assert excinfo.value.timeout_s == 1
+    assert sess.cookies_path.read_text(encoding="utf-8") == before, (
+        "a timed-out manual login must not touch a jar that already works"
+    )
+    assert "waiting for you to finish logging in" in capsys.readouterr().out
+
+    browser, context, page = manual_parts(driver)
+    assert (browser.closed, context.closed, page.closed) == (True, True, True)
+
+
+def test_manual_login_timeout_creates_no_jar_at_all_when_none_existed(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_manual_playwright(monkeypatch, login_after=10**9)
+    with pytest.raises(ManualLoginTimeout):
+        sess.manual_login(timeout_s=1, poll_s=0.05)
+    assert not sess.cookies_path.exists()
+
+
+def test_manual_login_closes_everything_on_an_exception(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def explode(_page: StrictManualPage, _url: str) -> None:
+        raise RuntimeError("net::ERR_NAME_NOT_RESOLVED")
+
+    driver = install_manual_playwright(
+        monkeypatch, page_factory=lambda ctx: StrictManualPage(ctx, on_goto=explode)
+    )
+
+    with pytest.raises(RuntimeError, match="ERR_NAME_NOT_RESOLVED"):
+        sess.manual_login(timeout_s=30, poll_s=0.01)
+
+    browser, context, page = manual_parts(driver)
+    assert (browser.closed, context.closed, page.closed) == (True, True, True)
+    assert not sess.cookies_path.exists()
+
+
+def test_manual_login_turns_a_playwright_nav_failure_into_a_clear_runtime_error(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A nav timeout is a plain Exception; it must not escape unwrapped. Regression.
+
+    ``playwright._impl._errors.Error`` (and the TimeoutError subclassing it) is
+    neither RuntimeError nor ValueError, so a 45s timeout on the login page broke
+    this method's documented Raises contract and surfaced in the CLI as a bare
+    traceback instead of the promised message.
+    """
+
+    class PlaywrightishError(Exception):
+        """Same MRO as playwright's own Error: straight off Exception."""
+
+    def timeout(_page: StrictManualPage, _url: str) -> None:
+        raise PlaywrightishError("Page.goto: Timeout 45000ms exceeded.")
+
+    driver = install_manual_playwright(
+        monkeypatch, page_factory=lambda ctx: StrictManualPage(ctx, on_goto=timeout)
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        sess.manual_login(timeout_s=30, poll_s=0.01)
+
+    message = str(excinfo.value)
+    assert "https://shopee.co.id/buyer/login" in message
+    assert "Timeout 45000ms exceeded" in message
+    assert "ecom-scraper login" in message
+
+    browser, context, page = manual_parts(driver)
+    assert (browser.closed, context.closed, page.closed) == (True, True, True)
+    assert not sess.cookies_path.exists()
+
+
+def test_manual_login_closes_everything_on_keyboard_interrupt(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C is the expected way to abandon this command; it must not leak Chromium."""
+    driver = install_manual_playwright(
+        monkeypatch, login_after=10**9, cookies_error=KeyboardInterrupt()
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        sess.manual_login(timeout_s=30, poll_s=0.01)
+
+    browser, context, page = manual_parts(driver)
+    assert (browser.closed, context.closed, page.closed) == (True, True, True)
+    assert not sess.cookies_path.exists()
+
+
+def test_manual_login_reports_a_closed_window_clearly(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = install_manual_playwright(
+        monkeypatch,
+        login_after=10**9,
+        cookies_error=RuntimeError("Target page, context or browser has been closed"),
+    )
+
+    with pytest.raises(RuntimeError, match="browser window closed"):
+        sess.manual_login(timeout_s=30, poll_s=0.01)
+
+    browser, _context, _page = manual_parts(driver)
+    assert browser.closed is True
+
+
+def test_manual_login_needs_a_window_and_says_so(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_manual_playwright(
+        monkeypatch, launch_error=Exception("Missing X server or $DISPLAY")
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        sess.manual_login(timeout_s=30, poll_s=0.01)
+
+    message = str(excinfo.value)
+    assert "cannot run headless" in message
+    assert "playwright install chromium" in message
+
+
+def test_manual_login_uses_the_indonesian_browser_identity(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = install_manual_playwright(monkeypatch)
+    sess.manual_login(timeout_s=30, poll_s=0.01)
+
+    kwargs = driver.chromium.browser.context_kwargs  # type: ignore[union-attr]
+    assert kwargs["locale"] == "id-ID"
+    assert kwargs["timezone_id"] == "Asia/Jakarta"
+    assert kwargs["user_agent"] == DEFAULT_USER_AGENT
+
+
+@pytest.mark.parametrize(
+    ("timeout_s", "poll_s"), [(0, 2.0), (-1, 2.0), (600, 0.0), (600, -0.5)]
+)
+def test_manual_login_rejects_nonsense_timings_without_a_browser(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch, timeout_s: int, poll_s: float
+) -> None:
+    forbid_playwright(monkeypatch)
+    with pytest.raises(ValueError):
+        sess.manual_login(timeout_s=timeout_s, poll_s=poll_s)
+
+
+def test_manual_login_logs_names_and_counts_but_never_values(
+    sess: ShopeeSession, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    install_manual_playwright(monkeypatch)
+
+    with caplog.at_level(logging.DEBUG, logger="scraper.session"):
+        sess.manual_login(timeout_s=30, poll_s=0.01)
+
+    for secret in ("logged-in-secret", "spc-f-secret", "csrf-secret", "spc-si-secret"):
+        assert secret not in caplog.text
+    assert "SPC_EC" in caplog.text and "csrftoken" in caplog.text
 
 
 # ---------------------------------------------------------------------------

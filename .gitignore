@@ -1,6 +1,12 @@
 .venv/
 .env
+# Cookie jars are live sessions. COOKIES_PATH is configurable, so match the
+# material and not just the default filename: `COOKIES_PATH=shopee-cookies.json`
+# used to produce a file no rule covered, which `git add -A` then staged.
 cookies.json
+*cookies*.json
+*.jar.json
+*.tmp
 .recon/
 __pycache__/
 *.pyc

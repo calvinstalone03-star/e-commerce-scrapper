@@ -9,6 +9,7 @@ loop in :mod:`scraper.client`.
 Lifecycle::
 
     bootstrap_cookies()  # launch Chromium, visit Shopee, harvest cookies, save
+    manual_login()       # open a visible window, let a HUMAN log in, harvest
     load_cookies()       # read cookies.json back (used on every client startup)
     is_expired()         # cheap check the client runs before each batch
     save_cookies()       # persist a jar (also called by bootstrap)
@@ -20,6 +21,15 @@ may perform a login pass — but it must degrade to the logged-out jar rather th
 raise if login fails or a CAPTCHA/OTP challenge appears. This code never solves
 challenges; if one blocks progress it surfaces it so a human can run with
 ``HEADLESS=false``.
+
+:meth:`ShopeeSession.manual_login` is the other way in, and the one to reach for
+when Shopee's login wall (``/verify/traffic/error?...&is_logged_in=false``, "Masuk
+Diperlukan") is what stands between the scraper and ``search_items``. It opens a
+**visible** browser, navigates to the login page, and then keeps its hands off:
+the human types their own credentials and clears their own OTP/CAPTCHA, and this
+module does nothing but poll the cookie jar until an authenticated cookie shows
+up. Nothing in that path reads, fills, types into or even locates a credential
+field — see the guard rails documented on the method itself.
 
 Concurrency: **sync API**. See the note at the top of :mod:`scraper.client` for
 why the whole package is deliberately synchronous.
@@ -63,6 +73,7 @@ import os
 import random
 import stat
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypedDict
@@ -74,6 +85,7 @@ __all__ = [
     "CookieDict",
     "ShopeeSession",
     "ChallengeDetected",
+    "ManualLoginTimeout",
     "SHOPEE_BASE_URL",
     "DEFAULT_USER_AGENT",
 ]
@@ -124,6 +136,14 @@ LOGIN_SETTLE_MS = 8_000
 #: How long a headful run waits for a human to clear a challenge before failing.
 MANUAL_CHALLENGE_TIMEOUT_MS = 180_000
 
+#: Seconds between "still waiting for you" heartbeats during a manual login.
+#: Every poll would be noise; silence would look like a hang.
+MANUAL_LOGIN_HEARTBEAT_S = 15.0
+#: How long the homepage is given to settle after a manual login before the jar
+#: is re-harvested. Shopee finishes minting the post-login cookie set on the
+#: first authenticated page load, not on the login POST itself.
+MANUAL_LOGIN_SETTLE_MS = 3_000
+
 LOGIN_PATH = "/buyer/login"
 USERNAME_SELECTORS = ('input[name="loginKey"]', 'form input[type="text"]')
 PASSWORD_SELECTORS = ('input[name="password"]', 'form input[type="password"]')
@@ -166,6 +186,23 @@ class ChallengeDetected(RuntimeError):
         self.url = url
 
 
+class ManualLoginTimeout(TimeoutError):
+    """Nobody finished logging in before :meth:`ShopeeSession.manual_login` gave up.
+
+    Carries the deadline that elapsed so the message can name it, and is raised
+    *instead of* saving anything: a timed-out manual login must leave whatever jar
+    was already on disk untouched.
+
+    Attributes:
+        timeout_s: The deadline, in seconds, that was exceeded.
+    """
+
+    def __init__(self, message: str, *, timeout_s: int) -> None:
+        """Store the elapsed deadline alongside the message."""
+        super().__init__(message)
+        self.timeout_s = timeout_s
+
+
 def _sync_playwright() -> Any:
     """Return an unentered ``playwright.sync_api.sync_playwright()`` manager.
 
@@ -200,6 +237,19 @@ def _cookie_names(cookies: list[CookieDict]) -> list[str]:
         The names, in jar order.
     """
     return [str(c.get("name", "")) for c in cookies]
+
+
+def _has_cookie(cookies: list[CookieDict], name: str) -> bool:
+    """Whether a jar carries a cookie of this name. Values are never compared.
+
+    Args:
+        cookies: Jar to inspect.
+        name: Cookie name to look for.
+
+    Returns:
+        True if present.
+    """
+    return any(str(c.get("name", "")) == name for c in cookies)
 
 
 class ShopeeSession:
@@ -580,7 +630,12 @@ class ShopeeSession:
             names = {str(c.get("name", "")) for c in (context.cookies() or [])}
             authenticated = any(name in names for name in AUTHENTICATED_COOKIES)
             if authenticated:
-                log.info("Login succeeded for user %r; jar is authenticated.", username)
+                # The identifier is deliberately not logged: `-v --log-file` opens
+                # a plain-text handler at INFO, so naming the account would write
+                # half a credential pair — plus confirmation that it is valid —
+                # into a file on disk. Only one account can be configured, so the
+                # name adds nothing operationally.
+                log.info("Login succeeded; jar is authenticated.")
             else:
                 log.warning(
                     "Login did not produce an authenticated cookie (looked for %s); "
@@ -635,6 +690,307 @@ class ShopeeSession:
         return _normalise_cookies(raw, default_domain=self._default_cookie_domain())
 
     # ------------------------------------------------------------------
+    # Manual login — the human types, this code only watches the jar
+    # ------------------------------------------------------------------
+
+    def manual_login(self, timeout_s: int = 600, poll_s: float = 2.0) -> list[CookieDict]:
+        """Open a visible browser, wait for a *human* to log in, harvest the jar.
+
+        This is the answer to Shopee's login wall. ``/api/v4/search/search_items``
+        and ``/api/v4/shop/get_shop_tab`` answer a logged-out caller with HTTP 200
+        and a 119-byte ``{"error":90309999,...}`` body, and the page itself
+        redirects to ``/verify/traffic/error?...&is_logged_in=false`` ("Masuk
+        Diperlukan"). Requests fired from inside a live page are fully signed by
+        Shopee's own SDK and are rejected all the same, so signing is not the
+        gate — being logged in is. The only supported way through is for the
+        account's owner to log in themselves.
+
+        What this method does, in order:
+
+        1. Launches Chromium with ``headless=False`` **unconditionally**.
+           ``Settings.headless`` is deliberately ignored: a manual login nobody
+           can see is a contradiction, so a platform that cannot open a window
+           gets a clear error rather than a browser that waits forever offscreen.
+        2. Navigates to ``<base_url>/buyer/login`` and stops touching the page.
+        3. Polls ``context.cookies()`` every ``poll_s`` seconds for any of
+           :data:`AUTHENTICATED_COOKIES`, printing a heartbeat with the remaining
+           time every :data:`MANUAL_LOGIN_HEARTBEAT_S` seconds.
+        4. On success, loads the homepage once so the post-login cookie set
+           finishes minting, re-harvests, and persists through
+           :meth:`save_cookies` — same envelope, same ``0600`` file, same
+           recorded user agent as a bootstrap.
+
+        What this method never does, and what no future edit may add to it:
+
+        * it never locates, reads, fills, types into, clicks or submits the
+          username, password or OTP fields — :data:`USERNAME_SELECTORS`,
+          :data:`PASSWORD_SELECTORS` and :data:`SUBMIT_SELECTORS` are not
+          referenced anywhere on this path;
+        * it never solves or bypasses a CAPTCHA, slider or OTP challenge;
+        * it never reads credentials from settings, the environment or anywhere
+          else. The credential-driven :meth:`_attempt_login` is a separate,
+          untouched path used only by :meth:`bootstrap_cookies`.
+
+        Args:
+            timeout_s: How long to wait for the login to complete, in seconds.
+            poll_s: Seconds between cookie-jar polls.
+
+        Returns:
+            The harvested jar, in Playwright ``storage_state`` shape, already
+            persisted to :attr:`cookies_path` with ``authenticated=true``.
+
+        Raises:
+            ValueError: If ``timeout_s`` or ``poll_s`` is not positive.
+            ManualLoginTimeout: If no authenticated cookie appeared in time. The
+                existing jar on disk is left exactly as it was.
+            RuntimeError: If a visible Chromium cannot be launched, or if the
+                window was closed before the login finished.
+        """
+        if timeout_s <= 0:
+            raise ValueError(f"timeout_s must be positive, got {timeout_s}")
+        if poll_s <= 0:
+            raise ValueError(f"poll_s must be positive, got {poll_s}")
+
+        log.info(
+            "Manual login: opening a visible Chromium at %s%s (waiting up to %ds)",
+            self.base_url,
+            LOGIN_PATH,
+            timeout_s,
+        )
+        cookies = self._run_manual_login_browser(timeout_s=timeout_s, poll_s=poll_s)
+
+        # Only reached once an authenticated cookie is actually in hand, so the
+        # save below can never overwrite a good jar with a logged-out one.
+        self.authenticated = True
+        self.save_cookies(cookies)
+        log.info(
+            "Manual login captured %d cookies (authenticated=True): %s",
+            len(cookies),
+            ", ".join(_cookie_names(cookies)),
+        )
+        missing = self._missing_required(cookies)
+        if missing:
+            log.warning(
+                "Cookie jar is missing expected names %s — the API may reject it.",
+                ", ".join(missing),
+            )
+        return cookies
+
+    def _run_manual_login_browser(self, *, timeout_s: int, poll_s: float) -> list[CookieDict]:
+        """Drive the whole visible-browser manual login and return its jar.
+
+        Split out of :meth:`manual_login` so that persistence happens strictly
+        after the browser is closed: nothing is written while a window the user
+        may ``ctrl-C`` at any moment is still open.
+
+        Args:
+            timeout_s: Deadline for the human to finish, in seconds.
+            poll_s: Seconds between cookie-jar polls.
+
+        Returns:
+            The harvested, authenticated jar.
+
+        Raises:
+            ManualLoginTimeout: The deadline passed with no authenticated cookie.
+            RuntimeError: Chromium could not be launched visibly, the login page
+                could not be reached, or the window went away mid-login.
+        """
+        deadline = time.monotonic() + timeout_s
+
+        with _sync_playwright() as pw:
+            browser: Any = None
+            context: Any = None
+            page: Any = None
+            try:
+                try:
+                    # headless is hardcoded False on purpose. Do not thread
+                    # Settings.headless in here.
+                    browser = pw.chromium.launch(
+                        headless=False,
+                        args=["--disable-blink-features=AutomationControlled"],
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Could not open a visible browser window for the manual login. "
+                        "This command cannot run headless — you have to be able to see "
+                        "the page to type into it. Run it on a desktop session (not a "
+                        "bare SSH shell), and make sure the browser binary is installed "
+                        "with: python -m playwright install chromium "
+                        f"(original error: {exc})"
+                    ) from exc
+
+                context = browser.new_context(
+                    user_agent=self.user_agent,
+                    locale=LOCALE,
+                    timezone_id=TIMEZONE_ID,
+                    viewport=dict(VIEWPORT),
+                    extra_http_headers={"Accept-Language": ACCEPT_LANGUAGE},
+                )
+                page = context.new_page()
+                login_url = f"{self.base_url}{LOGIN_PATH}"
+                try:
+                    page.goto(
+                        login_url,
+                        wait_until="domcontentloaded",
+                        timeout=NAV_TIMEOUT_MS,
+                    )
+                except Exception as exc:
+                    # Playwright's Error/TimeoutError are plain Exceptions, so
+                    # letting them out unwrapped broke this method's documented
+                    # contract and reached the CLI as a bare traceback. The
+                    # realistic trigger is a slow connection missing the 45s
+                    # navigation timeout.
+                    raise RuntimeError(
+                        f"Could not open Shopee's login page at {login_url} within "
+                        f"{NAV_TIMEOUT_MS // 1000}s ({type(exc).__name__}: {exc}). "
+                        "Nothing was saved and any existing jar is untouched. Check "
+                        "that the site loads in a normal browser, then re-run "
+                        "`ecom-scraper login`."
+                    ) from exc
+                # From here on the page is the human's. Nothing below touches it
+                # except to poll cookies and, after success, to load the homepage.
+                harvested = self._poll_for_authenticated_jar(
+                    context, deadline=deadline, poll_s=poll_s
+                )
+                if harvested is None:
+                    raise ManualLoginTimeout(
+                        f"no Shopee login completed within {timeout_s}s, so no "
+                        f"authenticated cookie ({' or '.join(AUTHENTICATED_COOKIES)}) "
+                        "ever appeared. Nothing was saved and any existing jar is "
+                        "untouched. Re-run `ecom-scraper login` — add "
+                        "`--timeout 1200` if you need longer than "
+                        f"{timeout_s}s at the keyboard.",
+                        timeout_s=timeout_s,
+                    )
+                return self._settle_after_manual_login(page, context, harvested)
+            finally:
+                # Runs on success, on timeout, on a Playwright error and on the
+                # KeyboardInterrupt the operator is very likely to send: this
+                # command's whole job is to sit and wait. Nothing here may raise
+                # or a leaked Chromium becomes the least of the problems.
+                self._close_quietly(page, context, browser)
+
+    def _poll_for_authenticated_jar(
+        self, context: Any, *, deadline: float, poll_s: float
+    ) -> list[CookieDict] | None:
+        """Watch the cookie jar until a login lands or the deadline passes.
+
+        The jar is the only thing inspected. The page is never queried for state,
+        so a redesigned login form, an OTP step or a CAPTCHA in the middle costs
+        nothing here — whatever the human has to do, the cookies show up when it
+        is done.
+
+        Args:
+            context: Playwright browser context.
+            deadline: ``time.monotonic()`` value after which to give up.
+            poll_s: Seconds between polls.
+
+        Returns:
+            The harvested jar as soon as it carries an authenticated cookie, or
+            None if the deadline passed first.
+
+        Raises:
+            RuntimeError: If the browser window went away while we were waiting.
+        """
+        last_beat = time.monotonic()
+        while True:
+            try:
+                cookies = self._harvest(context)
+            except Exception as exc:
+                raise RuntimeError(
+                    "The browser window closed before the login finished, so no "
+                    "cookies were captured. Nothing was saved. Re-run "
+                    "`ecom-scraper login` and leave the window open until the "
+                    f"command says it is done ({type(exc).__name__}: {exc})."
+                ) from exc
+
+            found = [name for name in AUTHENTICATED_COOKIES if _has_cookie(cookies, name)]
+            if found:
+                log.info(
+                    "Manual login detected: %s present in the jar (%d cookies).",
+                    ", ".join(found),
+                    len(cookies),
+                )
+                return cookies
+
+            now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                return None
+            if now - last_beat >= MANUAL_LOGIN_HEARTBEAT_S:
+                last_beat = now
+                print(
+                    f"  ... waiting for you to finish logging in "
+                    f"({int(remaining)}s left)",
+                    flush=True,
+                )
+            time.sleep(min(poll_s, remaining))
+
+    def _settle_after_manual_login(
+        self, page: Any, context: Any, harvested: list[CookieDict]
+    ) -> list[CookieDict]:
+        """Load the homepage once so the jar settles, then re-harvest.
+
+        Shopee tops the cookie set up on the first authenticated page load, so the
+        jar read the instant ``SPC_EC`` appears is usually a cookie or two short of
+        what the httpx loop wants.
+
+        Args:
+            page: Playwright page.
+            context: Playwright browser context.
+            harvested: The jar as read the moment the login was detected. Used as
+                the fallback for every failure mode here — a warm-up problem must
+                never cost us a login the human already completed.
+
+        Returns:
+            The settled jar, or ``harvested`` when the warm-up did not improve it.
+        """
+        try:
+            page.goto(self.base_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            page.wait_for_timeout(MANUAL_LOGIN_SETTLE_MS)
+            settled = self._harvest(context)
+        except Exception:
+            log.debug(
+                "Warm-up after the manual login failed; keeping the jar as harvested",
+                exc_info=True,
+            )
+            return harvested
+
+        if not any(_has_cookie(settled, name) for name in AUTHENTICATED_COOKIES):
+            log.warning(
+                "The warm-up navigation dropped the authenticated cookie; keeping the "
+                "jar exactly as it was when the login completed."
+            )
+            return harvested
+        log.debug(
+            "Jar after warm-up: %d cookies (%s)",
+            len(settled),
+            ", ".join(_cookie_names(settled)),
+        )
+        return settled
+
+    @staticmethod
+    def _close_quietly(page: Any, context: Any, browser: Any) -> None:
+        """Close page, context and browser, swallowing every failure.
+
+        Called from a ``finally``, including on ``KeyboardInterrupt``. Each handle
+        is closed independently so one broken handle cannot strand the next — a
+        leaked Chromium outlives the process and keeps holding the profile.
+
+        Args:
+            page: Playwright page, or None if it was never created.
+            context: Playwright browser context, or None.
+            browser: Playwright browser, or None.
+        """
+        for handle, label in ((page, "page"), (context, "context"), (browser, "browser")):
+            if handle is None:
+                continue
+            try:
+                handle.close()
+            except Exception:  # pragma: no cover - close is best effort
+                log.debug("Ignoring error while closing the %s", label, exc_info=True)
+
+    # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
@@ -675,9 +1031,11 @@ class ShopeeSession:
 
         Writes to a sibling temp file and ``os.replace``s it into position so a
         crash mid-write cannot leave a half-written jar behind. Creates parent
-        directories as needed. The file is gitignored — it is credential-grade
-        material and must never be committed, and is written ``0600`` so other
-        local accounts cannot read the session either.
+        directories as needed. The jar is credential-grade material and must
+        never be committed: it is always written ``0600`` so other local accounts
+        cannot read the session, and ``.gitignore`` covers the default name plus
+        anything matching ``*cookies*.json`` — a ``COOKIES_PATH`` outside those
+        patterns has to be added there by hand.
 
         Args:
             cookies: Jar to write, in Playwright ``storage_state`` shape.

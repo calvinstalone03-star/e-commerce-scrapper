@@ -86,6 +86,77 @@ Logged out is the default and supported posture. `--login` requires
 You rarely need to run this by hand: the client re-bootstraps itself once when it
 gets blocked mid-run.
 
+### Logged out is not enough any more: `ecom-scraper login`
+
+`/api/v4/search/search_items` now answers a logged-out caller with **HTTP 200 and
+a 119-byte `{"error":90309999,...}` refusal**, and the page behind it redirects to
+a *Masuk Diperlukan* ("Login Required") wall. Requests fired from inside a real
+browser page are fully signed by Shopee's own SDK and are refused all the same —
+signing is not the gate, being logged in is.
+
+```bash
+ecom-scraper login                 # opens a window, waits up to 10 minutes
+ecom-scraper login --timeout 1200  # wait longer at the keyboard
+```
+
+A real browser window opens on Shopee's login page and then the tool keeps its
+hands off it:
+
+- **You** type your own username, password and OTP, and clear your own CAPTCHA.
+  This tool never sees, fills, types, saves or logs a credential, never touches a
+  challenge, and never asks you for one. It has no way to log in for you.
+- All it does is poll the browser's cookie jar every couple of seconds, printing
+  a heartbeat with the time left, and stop the moment a logged-in session cookie
+  (`SPC_EC` / `SPC_ST`) appears.
+- It then loads the homepage once so the jar settles, and saves it through the
+  same `0600` path `bootstrap` uses — same envelope, same recorded user agent.
+
+Ctrl-C is safe at any point: the browser is always closed, and a cancelled or
+timed-out login never overwrites cookies you already have. Cookie **names** are
+printed, values never are. `--headless` is not an option here and `HEADLESS` is
+ignored — a login nobody can see is a contradiction.
+
+### Did that actually unlock anything? `ecom-scraper doctor`
+
+```bash
+ecom-scraper doctor                      # human-readable table
+ecom-scraper doctor --json               # machine-readable
+ecom-scraper doctor --username erigostore --keyword "sepatu pria"
+```
+
+Probes the five known endpoints once each, a few seconds apart, using the jar on
+disk exactly as it is — no browser is launched, no cookie is re-minted.
+
+```
+                          endpoint doctor
+┏━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━┓
+┃ endpoint         ┃ http status ┃ envelope error ┃ items found ┃ verdict ┃
+┡━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━┩
+│ get_shop_base_v2 │         200 │              0 │           1 │ OK      │
+│ get_shop_detail  │         200 │              0 │           1 │ OK      │
+│ get_shop_seo     │         200 │              0 │           1 │ OK      │
+│ get_categories   │         200 │              0 │          20 │ OK      │
+│ search_items     │         200 │       90309999 │           0 │ BLOCKED │
+└──────────────────┴─────────────┴────────────────┴─────────────┴─────────┘
+4/5 endpoint(s) usable, 1 blocked · verdict is read from the response envelope, not the HTTP status
+  search_items: envelope error 90309999 — Shopee's anti-bot refusal (served with HTTP 200)
+```
+
+**The verdict comes from the payload envelope, never from the status line** — as
+the last row shows, a refusal arrives as `200 OK`. Four verdicts:
+
+| verdict | means |
+| --- | --- |
+| `OK` | success, with rows |
+| `EMPTY` | success with nothing in it — a keyword nothing matched, a shop with no custom categories. The session works |
+| `ERROR` | the endpoint's own error ("shop not found"). Fresh cookies cannot fix it |
+| `BLOCKED` | Shopee's refusal envelope, whatever status carried it. **The only verdict that means "log in / re-bootstrap"** |
+
+`BLOCKED` is decided by the same `scraper.client.is_soft_block` the scraper's
+transport uses, so `doctor` cannot disagree with the thing it is diagnosing — and
+an empty-but-successful answer is never reported as a block. Run it right after
+`login` to see whether search opened up.
+
 ## 3. Run — keyword mode
 
 "Who sells this, and at what price?" Walks `search_items` for each phrase.
@@ -186,9 +257,9 @@ JOIN LATERAL (
 
 | Code | Meaning |
 |---|---|
-| `0` | Success — every target scraped |
-| `1` | Partial failure — some targets failed (`run` only) |
-| `2` | Usage or configuration error — missing file, empty target list, unreachable Postgres, missing credentials |
+| `0` | Success — every target scraped (`doctor` always exits `0`; read the verdicts) |
+| `1` | Partial failure — some targets failed (`run`), or the manual `login` timed out or was cancelled |
+| `2` | Usage or configuration error — missing file, empty target list, unreachable Postgres, missing credentials, no window available for `login` |
 
 Suitable for cron: `1` means "look at the log", `2` means "the setup is broken".
 
@@ -205,7 +276,7 @@ Real environment variables win over `.env`.
 | `HEADLESS` | `true` | Set `false` to watch the bootstrap or clear a challenge |
 | `MIN_DELAY` | `2.0` | Lower bound of the per-request random delay, seconds |
 | `MAX_DELAY` | `5.0` | Upper bound. Must be >= `MIN_DELAY` or startup fails |
-| `COOKIES_PATH` | `cookies.json` | Where the cookie jar is persisted (gitignored) |
+| `COOKIES_PATH` | `cookies.json` | Where the cookie jar is persisted. Always written `0600`; `.gitignore` covers `*cookies*.json`, so a path outside that pattern is yours to add |
 
 Target files (`config/keywords.txt`, `config/stores.txt`): one entry per line,
 blank lines and `#` comment lines ignored, duplicates collapsed. A `#` only

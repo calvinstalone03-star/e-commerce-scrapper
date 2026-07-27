@@ -15,10 +15,18 @@ Responsibilities of :class:`ShopeeClient`, in the order they apply to a request:
    id-ID``, the session's ``Cookie`` header and its ``X-CSRFToken``.
 3. **Retry** — tenacity, exponential backoff with jitter, on transport errors
    and 429/5xx.
-4. **Re-bootstrap** — on a 403 or a soft block (200 with an error envelope, or
+4. **Re-bootstrap** — on a 403 or a soft block (200 with a refusal envelope, or
    an HTML anti-bot interstitial where JSON was expected), call the
    ``on_blocked`` callback **at most once per request**, then retry once. A
    second block on the same request raises :class:`BlockedError`.
+
+   A soft block is not a lesser event than a 403: Shopee answers a refused
+   ``/api/v4/search/search_items`` with **HTTP 200 and a 119-byte body that says
+   denied** (``.recon/browser_capture.json`` request #6). Both therefore take the
+   *same* path here — :meth:`ShopeeClient._is_blocked` classifies them
+   identically and :meth:`ShopeeClient._on_block` handles them identically — so
+   there is exactly one recovery policy, one circuit breaker and one way for a
+   blocked target to be recorded as FAILED rather than as an empty success.
 
 Concurrency decision (binding on all downstream agents): this package is
 **synchronous**. The anti-ban posture mandates one session, no proxies and a
@@ -62,6 +70,10 @@ __all__ = [
     "BlockedError",
     "SHOPEE_API_BASE",
     "DEFAULT_HEADERS",
+    "BLOCK_ERROR_CODES",
+    "has_v4_error",
+    "is_block_envelope",
+    "is_soft_block",
 ]
 
 log = logging.getLogger(__name__)
@@ -135,9 +147,27 @@ MAX_INEFFECTIVE_REBOOTSTRAPS = 2
 #: request and one browser launch per discovery.
 SESSION_RECHECK_INTERVAL = 1800.0
 
-#: Shopee's own block codes. ``90309999`` is the one observed live in ``.recon/``
-#: on ``search_items`` / ``rcmd_items`` / ``pdp/get_pc``; it is emitted both as a
-#: 403 body and as a 200 body with obfuscated numeric keys.
+#: Shopee's own block codes, as *evidence*, not as the whole rule.
+#:
+#: ``90309999`` is the only code observed live (recon of 2026-07-27, logged out,
+#: residential IP). It arrives two ways, and the second is why this module cannot
+#: trust the status line:
+#:
+#: * as a **403** body from plain httpx — ``.recon/A_search_kaos_polos.json``,
+#:   ``.recon/C_shop_search_items.json``, ``.recon/D_rcmd_items.json``,
+#:   ``.recon/E_pdp_get_pc.json``;
+#: * as a **HTTP 200** body, 119 bytes, from inside a real logged-out browser
+#:   page — ``.recon/browser_capture.json`` request #6
+#:   (``/api/v4/search/search_items``) and #27 (``/api/v4/shop/get_shop_tab``):
+#:   ``{"5":false,"2":false,"4":2,"0":3,"3":90309999,"error":90309999,
+#:   "1":"9880b6c7939-...","9":true}``. Same refusal, ``200 OK`` on the wire.
+#:
+#: Note the second shape repeats the code under an obfuscated numeric key as well
+#: as under ``error``; :func:`is_block_envelope` therefore scans *values*, not
+#: only the ``error`` key. Because a new code inside that key-shuffled envelope
+#: would be unrecognisable by name, the general rules in
+#: :func:`is_block_envelope` / :func:`is_soft_block` — not this set — are what
+#: keeps detection working when Shopee changes the number.
 BLOCK_ERROR_CODES = frozenset({90309999})
 
 #: Substrings that mark an ``error_msg`` as an anti-bot refusal rather than a
@@ -154,8 +184,175 @@ BLOCK_ERROR_MARKERS = (
     "rate limit",
 )
 
+#: Keys that ride along with the refusal envelope and appear on nothing else.
+#: From ``.recon/A_search_kaos_polos.json`` (all five present) — they describe
+#: the *interstitial* Shopee wants the SPA to render, which is why a data
+#: endpoint's own error envelope never carries them. Two or more alongside a
+#: non-zero ``error`` identify the refusal without knowing its code.
+BLOCK_ENVELOPE_MARKER_KEYS = frozenset(
+    {"redirect_to_error_page", "tracking_id", "is_login", "action_type", "is_customized"}
+)
+
+#: Keys that make a body a *v4 application-error envelope* — an endpoint saying
+#: "your request was fine, the answer is no" (``{"error": 4, "error_msg": "shop
+#: not found", "data": null}``). Their absence next to a non-zero ``error`` is
+#: what marks a body as a refusal instead: the live block envelope carries
+#: neither an ``error_msg`` nor a ``data`` key.
+V4_ENVELOPE_KEYS = ("error_msg", "data")
+
 #: How much of a failing body is carried on the exception, for diagnosis.
 BODY_EXCERPT_CHARS = 500
+
+
+def has_v4_error(payload: Mapping[str, Any]) -> bool:
+    """Whether a decoded v4 body reports a non-zero ``error``.
+
+    Shopee's success envelope is ``"error": 0``; anything else means the body
+    carries no usable data, whatever the HTTP status said. Two shapes are
+    deliberately *not* errors, because misreading either would fail healthy runs:
+
+    * ``error`` absent entirely — ``{"data":"OK"}`` from ``/api/v4/web/subcart``
+      (``.recon/browser_capture.json`` #5) is a perfectly good answer;
+    * ``"error": null`` — ``/api/v4/abtest/traffic/get_web_experiments`` answers
+      ``{"data":[],"error":null,"error_msg":null,"debug":null,"retcode":0}``
+      (same capture, #3). A **null** error with an empty list is success with no
+      rows, which is exactly the state this module must not confuse with a block.
+
+    Args:
+        payload: Decoded top-level JSON object.
+
+    Returns:
+        True when the body reports an error code that is not zero.
+    """
+    if not isinstance(payload, Mapping) or "error" not in payload:
+        return False
+    error = payload["error"]
+    if error is None:
+        return False
+    if isinstance(error, bool):
+        return error
+    if isinstance(error, (int, float)):
+        return error != 0
+    if isinstance(error, str):
+        text = error.strip()
+        if not text:
+            return False
+        try:
+            return float(text) != 0.0
+        except ValueError:
+            # A non-numeric error string ("RISK_CONTROL") is still an error.
+            return True
+    return bool(error)
+
+
+def _looks_like_application_error(payload: Mapping[str, Any]) -> bool:
+    """Whether a non-zero error is an endpoint's own answer rather than a refusal.
+
+    An application error speaks the standard v4 envelope — it explains itself
+    with an ``error_msg`` that says something, and/or carries the ``data`` it
+    was able to fill. The anti-bot envelope has neither; it is a routing
+    instruction for the SPA that happens to reuse the ``error`` key.
+
+    The *substance* of those keys is what counts, not their presence. Accepting a
+    bare ``"error_msg": ""`` or ``"data": null`` as an explanation handed the
+    refusal a one-key escape hatch: a renumbered block carrying an empty
+    ``error_msg`` was downgraded to :attr:`PageVerdict.ERROR`, which means no
+    re-bootstrap, no :class:`BlockedError`, and no credit toward the runner's
+    consecutive-block abort — a fully blocked invocation would walk every
+    remaining target at full request volume.
+
+    Args:
+        payload: Decoded top-level JSON object with a non-zero ``error``.
+
+    Returns:
+        True when the body is shaped like a normal endpoint error.
+    """
+    message = payload.get("error_msg")
+    if isinstance(message, str) and message.strip():
+        return True
+    if message is not None and not isinstance(message, str):
+        # A structured error_msg (list/dict of validation problems) is still the
+        # endpoint explaining itself.
+        return bool(message)
+    return payload.get("data") is not None
+
+
+def is_block_envelope(payload: Mapping[str, Any]) -> bool:
+    """Detect Shopee's anti-bot JSON envelope in a decoded body.
+
+    Recognises, in order:
+
+    1. ``"redirect_to_error_page": true`` — the flag that sends the SPA to
+       ``/verify/traffic/error``;
+    2. any top-level integer matching :data:`BLOCK_ERROR_CODES`, which is what
+       catches the key-shuffled variant (``{"3": 90309999, "9": true, ...}``)
+       where no key is named ``error`` at all;
+    3. a non-zero ``error`` whose ``error_msg`` contains a
+       :data:`BLOCK_ERROR_MARKERS` substring;
+    4. a non-zero ``error`` sitting in an envelope carrying two or more
+       :data:`BLOCK_ENVELOPE_MARKER_KEYS` — the code-independent fingerprint, so
+       a renumbered refusal is still recognised.
+
+    This is status-independent: the same envelope arrives as a 403 body and as a
+    200 body, and the whole point is that it means the same thing either way.
+
+    Args:
+        payload: Decoded top-level JSON object.
+
+    Returns:
+        True when the payload is a block envelope.
+    """
+    if not isinstance(payload, Mapping):
+        return False
+
+    if payload.get("redirect_to_error_page") is True:
+        return True
+
+    for value in payload.values():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value in BLOCK_ERROR_CODES:
+            return True
+
+    if not has_v4_error(payload):
+        return False
+
+    message = str(payload.get("error_msg") or "").lower()
+    if any(marker in message for marker in BLOCK_ERROR_MARKERS):
+        return True
+
+    return len(BLOCK_ENVELOPE_MARKER_KEYS & set(payload)) >= 2
+
+
+def is_soft_block(payload: Mapping[str, Any]) -> bool:
+    """Classify a body that arrived under a *success* status as a block or not.
+
+    The soft block is the whole problem this function exists for: the status line
+    says 200, the payload says denied, and a caller that trusts the status
+    records a refused scrape as a successful run with zero items.
+
+    True when the body is a recognisable :func:`is_block_envelope`, **or** when
+    it reports a non-zero ``error`` (:func:`has_v4_error`) that it does not
+    explain as an application error (:func:`_looks_like_application_error`). The
+    second clause is the general rule: an unexplained non-zero error is not
+    usable data, and on a 200 the only thing that produces one is a refusal.
+
+    Callers must only apply this to bodies the transport delivered with a
+    non-error status. On a 404 the status is the honest answer — ``{"error": 4}``
+    there means "no such shop", not anti-bot — and treating it as a block would
+    spend a browser bootstrap on a page that simply does not exist.
+
+    Args:
+        payload: Decoded top-level JSON object from a sub-400 response.
+
+    Returns:
+        True when the response is a block despite its status.
+    """
+    if not isinstance(payload, Mapping):
+        return False
+    if is_block_envelope(payload):
+        return True
+    return has_v4_error(payload) and not _looks_like_application_error(payload)
 
 
 class ScraperHTTPError(RuntimeError):
@@ -438,10 +635,18 @@ class ShopeeClient:
                 block/bootstrap loop. Callers leave this True.
 
         Returns:
-            The decoded JSON object.
+            The decoded JSON object. A returned payload is *not* a promise that
+            it carries data: an application error that explains itself
+            (``{"error": 4, "error_msg": "shop not found"}``) comes back
+            unchanged, because fresh cookies cannot fix it. Any non-zero
+            ``error`` still means "no usable rows", and the caller must never
+            read one as an empty-but-successful page — see
+            :func:`scraper.adapters.shopee.classify_payload`.
 
         Raises:
-            BlockedError: Blocked, and re-bootstrapping did not clear it.
+            BlockedError: Blocked — by status, by interstitial, or by a soft
+                block (HTTP 200 carrying a refusal envelope) — and
+                re-bootstrapping did not clear it.
             ScraperHTTPError: Non-retryable HTTP status, or a body that is not
                 valid JSON.
         """
@@ -861,14 +1066,32 @@ class ShopeeClient:
 
         True when any of these hold:
 
-        * status is 403;
-        * ``Content-Type`` is HTML on an endpoint that must return JSON;
-        * the body decodes to JSON carrying a block envelope (Shopee uses a
-          non-zero top-level ``error`` with an ``error_msg`` mentioning a
-          blocked/forbidden condition).
+        * status is 403 or 429 (:data:`BLOCK_STATUS_CODES`);
+        * ``Content-Type`` is HTML on an endpoint that must return JSON, or the
+          body opens with markup — the login-wall interstitial;
+        * the body decodes to a recognisable :func:`is_block_envelope`,
+          whatever the status;
+        * the transport reported success (sub-400) but the body is a
+          :func:`is_soft_block` — a non-zero ``error`` the endpoint does not
+          explain. This is the 200-with-a-refusal case, and it returns True so
+          that a soft block takes the identical recovery path to a 403: one
+          forced re-bootstrap through :meth:`_on_block`, subject to the same
+          circuit breaker, then :class:`BlockedError`.
 
-        A 404 or an empty result set is **not** a block — those are legitimate
-        answers and must propagate to the adapter unchanged.
+        Not a block, and each one must stay that way:
+
+        * ``"error": 0`` with an empty item list — a successful empty result;
+        * ``"error": null`` beside ``"retcode": 0`` — the success shape of
+          ``get_web_experiments`` (see :func:`has_v4_error`);
+        * a 404, or any other 4xx that is not in :data:`BLOCK_STATUS_CODES` —
+          the status is the endpoint's honest answer, and :meth:`get_json`
+          raises :class:`ScraperHTTPError` for it rather than burning a browser
+          bootstrap;
+        * a non-zero ``error`` that explains itself (``{"error": 4, "error_msg":
+          "shop not found"}``). It is still not usable data, but it is the
+          *adapter's* problem, not the cookie jar's, so it is returned unchanged
+          for :mod:`scraper.adapters.shopee` to classify and refuse to count as
+          an empty page.
 
         Args:
             response: The response to classify.
@@ -897,37 +1120,13 @@ class ShopeeClient:
             return False
         if not isinstance(payload, dict):
             return False
-        return self._is_block_envelope(payload)
 
-    @staticmethod
-    def _is_block_envelope(payload: Mapping[str, Any]) -> bool:
-        """Detect Shopee's anti-bot JSON envelope in a decoded body.
-
-        Handles both shapes seen in ``.recon/``: the readable one
-        (``{"error": 90309999, "redirect_to_error_page": true, ...}``) and the
-        obfuscated one the SPA receives, where the same values arrive under
-        numeric string keys (``{"3": 90309999, "9": true, ...}``). Because the
-        key names are not stable, any top-level integer matching a known block
-        code counts.
-
-        Args:
-            payload: Decoded top-level JSON object.
-
-        Returns:
-            True when the payload is a block envelope.
-        """
-        if payload.get("redirect_to_error_page") is True:
+        # A recognised refusal envelope means the same thing under every status.
+        if is_block_envelope(payload):
             return True
 
-        for value in payload.values():
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, int) and value in BLOCK_ERROR_CODES:
-                return True
-
-        error = payload.get("error")
-        if isinstance(error, int) and not isinstance(error, bool) and error != 0:
-            message = str(payload.get("error_msg") or "").lower()
-            if any(marker in message for marker in BLOCK_ERROR_MARKERS):
-                return True
-        return False
+        # The general soft-block rule, applied only where it is sound: the
+        # transport claimed the request succeeded, so the payload is the only
+        # authority left. Above 400 the status already carries the meaning, and
+        # a 404's bare `{"error": 4}` must not be escalated into a block.
+        return response.status_code < 400 and is_soft_block(payload)

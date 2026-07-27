@@ -109,7 +109,10 @@ class Settings(BaseSettings):
     )
     cookies_path: Path = Field(
         default=DEFAULT_COOKIES_PATH,
-        description="Where ShopeeSession persists the harvested cookie jar. Gitignored.",
+        description="Where ShopeeSession persists the harvested cookie jar. Always "
+        "written 0600. .gitignore covers the default name and anything matching "
+        "*cookies*.json — point this somewhere else and it is on you to add that "
+        "path to .gitignore too.",
     )
 
     @field_validator("cookies_path", mode="before")

@@ -19,7 +19,18 @@ not:
 
 ``tests/fixtures/shopee_blocked.json``
     **REAL.** ``.recon/A_search_kaos_polos.json`` verbatim — the ``error: 90309999``
-    anti-bot envelope Shopee returned for keyword search.
+    anti-bot envelope Shopee returned for keyword search, as a **403** body to
+    plain httpx.
+
+``tests/fixtures/shopee_soft_block_search_items.json``
+    **REAL, AND THE POINT OF HALF THIS FILE.** Request #6 of
+    ``.recon/browser_capture.json`` byte for byte: ``GET
+    /api/v4/search/search_items`` issued from inside a real logged-out browser
+    page and answered **HTTP 200, content-type application/json, 119 bytes** —
+    ``{"5":false,...,"3":90309999,"error":90309999,...,"9":true}``. The status
+    line says the request succeeded; the body says denied. Everything that reads
+    "zero items" off a page has to survive this body, because a run that records
+    it as a success writes an empty competitor price picture and reports green.
 
 ``tests/fixtures/shopee_search_items_SYNTHETIC.json``
     **HAND-WRITTEN, NOT A CAPTURE.** Every recon attempt at
@@ -47,9 +58,11 @@ from scraper.adapters.shopee import (
     PRICE_DIVISOR,
     SEARCH_PAGE_SIZE,
     SHOP_PAGE_SIZE,
+    PageVerdict,
     ShopeeAdapter,
     build_image_url,
     build_product_url,
+    classify_payload,
     is_placeholder_username,
     normalise_username,
     parse_item,
@@ -74,6 +87,18 @@ def load_fixture(name: str) -> dict[str, Any]:
         The decoded JSON object.
     """
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+#: The real HTTP 200 soft block, decoded. Loaded once so every test below is
+#: driven by the same 119 bytes that came off the wire.
+SOFT_BLOCK_BODY: bytes = (FIXTURES / "shopee_soft_block_search_items.json").read_bytes()
+SOFT_BLOCK_PAYLOAD: dict[str, Any] = json.loads(SOFT_BLOCK_BODY)
+
+#: An *explained* application error: Shopee saying "no such shop" in the standard
+#: v4 envelope. The ``error_msg`` is what separates it from a refusal — a
+#: non-zero error with an empty message and no data is unexplained, and
+#: ``client.is_soft_block`` classifies that as a block.
+NOT_FOUND_PAYLOAD: dict[str, Any] = {"error": 4, "error_msg": "shop not found", "data": None}
 
 
 # --------------------------------------------------------------------------- #
@@ -673,10 +698,15 @@ def test_search_keyword_propagates_blocked_error() -> None:
         adapter.search_keyword("kaos", pages=2)
 
 
-def test_search_keyword_stops_on_antibot_error_envelope(
+def test_search_keyword_fails_the_target_on_the_antibot_error_envelope(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Shopee returns error 90309999 with HTTP 200 to a browser-shaped client.
+    """A refusal body must fail the target, not end pagination as "no results".
+
+    Regression, and the reason this file exists: the adapter used to log the
+    envelope and ``break``, returning ``[]``. The runner then wrote SUCCESS with
+    ``item_count=0`` for a scrape Shopee had refused — a blocked keyword and a
+    keyword with genuinely no matches were the same row in the database.
 
     Also checks the log names the refusal rather than printing a bare code —
     "anti-bot refusal" and "error 4" point an operator at completely different
@@ -688,11 +718,92 @@ def test_search_keyword_stops_on_antibot_error_envelope(
     adapter = ShopeeAdapter(client=client)
 
     with caplog.at_level("WARNING", logger="scraper.adapters.shopee"):
-        assert adapter.search_keyword("kaos", pages=3) == []
+        with pytest.raises(BlockedError):
+            adapter.search_keyword("kaos", pages=3)
 
-    assert len(client.calls) == 1
+    assert len(client.calls) == 1, "a refusal stops the walk immediately"
     assert "anti-bot refusal" in caplog.text
     assert blocked_body["tracking_id"] in caplog.text
+
+
+def test_search_keyword_fails_the_target_on_the_real_200_soft_block(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The 119-byte HTTP 200 refusal, straight off the wire, must not read as empty.
+
+    This is the shape that actually reaches a browser-shaped client: no 403, no
+    HTML interstitial, just ``200 OK`` and a body carrying 90309999. A client
+    that hands it through — any client but our own — must still not be able to
+    turn it into a successful zero-item scrape.
+    """
+    client = FakeClient({"/api/v4/search/search_items": SOFT_BLOCK_PAYLOAD})
+    adapter = ShopeeAdapter(client=client)
+
+    with caplog.at_level("WARNING", logger="scraper.adapters.shopee"):
+        with pytest.raises(BlockedError) as excinfo:
+            adapter.search_keyword("kaos polos", pages=5)
+
+    assert "90309999" in str(excinfo.value)
+    assert "anti-bot refusal" in caplog.text
+    assert len(client.calls) == 1, "no point paging deeper into a refusal"
+    # And the failure is not silently mistaken for schema drift, which would
+    # have the runner report PARTIAL instead of FAILED.
+    assert adapter.last_parse_stats.drifted is False
+    assert adapter.last_parse_stats == (0, 0, 0)
+
+
+def test_search_keyword_error_zero_with_no_items_is_a_success_not_a_block() -> None:
+    """The other half of the rule: an honest empty answer stays a success.
+
+    ``"error": 0`` with an empty list is Shopee saying "nothing matched". It
+    must return ``[]`` without raising, or every keyword with no matches becomes
+    a failed target.
+    """
+    client = FakeClient(
+        {"/api/v4/search/search_items": {"error": 0, "error_msg": "", "items": [], "nomore": True}}
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    assert adapter.search_keyword("nothing-matches-this", pages=4) == []
+    assert len(client.calls) == 1
+    assert adapter.last_parse_stats.drifted is False
+    assert adapter.last_parse_stats.empty is True
+
+
+def test_search_keyword_soft_block_mid_walk_keeps_the_pages_already_walked() -> None:
+    """Partial data survives a soft block exactly as it survives a hard one."""
+    client = FakeClient(
+        {
+            "/api/v4/search/search_items": [
+                make_search_page(SEARCH_PAGE_SIZE, start_id=1000),
+                SOFT_BLOCK_PAYLOAD,
+            ]
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    items = adapter.search_keyword("kaos polos", pages=5)
+
+    assert len(items) == SEARCH_PAGE_SIZE
+    assert len(client.calls) == 2
+
+
+def test_search_keyword_fails_the_target_on_a_non_block_error_envelope() -> None:
+    """An explained error is not a block — and still is not zero results.
+
+    ``{"error": 4, "error_msg": ...}`` means the endpoint refused to answer, so
+    the item count is unknown, not observed. It fails the target as a plain
+    ScraperHTTPError so an operator is not sent chasing an anti-bot problem.
+    """
+    client = FakeClient(
+        {"/api/v4/search/search_items": {"error": 4, "error_msg": "invalid request", "data": None}}
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    with pytest.raises(ScraperHTTPError) as excinfo:
+        adapter.search_keyword("kaos", pages=2)
+
+    assert not isinstance(excinfo.value, BlockedError), "an application error is not a block"
 
 
 def test_search_keyword_returns_partial_results_on_mid_walk_http_error() -> None:
@@ -704,6 +815,20 @@ def test_search_keyword_returns_partial_results_on_mid_walk_http_error() -> None
 
     items = adapter.search_keyword("kaos", pages=3)
     assert len(items) == SEARCH_PAGE_SIZE
+
+
+def test_search_keyword_fails_the_target_when_the_first_page_errors() -> None:
+    """With no page ever observed, ``[]`` would be a fabricated result.
+
+    The mirror of the test above: keeping partials is right *because* they were
+    observed. Nothing observed at all has to fail, or a keyword whose every
+    request 500s is filed next to a keyword nobody sells.
+    """
+    client = FakeClient({"/api/v4/search/search_items": FakeHTTPError()})
+    adapter = ShopeeAdapter(client=client)
+
+    with pytest.raises(ScraperHTTPError):
+        adapter.search_keyword("kaos", pages=3)
 
 
 @pytest.mark.parametrize("pages", [0, -1])
@@ -752,6 +877,33 @@ def test_search_keyword_resolver_is_called_once_per_distinct_shop() -> None:
     assert sorted(seen) == [100, 101]
     assert {item.store.username for item in items} == {"toko-100", "toko-101"}
     assert all(item.store.shop_id in (100, 101) for item in items)
+
+
+def test_search_keyword_survives_a_blocked_username_enrichment() -> None:
+    """A refused enrichment must not throw away a successful harvest. Regression.
+
+    Wiring ``username_resolver=adapter.lookup_username`` is what ``lookup_username``
+    itself recommends. That resolver raises BlockedError on a refusal, and
+    ``_enrich_usernames`` runs *after* the page walk — so one refused
+    ``get_shop_seo`` escaped ``search_keyword``, the runner recorded the target
+    FAILED with item_count 0, and every already-parsed item was lost. That
+    undid, three lines later, the partial-keeping the block handler in the walk
+    does on purpose.
+    """
+    client = FakeClient(
+        {
+            "/api/v4/search/search_items": make_search_page(3, shop_id=555),
+            "/api/v4/shop/get_shop_seo": SOFT_BLOCK_PAYLOAD,
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+    adapter_with_resolver = ShopeeAdapter(client=client, username_resolver=adapter.lookup_username)
+
+    items = adapter_with_resolver.search_keyword("kaos polos", pages=1)
+
+    assert len(items) == 3, "the harvest survives; only the slug backfill was refused"
+    assert all(is_placeholder_username(item.store.username) for item in items)
+    assert "/api/v4/shop/get_shop_seo" in client.paths()
 
 
 def test_resolve_username_caches_negative_results() -> None:
@@ -836,11 +988,16 @@ def test_get_shop_falls_back_to_get_shop_base() -> None:
 
 
 def test_get_shop_raises_lookup_error_when_missing() -> None:
-    """A nonexistent shop is a LookupError the runner records as FAILED."""
+    """A nonexistent shop is a LookupError the runner records as FAILED.
+
+    Shopee explains this one — ``error_msg: "shop not found"`` — which is exactly
+    what separates it from a refusal. An unexplained non-zero error (no message,
+    no data) is classified as a block, not as a missing shop.
+    """
     client = FakeClient(
         {
-            "/api/v4/shop/get_shop_detail": {"error": 4, "data": None},
-            "/api/v4/shop/get_shop_base": {"error": 4, "data": None},
+            "/api/v4/shop/get_shop_detail": NOT_FOUND_PAYLOAD,
+            "/api/v4/shop/get_shop_base": NOT_FOUND_PAYLOAD,
         }
     )
     adapter = ShopeeAdapter(client=client)
@@ -856,6 +1013,113 @@ def test_get_shop_propagates_blocked_error() -> None:
 
     with pytest.raises(BlockedError):
         adapter.get_shop("erigostore")
+
+
+def test_get_shop_soft_block_is_a_block_not_a_missing_shop() -> None:
+    """A refusal on a 200 must not come back as LookupError.
+
+    ``get_shop`` treats an error envelope as "try the older endpoint, then give
+    up with LookupError". Left unclassified, a soft block therefore reported a
+    perfectly good slug as a shop that does not exist — and, in store mode,
+    failed the target with a message that sends an operator to check the
+    username instead of the session.
+    """
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": SOFT_BLOCK_PAYLOAD,
+            "/api/v4/shop/get_shop_base": SOFT_BLOCK_PAYLOAD,
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    with pytest.raises(BlockedError) as excinfo:
+        adapter.get_shop("erigostore")
+
+    assert "90309999" in str(excinfo.value)
+    assert client.paths() == [
+        "/api/v4/shop/get_shop_detail",
+        "/api/v4/shop/get_shop_base",
+    ], "the refusal is remembered, but the documented fallback still gets its turn"
+
+
+def test_get_shop_soft_block_on_one_path_still_tries_the_fallback() -> None:
+    """A refusal is per-endpoint, not per-session. Regression.
+
+    ``.recon/browser_capture.json`` #26 has ``get_shop_base_v2`` answering in full
+    inside the very page session where #27 ``get_shop_tab`` returned the 119-byte
+    refusal. Raising on the first path therefore failed whole store targets that
+    the second, advertised fallback would have resolved — and tripped the
+    runner's consecutive-block abort on a session that was only partially gated.
+    """
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": SOFT_BLOCK_PAYLOAD,
+            "/api/v4/shop/get_shop_base": load_fixture("shopee_get_shop_detail.json"),
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    store = adapter.get_shop("erigostore")
+
+    assert store.shop_id == 30203584
+    assert client.paths() == [
+        "/api/v4/shop/get_shop_detail",
+        "/api/v4/shop/get_shop_base",
+    ]
+
+
+def test_get_shop_hard_block_on_one_path_still_tries_the_fallback() -> None:
+    """Same rule for a 403 the client already re-bootstrapped and gave up on."""
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": FakeBlockedError(),
+            "/api/v4/shop/get_shop_base": load_fixture("shopee_get_shop_detail.json"),
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    assert adapter.get_shop("erigostore").shop_id == 30203584
+    assert client.paths() == [
+        "/api/v4/shop/get_shop_detail",
+        "/api/v4/shop/get_shop_base",
+    ]
+
+
+def test_get_shop_prefers_blocked_over_not_found_when_a_path_was_refused() -> None:
+    """One refusal plus one "no such shop" is a block: the actionable diagnosis."""
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": SOFT_BLOCK_PAYLOAD,
+            "/api/v4/shop/get_shop_base": NOT_FOUND_PAYLOAD,
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    with pytest.raises(BlockedError):
+        adapter.get_shop("erigostore")
+
+
+def test_lookup_username_soft_block_raises_rather_than_degrading() -> None:
+    """The enrichment door gets the same rule as everything else.
+
+    Returning None here would spread placeholder usernames across a whole run
+    while an active block went unreported.
+    """
+    client = FakeClient({"/api/v4/shop/get_shop_seo": SOFT_BLOCK_PAYLOAD})
+    adapter = ShopeeAdapter(client=client)
+
+    with pytest.raises(BlockedError):
+        adapter.lookup_username(30203584)
+
+
+def test_lookup_username_returns_none_on_an_explained_error() -> None:
+    """An application error is still best-effort: no slug, no failure."""
+    client = FakeClient(
+        {"/api/v4/shop/get_shop_seo": {"error": 4, "error_msg": "not found", "data": None}}
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    assert adapter.lookup_username(30203584) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -925,6 +1189,177 @@ def test_search_shop_falls_through_blocked_endpoints_to_get_shop_seo() -> None:
     assert items[0].store.username == "erigostore"
     assert items[0].snapshot.price == Decimal("152900")
     assert "/api/v4/shop/get_shop_seo" in client.paths()
+
+
+def test_search_shop_falls_through_soft_blocked_endpoints_to_get_shop_seo() -> None:
+    """A 200-with-refusal must fall through exactly as a 403 does.
+
+    Same scenario as the test above, with the two paginated endpoints answering
+    the way they really do from a browser-shaped client: HTTP 200 carrying
+    90309999. If the adapter reads those as "this endpoint has no items" it
+    keeps the empty result of the *first* strategy and never reaches the SEO
+    door that would have answered.
+    """
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": load_fixture("shopee_get_shop_detail.json"),
+            "/api/v4/recommend/recommend": SOFT_BLOCK_PAYLOAD,
+            "/api/v4/shop/rcmd_items": SOFT_BLOCK_PAYLOAD,
+            "/api/v4/shop/get_shop_seo": load_fixture("shopee_get_shop_seo.json"),
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    items = adapter.search_shop("erigostore", pages=1)
+
+    assert [item.product.item_id for item in items] == [2698631224]
+    assert items[0].store.username == "erigostore"
+    assert client.paths() == [
+        "/api/v4/shop/get_shop_detail",
+        "/api/v4/recommend/recommend",
+        "/api/v4/shop/rcmd_items",
+        "/api/v4/shop/get_shop_seo",
+    ]
+
+
+def test_search_shop_raises_blocked_when_every_strategy_is_soft_blocked() -> None:
+    """Every endpoint refused on a 200: the shop is not empty, the run is blocked."""
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": load_fixture("shopee_get_shop_detail.json"),
+            "/api/v4/recommend/recommend": SOFT_BLOCK_PAYLOAD,
+            "/api/v4/shop/rcmd_items": SOFT_BLOCK_PAYLOAD,
+            "/api/v4/shop/get_shop_seo": SOFT_BLOCK_PAYLOAD,
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    with pytest.raises(BlockedError):
+        adapter.search_shop("erigostore", pages=1)
+
+
+def test_search_shop_soft_block_beside_answering_endpoints_is_still_an_empty_shop() -> None:
+    """The symmetric guard: one refusal plus two honest empties is an empty shop.
+
+    Hardening detection must not start failing shops that two HTTP 200s already
+    showed to have no listings.
+    """
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": load_fixture("shopee_get_shop_detail.json"),
+            "/api/v4/recommend/recommend": SOFT_BLOCK_PAYLOAD,
+            "/api/v4/shop/rcmd_items": {"error": 0, "items": []},
+            "/api/v4/shop/get_shop_seo": {"error": 0, "data": {"items": []}},
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    assert adapter.search_shop("erigostore", pages=1) == []
+
+
+def test_search_shop_blocked_listings_beside_an_seo_answer_is_a_block() -> None:
+    """Both listing endpoints refused; get_shop_seo answering is not a catalogue.
+
+    Regression, and the last silent zero in store mode. ``get_shop_seo`` is SEO
+    metadata — the live body is ``{"error":0,"data":{"page_title":...,
+    "indexable":false}}`` with no ``items`` key at all, so it "answers" for every
+    shop, empty or not. Counting it as a strategy that observed the catalogue
+    left ``unusable_count`` at 2 of 3, skipped the raise and returned ``[]``:
+    the runner recorded SUCCESS with 0 items, and because no BlockedError was
+    raised it reset ``consecutive_blocks`` and kept walking every remaining
+    target at full request volume while fully blocked.
+    """
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": load_fixture("shopee_get_shop_detail.json"),
+            "/api/v4/recommend/recommend": SOFT_BLOCK_PAYLOAD,
+            "/api/v4/shop/rcmd_items": SOFT_BLOCK_PAYLOAD,
+            "/api/v4/shop/get_shop_seo": {
+                "error": 0,
+                "data": {"page_title": "Toko Online", "indexable": False},
+            },
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    with pytest.raises(BlockedError):
+        adapter.search_shop("erigostore", pages=1)
+
+
+def test_search_shop_failed_listings_beside_an_seo_answer_is_a_failure() -> None:
+    """The same rule without a refusal: two dead listing endpoints fail the target."""
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": load_fixture("shopee_get_shop_detail.json"),
+            "/api/v4/recommend/recommend": FakeHTTPError(),
+            "/api/v4/shop/rcmd_items": FakeHTTPError(),
+            "/api/v4/shop/get_shop_seo": {"error": 0, "data": {"page_title": "Toko Online"}},
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    with pytest.raises(ScraperHTTPError) as excinfo:
+        adapter.search_shop("erigostore", pages=1)
+
+    assert not isinstance(excinfo.value, BlockedError), "nothing was refused, so not a block"
+
+
+def test_search_shop_seo_items_still_prove_a_catalogue() -> None:
+    """The flip side: when get_shop_seo *does* carry items, they are the answer."""
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": load_fixture("shopee_get_shop_detail.json"),
+            "/api/v4/recommend/recommend": SOFT_BLOCK_PAYLOAD,
+            "/api/v4/shop/rcmd_items": SOFT_BLOCK_PAYLOAD,
+            "/api/v4/shop/get_shop_seo": load_fixture("shopee_get_shop_seo.json"),
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    assert [item.product.item_id for item in adapter.search_shop("erigostore", pages=1)] == [
+        2698631224
+    ]
+
+
+def test_search_shop_falls_through_a_strategy_that_errors_to_the_next() -> None:
+    """A strategy that never answered has not proven the shop empty — try the next.
+
+    Propagating the failure out of the walk is what makes the fallback count it
+    as a failed strategy; swallowing it made an unreachable endpoint look like a
+    catalogue with nothing in it, so the walk stopped at the first strategy.
+    """
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": load_fixture("shopee_get_shop_detail.json"),
+            "/api/v4/recommend/recommend": FakeHTTPError(),
+            "/api/v4/shop/rcmd_items": make_search_page(3, shop_id=30203584),
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    items = adapter.search_shop("erigostore", pages=1)
+
+    assert len(items) == 3
+    assert "/api/v4/shop/rcmd_items" in client.paths()
+
+
+def test_search_shop_fails_when_no_strategy_returned_a_usable_answer() -> None:
+    """Three error envelopes prove nothing about the catalogue, so they fail."""
+    error_body = {"error": 7, "error_msg": "temporarily unavailable", "data": None}
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": load_fixture("shopee_get_shop_detail.json"),
+            "/api/v4/recommend/recommend": error_body,
+            "/api/v4/shop/rcmd_items": error_body,
+            "/api/v4/shop/get_shop_seo": error_body,
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    with pytest.raises(ScraperHTTPError) as excinfo:
+        adapter.search_shop("erigostore", pages=1)
+
+    assert not isinstance(excinfo.value, BlockedError), "no refusal was seen, so not a block"
 
 
 def test_search_shop_does_not_paginate_the_unpaginated_seo_endpoint() -> None:
@@ -1119,6 +1554,74 @@ def test_search_keyword_still_raises_when_blocked_on_the_very_first_page() -> No
         adapter.search_keyword("kaos", pages=5)
 
 
+@pytest.mark.parametrize(
+    ("name", "payload", "verdict"),
+    [
+        ("empty_search", {"error": 0, "items": []}, PageVerdict.USABLE),
+        ("shop_seo", {"error": 0, "error_msg": "", "data": {"items": []}}, PageVerdict.USABLE),
+        # Real: /api/v4/abtest/traffic/get_web_experiments answers a *null* error
+        # with a zero retcode. Success with no rows, and the single most
+        # dangerous false positive for a "non-zero error" rule.
+        (
+            "null_error",
+            {"data": [], "error": None, "error_msg": None, "debug": None, "retcode": 0},
+            PageVerdict.USABLE,
+        ),
+        ("no_error_key", {"data": "OK"}, PageVerdict.USABLE),
+        ("soft_block_200", SOFT_BLOCK_PAYLOAD, PageVerdict.BLOCKED),
+        ("explained_error", {"error": 4, "error_msg": "shop not found"}, PageVerdict.ERROR),
+        ("not_an_object", [1, 2, 3], PageVerdict.ERROR),
+    ],
+)
+def test_classify_payload_names_the_three_states(
+    name: str, payload: Any, verdict: PageVerdict
+) -> None:
+    """USABLE / BLOCKED / ERROR are three different facts, not two.
+
+    Collapsing BLOCKED into ERROR loses the block report; collapsing either into
+    USABLE writes an empty price picture and calls the run a success.
+    """
+    assert classify_payload(payload) is verdict, name
+
+
+def test_parse_stats_distinguishes_blocked_from_empty_from_drift() -> None:
+    """All three zero-item endings, told apart in one place.
+
+    They arrive as the same thing — a call that produced no items — and each one
+    needs a different verdict from the runner: FAILED, SUCCESS, PARTIAL. Getting
+    any two of them confused is how a scraper stays green while collecting
+    nothing.
+    """
+    # 1. BLOCKED — raises, so the runner records FAILED. The stats stay pristine
+    #    precisely so this can never be mistaken for the other two.
+    blocked = ShopeeAdapter(client=FakeClient({"/api/v4/search/search_items": SOFT_BLOCK_PAYLOAD}))
+    with pytest.raises(BlockedError):
+        blocked.search_keyword("kaos", pages=1)
+    assert blocked.last_parse_stats == (0, 0, 0)
+    assert blocked.last_parse_stats.drifted is False
+
+    # 2. EMPTY — an honest answer with nothing in it: SUCCESS with 0 items.
+    empty = ShopeeAdapter(
+        client=FakeClient({"/api/v4/search/search_items": {"error": 0, "items": []}})
+    )
+    assert empty.search_keyword("kaos", pages=1) == []
+    assert empty.last_parse_stats.empty is True
+    assert empty.last_parse_stats.drifted is False
+
+    # 3. DRIFT — entries arrived and none of them parsed: PARTIAL, not SUCCESS.
+    drifted_page = {
+        "error": 0,
+        "items": [
+            {"itemid": 900 + i, "shopid": 5, "product_title": "renamed", "price": 1_000_000_000}
+            for i in range(3)
+        ],
+    }
+    drifted = ShopeeAdapter(client=FakeClient({"/api/v4/search/search_items": drifted_page}))
+    assert drifted.search_keyword("kaos", pages=1) == []
+    assert drifted.last_parse_stats.empty is False
+    assert drifted.last_parse_stats.drifted is True
+
+
 def test_parse_stats_distinguishes_schema_drift_from_an_empty_result() -> None:
     """Entries that all fail to parse must be visible as drift, not as "no items".
 
@@ -1186,11 +1689,17 @@ def test_a_zero_star_rating_backed_by_reviews_is_preserved() -> None:
 
 
 def test_search_shop_propagates_lookup_error() -> None:
-    """A renamed shop fails the target before any listing request is made."""
+    """A renamed shop fails the target before any listing request is made.
+
+    The bodies carry Shopee's own ``error_msg``, which is what makes them
+    *explained* application errors rather than unexplained ones: a non-zero error
+    with an empty message and no data is indistinguishable from a refusal and is
+    classified as one (see ``client._looks_like_application_error``).
+    """
     client = FakeClient(
         {
-            "/api/v4/shop/get_shop_detail": {"error": 4, "data": None},
-            "/api/v4/shop/get_shop_base": {"error": 4, "data": None},
+            "/api/v4/shop/get_shop_detail": NOT_FOUND_PAYLOAD,
+            "/api/v4/shop/get_shop_base": NOT_FOUND_PAYLOAD,
         }
     )
     adapter = ShopeeAdapter(client=client)

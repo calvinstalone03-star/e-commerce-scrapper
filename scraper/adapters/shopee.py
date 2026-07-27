@@ -64,14 +64,22 @@ Payload conventions this module is responsible for absorbing:
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 from typing import Any, NamedTuple
 from urllib.parse import quote, urlparse
 
 from scraper.adapters import ScrapedItem
-from scraper.client import BlockedError, ScraperHTTPError, ShopeeClient
+from scraper.client import (
+    BlockedError,
+    ScraperHTTPError,
+    ShopeeClient,
+    has_v4_error,
+    is_soft_block,
+)
 from scraper.models import (
     MARKETPLACE_BASE_URL,
     SHOPEE_PRICE_DIVISOR,
@@ -102,6 +110,8 @@ __all__ = [
     "placeholder_username",
     "is_placeholder_username",
     "ParseStats",
+    "PageVerdict",
+    "classify_payload",
 ]
 
 log = logging.getLogger(__name__)
@@ -110,9 +120,30 @@ log = logging.getLogger(__name__)
 class ParseStats(NamedTuple):
     """How a search call's raw payload entries fared through :func:`parse_item`.
 
-    Exists so "the shop is empty" and "Shopee renamed a field overnight" stop
-    looking identical downstream. Both end with zero :class:`ScrapedItem`; only
-    the second has ``raw_seen > 0`` with ``parsed == 0``.
+    Exists so that the three genuinely different ways a call can end with zero
+    items stop looking identical downstream. All three are worth telling apart,
+    and each has a different owner:
+
+    ============== ==================================== ======================
+    State          How it is recognised                 What the runner records
+    ============== ==================================== ======================
+    **BLOCKED**    :func:`classify_payload` returns     FAILED — the walk
+                   :attr:`PageVerdict.BLOCKED` and the  raises
+                   walk raises, so *these stats are     :class:`~scraper.client.BlockedError`
+                   never consulted*. They stay          before returning.
+                   ``(0, 0, 0)``, i.e. not drifted.
+    **empty**      ``raw_seen == 0`` and ``parsed ==    SUCCESS with 0 items.
+                   0``: a 200 with ``"error": 0`` and
+                   an empty item list.
+    **drift**      ``raw_seen > 0`` and ``parsed ==     PARTIAL, with the
+                   0``: entries arrived, none of them   drift message.
+                   parsed — a renamed field.
+    ============== ==================================== ======================
+
+    The middle column is the whole contract: BLOCKED is kept out of these
+    numbers deliberately, because a block that reached here as ``(0, 0, 0)``
+    would be indistinguishable from an honestly empty shop, which is exactly the
+    silent-zero failure this type was introduced to end.
 
     Attributes:
         raw_seen: Entries :func:`_extract_items` recognised as listings.
@@ -132,6 +163,67 @@ class ParseStats(NamedTuple):
             Whether this looks like a schema change rather than an empty result.
         """
         return self.raw_seen > 0 and self.parsed == 0
+
+    @property
+    def empty(self) -> bool:
+        """True when the endpoint genuinely returned nothing to parse.
+
+        Distinct from :attr:`drifted` (entries arrived and were unusable) and
+        from a block (which never reaches these stats at all).
+
+        Returns:
+            Whether this call saw no listing entries whatsoever.
+        """
+        return self.raw_seen == 0
+
+
+class PageVerdict(Enum):
+    """What one decoded listing page actually is.
+
+    Three states, deliberately not two. A 200 OK from Shopee can be any of them
+    and they have nothing in common but their status line:
+
+    * :attr:`USABLE` — parse it. It may hold zero items; an ``"error": 0``
+      envelope with an empty list is a *successful* empty answer and must be
+      recorded as SUCCESS.
+    * :attr:`BLOCKED` — Shopee refused us. The 119-byte
+      ``{"error": 90309999, ...}`` body arrives with **HTTP 200**, so nothing but
+      the payload distinguishes it from an empty page. It must fail the target,
+      never end pagination as "no more items".
+    * :attr:`ERROR` — some other non-zero ``error`` (``{"error": 4, "error_msg":
+      "shop not found"}``). Not a block, still not data: zero rows here are
+      unknown, not observed.
+    """
+
+    USABLE = "usable"
+    BLOCKED = "blocked"
+    ERROR = "error"
+
+
+def classify_payload(payload: Any) -> PageVerdict:
+    """Decide which of the three :class:`PageVerdict` states a body is in.
+
+    Delegates the block rule to :func:`scraper.client.is_soft_block` rather than
+    re-deriving it, so the adapter and the transport can never disagree about
+    what a block looks like — a disagreement would mean one layer counting a
+    refusal as data. Bodies reach the adapter only through
+    :meth:`scraper.client.ShopeeClient.get_json`, which returns exclusively
+    sub-400 responses, so the "success status" precondition of
+    :func:`~scraper.client.is_soft_block` always holds here.
+
+    Args:
+        payload: Decoded JSON body.
+
+    Returns:
+        The verdict for this page.
+    """
+    if not isinstance(payload, Mapping):
+        return PageVerdict.ERROR
+    if is_soft_block(payload):
+        return PageVerdict.BLOCKED
+    if has_v4_error(payload):
+        return PageVerdict.ERROR
+    return PageVerdict.USABLE
 
 
 #: Alias of :data:`scraper.models.SHOPEE_PRICE_DIVISOR`, kept because this
@@ -158,9 +250,14 @@ SHOP_SEO_PATH = "/api/v4/shop/get_shop_seo"
 #: :meth:`ShopeeAdapter.resolve_username` for how it gets replaced by the real one.
 PLACEHOLDER_USERNAME_PREFIX = "shop-"
 
-#: Shopee's "you are not a trusted client" envelope. Seen as a 403 body from
-#: httpx and as a 200 body from a real browser, so the adapter checks for it
-#: independently of whatever the client made of the status code.
+#: Shopee's "you are not a trusted client" code. Seen as a 403 body from httpx
+#: (``.recon/A_search_kaos_polos.json``) and as a **119-byte HTTP 200 body** from
+#: a real logged-out browser (``.recon/browser_capture.json`` #6 and #27), so the
+#: adapter classifies payloads independently of whatever the status code said.
+#:
+#: Used for *naming* the refusal in logs only. Detection itself is the general
+#: rule in :func:`scraper.client.is_soft_block`, so a renumbered refusal is still
+#: caught — see :data:`scraper.client.BLOCK_ERROR_CODES`.
 ANTIBOT_ERROR_CODE = 90309999
 
 #: Keys a bucketed sold-count dict hides its number under, in preference order.
@@ -799,34 +896,15 @@ def _extract_items(payload: Any) -> list[dict[str, Any]]:
     return merged
 
 
-def _is_error_payload(payload: Any) -> bool:
-    """Whether a decoded body is an error envelope rather than data.
-
-    Shopee signals success with a top-level ``"error": 0``. The anti-bot refusal
-    is ``"error": 90309999`` — delivered as a 403 body to httpx but as a *200*
-    body to a real browser, so status alone is not enough to classify it.
-
-    Args:
-        payload: Decoded JSON body.
-
-    Returns:
-        True when the payload reports a non-zero error.
-    """
-    if not isinstance(payload, Mapping):
-        return True
-    error = payload.get("error")
-    if error in (None, 0, "0", ""):
-        return False
-    return True
-
-
 def _describe_error(payload: Any) -> str:
     """Render a payload's error code as something readable in a log line.
 
-    Calls out :data:`ANTIBOT_ERROR_CODE` by name, because "error 90309999" and
-    "Shopee anti-bot refusal" lead an operator to very different next steps: the
-    latter means the session needs re-bootstrapping (or that the endpoint is
-    simply gated for logged-out traffic), not that the shop or keyword is bad.
+    Calls out an anti-bot refusal by name, because "error 90309999" and "Shopee
+    anti-bot refusal" lead an operator to very different next steps: the latter
+    means the session needs re-bootstrapping (or that the endpoint is simply
+    gated for logged-out traffic), not that the shop or keyword is bad. A refusal
+    whose code is *not* :data:`ANTIBOT_ERROR_CODE` is still named as a refusal —
+    the code is evidence, not the definition.
 
     Args:
         payload: Decoded JSON body.
@@ -837,12 +915,29 @@ def _describe_error(payload: Any) -> str:
     if not isinstance(payload, Mapping):
         return f"non-object body ({type(payload).__name__})"
     error = payload.get("error")
-    if _as_int(error) == ANTIBOT_ERROR_CODE:
+    if classify_payload(payload) is PageVerdict.BLOCKED:
         tracking = _as_text(payload.get("tracking_id"))
         suffix = f", tracking_id={tracking}" if tracking else ""
-        return f"anti-bot refusal (error {ANTIBOT_ERROR_CODE}{suffix})"
+        known = "" if _as_int(error) == ANTIBOT_ERROR_CODE else " (unrecognised code)"
+        return f"anti-bot refusal (error {error!r}{suffix}){known}"
     message = _as_text(payload.get("error_msg"))
     return f"error {error!r}" + (f": {message}" if message else "")
+
+
+def _payload_excerpt(payload: Any) -> str:
+    """Render a payload compactly for an exception's ``body_excerpt``.
+
+    Args:
+        payload: Decoded JSON body.
+
+    Returns:
+        A single-line excerpt, truncated to a log-friendly length.
+    """
+    try:
+        text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = repr(payload)
+    return text[:500]
 
 
 # --------------------------------------------------------------------------- #
@@ -985,20 +1080,28 @@ class ShopeeAdapter:
         ``SEARCH_PAGE_SIZE`` items or when the payload sets ``nomore``. Sends a
         ``Referer`` of ``https://shopee.co.id/search?keyword=<encoded>``.
 
-        Items that fail :func:`parse_item` are logged and skipped; a page-level
-        failure that is not a block ends pagination and returns what was
-        collected so far.
+        Items that fail :func:`parse_item` are logged and skipped. A page-level
+        failure — a block, an error envelope, or an HTTP error — keeps the pages
+        already walked when there are any, and otherwise **fails the target**:
+        with nothing collected, returning ``[]`` would report a refused scrape
+        as a successful keyword with no results. See
+        :meth:`_refuse_unusable_page`.
 
         Args:
             keyword: Search phrase.
             pages: Maximum pages to walk, >= 1.
 
         Returns:
-            De-duplicated :class:`ScrapedItem` list in result order.
+            De-duplicated :class:`ScrapedItem` list in result order. Empty only
+            when Shopee genuinely answered ``"error": 0`` with no items.
 
         Raises:
             ValueError: If ``pages`` < 1.
-            scraper.client.BlockedError: If blocked and re-bootstrap failed.
+            scraper.client.BlockedError: If the first page was blocked — whether
+                by a 403 the client raised on, or by a soft block: an HTTP 200
+                whose body is Shopee's refusal envelope.
+            scraper.client.ScraperHTTPError: If the first page came back with a
+                non-block error envelope or an HTTP failure.
         """
         self._check_pages(pages)
         self._reset_parse_stats()
@@ -1038,6 +1141,11 @@ class ShopeeAdapter:
                     break
                 raise
             except ScraperHTTPError as exc:
+                if not collected:
+                    # Nothing was ever observed, so "no items" would be a claim
+                    # we cannot make. Fail the target instead of reporting an
+                    # empty-but-successful keyword.
+                    raise
                 log.warning(
                     "keyword %r page %d failed (%s); returning %d items collected so far",
                     term,
@@ -1047,12 +1155,15 @@ class ShopeeAdapter:
                 )
                 break
 
-            if _is_error_payload(payload):
-                log.warning(
-                    "keyword %r page %d: %s; stopping pagination",
-                    term,
-                    page,
-                    _describe_error(payload),
+            verdict = classify_payload(payload)
+            if verdict is not PageVerdict.USABLE:
+                self._refuse_unusable_page(
+                    payload,
+                    verdict,
+                    collected=bool(collected),
+                    url=f"{SITE_BASE}{SEARCH_PATH}",
+                    context=f"keyword {term!r} page {page}",
+                    kept=len(collected),
                 )
                 break
 
@@ -1062,7 +1173,22 @@ class ShopeeAdapter:
             if self._is_last_page(payload, raw_items, SEARCH_PAGE_SIZE):
                 break
 
-        self._enrich_usernames(collected)
+        # Enrichment is a bonus, never a gate. lookup_username raises BlockedError
+        # on a refusal, and running it *after* the walk meant one refused
+        # get_shop_seo threw away a whole successful harvest — undoing, three
+        # lines up, the partial-keeping the block handler above deliberately does.
+        # The items keep their placeholder slugs; a later store-mode run backfills
+        # them, and the block is still reported by the endpoint that hit it.
+        try:
+            self._enrich_usernames(collected)
+        except BlockedError as exc:
+            log.warning(
+                "keyword %r: username enrichment blocked (%s); keeping %d items with "
+                "placeholder usernames",
+                term,
+                exc,
+                len(collected),
+            )
         return collected
 
     def search_shop(self, username: str, pages: int = 1) -> list[ScrapedItem]:
@@ -1071,9 +1197,21 @@ class ShopeeAdapter:
         Resolves the shop with :meth:`get_shop` first, then tries each entry of
         :data:`SHOP_LISTING_STRATEGIES` in order, keeping the first that returns
         items and paginating it with ``offset = page_index * SHOP_PAGE_SIZE``.
-        A strategy that is blocked or errors is logged and the next is tried; the
-        target only fails with :class:`~scraper.client.BlockedError` when *every*
-        strategy was blocked, which is the honest signal for the runner.
+        A strategy that is blocked or errors is logged and the next is tried.
+
+        A soft block (HTTP 200 carrying Shopee's refusal envelope) is raised out
+        of the walk as a :class:`~scraper.client.BlockedError`, so it falls
+        through to the next strategy on exactly the same rails as a 403 and is
+        counted the same way here.
+
+        The target fails whenever nothing came back and no *listing* endpoint
+        ever answered. "This shop is empty" is a claim only a paginated listing
+        endpoint can support: ``get_shop_seo`` is SEO metadata that answers
+        ``error: 0`` with no ``items`` key at all, so counting its silence as
+        proof of an empty catalogue would report a fully refused shop as a
+        successful run with zero items. One blocked endpoint next to a listing
+        endpoint that answered 200 with an empty catalogue is still an empty
+        shop, not a block.
 
         Every returned :class:`ScrapedItem` carries the rich Store from
         :meth:`get_shop`, not the thin one :func:`parse_item` derives, so
@@ -1084,12 +1222,16 @@ class ShopeeAdapter:
             pages: Maximum pages to walk, >= 1.
 
         Returns:
-            De-duplicated :class:`ScrapedItem` list.
+            De-duplicated :class:`ScrapedItem` list. Empty only when a listing
+            endpoint answered and reported no listings.
 
         Raises:
             ValueError: If ``pages`` < 1.
             LookupError: If the shop does not exist.
-            scraper.client.BlockedError: If every listing endpoint was blocked.
+            scraper.client.BlockedError: If no listing endpoint gave a usable
+                answer and at least one endpoint was blocked.
+            scraper.client.ScraperHTTPError: If no listing endpoint gave a usable
+                answer and none of the failures was a block.
         """
         self._check_pages(pages)
         self._reset_parse_stats()
@@ -1099,7 +1241,15 @@ class ShopeeAdapter:
         collected: list[ScrapedItem] = []
         seen: set[int] = set()
         blocked: BlockedError | None = None
+        failed: ScraperHTTPError | None = None
         blocked_count = 0
+        unusable_count = 0
+        # Only a *paginated listing* endpoint can testify that a catalogue is
+        # empty. get_shop_seo is SEO metadata: it answers error:0 with no items
+        # key whether the shop has a thousand listings or none, so its silence
+        # is not evidence about the catalogue.
+        answered_listing = False
+        total = len(SHOP_LISTING_STRATEGIES)
 
         for strategy in SHOP_LISTING_STRATEGIES:
             try:
@@ -1107,14 +1257,33 @@ class ShopeeAdapter:
                     strategy, store.shop_id, pages, referer, seen, store.username
                 )
             except BlockedError as exc:
+                # A soft block arrives here identically to a 403: both are a
+                # BlockedError raised out of the walk, so a 200-with-refusal
+                # falls through to the next strategy exactly as a hard block
+                # does, and is counted the same way below.
                 blocked = exc
                 blocked_count += 1
+                unusable_count += 1
                 log.warning(
                     "shop %s: listing endpoint %s blocked; trying next strategy",
                     store.username,
                     strategy.name,
                 )
                 continue
+            except ScraperHTTPError as exc:
+                failed = exc
+                unusable_count += 1
+                log.warning(
+                    "shop %s: listing endpoint %s gave no usable answer (%s); "
+                    "trying next strategy",
+                    store.username,
+                    strategy.name,
+                    exc,
+                )
+                continue
+
+            if strategy.paginated:
+                answered_listing = True
 
             if items:
                 collected = items
@@ -1124,22 +1293,37 @@ class ShopeeAdapter:
                 break
             log.debug("shop %s: %s returned no items", store.username, strategy.name)
 
-        # Only "every endpoint was blocked" is an honest block. Counting merely
-        # *tried* strategies re-raised a stale BlockedError whenever one endpoint
-        # was blocked and the others answered 200 with an empty catalogue — a
-        # shop with no active listings was reported FAILED, and an operator was
-        # sent chasing an anti-bot problem that did not exist.
-        if not collected and blocked is not None and blocked_count == len(
-            SHOP_LISTING_STRATEGIES
-        ):
-            raise blocked
-        if not collected and blocked is not None:
+        # "The shop is empty" is a claim, and only a *listing* endpoint that
+        # actually answered can support it. When none did, nothing observed the
+        # catalogue, so the target fails — a block is re-raised in preference to
+        # a plain error because it is the more actionable diagnosis.
+        #
+        # Requiring `unusable_count == total` instead was the silent-zero bug:
+        # with both paginated endpoints refused, get_shop_seo answering
+        # {"error":0,"data":{"page_title":...}} — no items key, because it is SEO
+        # metadata and not a listing — left 2 of 3 unusable, skipped the raise
+        # and returned []. The runner then recorded SUCCESS with 0 items and,
+        # seeing no block, reset its consecutive-block counter and kept walking
+        # every remaining target while fully blocked.
+        #
+        # Counting merely *tried* strategies would be the opposite bug: it
+        # re-raised a stale BlockedError whenever one endpoint was blocked and
+        # the others answered 200 with an empty catalogue, reporting a shop with
+        # no active listings as FAILED and sending an operator chasing an
+        # anti-bot problem that two HTTP 200s had already disproved.
+        if not collected and unusable_count and not answered_listing:
+            failure = blocked if blocked is not None else failed
+            if failure is not None:
+                raise failure
+        if not collected and unusable_count:
             log.warning(
-                "shop %s: %d of %d listing endpoints blocked, the rest returned no "
-                "items; reporting an empty shop rather than a block",
+                "shop %s: %d of %d listing endpoints unusable (%d blocked), but a "
+                "listing endpoint answered with no items; reporting an empty shop "
+                "rather than a block",
                 store.username,
+                unusable_count,
+                total,
                 blocked_count,
-                len(SHOP_LISTING_STRATEGIES),
             )
 
         return [item._replace(store=store) for item in collected]
@@ -1160,9 +1344,14 @@ class ShopeeAdapter:
 
         Raises:
             ValueError: If ``username`` is blank.
-            LookupError: If Shopee reports the shop as missing (``error`` set, or
-                a null ``data``).
-            scraper.client.BlockedError: If blocked and re-bootstrap failed.
+            LookupError: If Shopee reports the shop as missing (an explained
+                ``error``, or a null ``data``) on every path, and none of them
+                was blocked.
+            scraper.client.BlockedError: If every path was tried and at least one
+                was blocked — either the client raised, or the body was a refusal
+                envelope under a success status. A block is never downgraded to
+                LookupError: "you are refused" and "this shop does not exist"
+                send an operator to opposite fixes.
         """
         slug = normalise_username(username)
         cached = self._shop_cache.get(slug)
@@ -1171,6 +1360,7 @@ class ShopeeAdapter:
 
         referer = f"{SITE_BASE}/{slug}"
         last_error: str | None = None
+        blocked: BlockedError | None = None
 
         for path in (SHOP_DETAIL_PATH, SHOP_BASE_PATH):
             params: dict[str, Any] = {"username": slug}
@@ -1185,15 +1375,38 @@ class ShopeeAdapter:
                 )
             try:
                 payload = self._client.get_json(path, params, referer=referer)
-            except BlockedError:
-                raise
+            except BlockedError as exc:
+                # Shopee refuses per *endpoint*, not per session: the recon
+                # capture has get_shop_base_v2 answering in full (#26) in the
+                # same page session where get_shop_tab returned the 119-byte
+                # refusal (#27). Remember the refusal and give the fallback its
+                # turn, exactly as search_shop does across listing strategies.
+                blocked = exc
+                log.warning("shop %s: %s blocked; trying the fallback endpoint", slug, path)
+                continue
             except ScraperHTTPError as exc:
                 last_error = str(exc)
                 log.debug("shop %s: %s failed (%s)", slug, path, exc)
                 continue
 
+            verdict = classify_payload(payload)
+            if verdict is PageVerdict.BLOCKED:
+                # "Blocked" and "no such shop" are different facts with different
+                # fixes, and a LookupError here would report the first as the
+                # second — sending an operator to check a slug that is fine. The
+                # refusal is kept and re-raised below only if the fallback fails
+                # too; a soft block on one path says nothing about the other.
+                log.warning("shop %s: %s -> %s", slug, path, _describe_error(payload))
+                blocked = BlockedError(
+                    f"shop {slug!r}: {path} returned a refusal envelope on an "
+                    f"otherwise-successful response ({_describe_error(payload)})",
+                    url=f"{SITE_BASE}{path}",
+                    body_excerpt=_payload_excerpt(payload),
+                )
+                continue
+
             data = payload.get("data") if isinstance(payload, Mapping) else None
-            if _is_error_payload(payload) or not isinstance(data, Mapping):
+            if verdict is PageVerdict.ERROR or not isinstance(data, Mapping):
                 last_error = f"{path} -> {_describe_error(payload)}"
                 log.debug("shop %s: %s", slug, last_error)
                 continue
@@ -1209,6 +1422,10 @@ class ShopeeAdapter:
             self._username_cache[store.shop_id] = store.username
             return store
 
+        if blocked is not None:
+            # Every door was tried and one of them refused us: "blocked" is the
+            # honest, actionable diagnosis, and outranks "not found".
+            raise blocked
         raise LookupError(f"shop {slug!r} not found on Shopee ({last_error or 'no data'})")
 
     def resolve_username(self, shop_id: int) -> str | None:
@@ -1271,7 +1488,19 @@ class ShopeeAdapter:
             log.debug("lookup_username(%s) failed: %s", shop_id, exc)
             return None
 
-        if _is_error_payload(payload):
+        verdict = classify_payload(payload)
+        if verdict is PageVerdict.BLOCKED:
+            # Same treatment a 403 gets from get_json two lines up: a refusal is
+            # a refusal whichever status it wore, and degrading it to "this shop
+            # has no username" would hide an active block behind placeholder
+            # slugs on every item of the run.
+            raise BlockedError(
+                f"lookup_username({shop_id}): {_describe_error(payload)} on an "
+                f"otherwise-successful response",
+                url=f"{SITE_BASE}{SHOP_SEO_PATH}",
+                body_excerpt=_payload_excerpt(payload),
+            )
+        if verdict is PageVerdict.ERROR:
             return None
 
         canonical = _as_text(_dig(payload, "data", "canonical_url"))
@@ -1317,8 +1546,80 @@ class ShopeeAdapter:
             raise ValueError(f"pages must be >= 1, got {pages}")
 
     @staticmethod
+    def _refuse_unusable_page(
+        payload: Any,
+        verdict: PageVerdict,
+        *,
+        collected: bool,
+        url: str,
+        context: str,
+        kept: int,
+    ) -> None:
+        """React to a page that carries no usable rows: never call it "no items".
+
+        This is the single place the data-integrity rule is enforced, for every
+        walk in the module. A page whose verdict is not
+        :attr:`PageVerdict.USABLE` observed *nothing*; ending pagination on it
+        and returning the empty list would let the runner record the target
+        SUCCESS with ``item_count=0`` — a refused scrape indistinguishable, in
+        the database and on the dashboard, from a genuinely empty shop.
+
+        With items already in hand the walk keeps them and stops (a partial page
+        set is real data, and matches how a hard
+        :class:`~scraper.client.BlockedError` mid-walk is handled). With nothing
+        in hand it raises, and the class of exception preserves the distinction:
+        :class:`~scraper.client.BlockedError` for a refusal — the same type a 403
+        produces, so shop-strategy fallback and the runner's block accounting
+        treat soft and hard blocks identically — and
+        :class:`~scraper.client.ScraperHTTPError` for any other error envelope.
+
+        Args:
+            payload: The decoded page body.
+            verdict: Its classification from :func:`classify_payload`.
+            collected: Whether the caller already holds items from earlier pages.
+            url: Absolute URL of the endpoint, for the exception context.
+            context: Human label for the log line, e.g. ``"keyword 'kaos' page 0"``.
+            kept: How many items the caller is holding, for the log line.
+
+        Raises:
+            scraper.client.BlockedError: Refused, with nothing collected yet.
+            scraper.client.ScraperHTTPError: Other error envelope, nothing
+                collected yet.
+        """
+        description = _describe_error(payload)
+        if collected:
+            log.warning(
+                "%s: %s; stopping pagination and keeping %d items collected so far",
+                context,
+                description,
+                kept,
+            )
+            return
+
+        log.warning("%s: %s; failing the target", context, description)
+        excerpt = _payload_excerpt(payload)
+        if verdict is PageVerdict.BLOCKED:
+            raise BlockedError(
+                f"{context}: {description} — Shopee returned a refusal envelope on an "
+                f"otherwise-successful response; this is a block, not an empty result",
+                url=url,
+                body_excerpt=excerpt,
+            )
+        raise ScraperHTTPError(
+            f"{context}: {description} — no usable rows were returned, so zero items "
+            f"here is unknown, not observed",
+            url=url,
+            body_excerpt=excerpt,
+        )
+
+    @staticmethod
     def _is_last_page(payload: Any, raw_items: Sequence[Any], page_size: int) -> bool:
         """Decide whether pagination should stop after this page.
+
+        Precondition: ``payload`` has already been classified
+        :attr:`PageVerdict.USABLE` by :func:`classify_payload`. A blocked or
+        error page must never reach here — "zero items" from one of those means
+        "we were refused", and this method would read it as "last page".
 
         Args:
             payload: The decoded page body.
@@ -1416,11 +1717,16 @@ class ShopeeAdapter:
             slug: Shop username, for log lines.
 
         Returns:
-            Parsed items from this strategy, possibly empty.
+            Parsed items from this strategy — empty only when the endpoint
+            answered and had nothing to list.
 
         Raises:
-            scraper.client.BlockedError: Propagated so the caller can fall
-                through to the next strategy.
+            scraper.client.BlockedError: A hard block from the client, or a soft
+                block this method classified itself, with no items yet in hand.
+                Propagated so the caller can fall through to the next strategy.
+            scraper.client.ScraperHTTPError: A non-block failure with no items
+                yet in hand, so the caller does not mistake this strategy's
+                silence for proof that the shop is empty.
         """
         collected: list[ScrapedItem] = []
         effective_pages = pages if strategy.paginated else 1
@@ -1450,15 +1756,22 @@ class ShopeeAdapter:
                 raise
             except ScraperHTTPError as exc:
                 log.warning("shop %s: %s page %d failed (%s)", slug, strategy.name, page, exc)
+                if not collected:
+                    # This strategy never produced a usable answer, so it has not
+                    # shown the shop to be empty. Propagate so search_shop counts
+                    # it as a failed strategy rather than as a clean empty one.
+                    raise
                 break
 
-            if _is_error_payload(payload):
-                log.debug(
-                    "shop %s: %s page %d: %s",
-                    slug,
-                    strategy.name,
-                    page,
-                    _describe_error(payload),
+            verdict = classify_payload(payload)
+            if verdict is not PageVerdict.USABLE:
+                self._refuse_unusable_page(
+                    payload,
+                    verdict,
+                    collected=bool(collected),
+                    url=f"{SITE_BASE}{strategy.path}",
+                    context=f"shop {slug!r}/{strategy.name} page {page}",
+                    kept=len(collected),
                 )
                 break
 
