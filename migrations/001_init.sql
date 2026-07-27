@@ -1,0 +1,24 @@
+-- migrations/001_init.sql
+--
+-- PLACEHOLDER. Intentionally left as comments only.
+-- The db agent owns this file and writes the real DDL here.
+--
+-- It MUST match, exactly, the schema documented in the module docstring of
+-- scraper/db.py (which is the single source of truth for column names, types,
+-- constraints and indexes). Four tables:
+--
+--   stores           (unique on (marketplace, shop_id))
+--   products         (unique on (marketplace, item_id), fk shop_ref -> stores.id)
+--   price_snapshots  (fk product_ref -> products.id, index on (product_ref, scraped_at desc))
+--   scrape_runs
+--
+-- Conventions the db agent must follow:
+--   * All timestamp columns are `timestamptz`.
+--   * Money / rating columns are `numeric` (never float) — Shopee returns integer
+--     micro-units (price * 100000) and the adapter divides down, so the values
+--     arriving here are already decimal rupiah.
+--   * Use `CREATE TABLE IF NOT EXISTS` so `ecom-scraper initdb` is idempotent.
+--   * Name the constraints/indexes explicitly so ON CONFLICT targets are stable:
+--       uq_stores_marketplace_shop_id
+--       uq_products_marketplace_item_id
+--       ix_price_snapshots_product_ref_scraped_at

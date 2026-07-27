@@ -1,0 +1,11 @@
+.venv/
+.env
+cookies.json
+.recon/
+__pycache__/
+*.pyc
+
+# build / test artifacts
+*.egg-info/
+.pytest_cache/
+.DS_Store

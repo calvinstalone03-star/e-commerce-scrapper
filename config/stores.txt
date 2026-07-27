@@ -1,0 +1,5 @@
+# One Shopee shop username per line (the slug in https://shopee.co.id/<username>).
+# Blank lines and lines starting with # are ignored.
+# Used by `ecom-scraper run --mode store --stores-file config/stores.txt`
+erigostore
+eigerindostore
