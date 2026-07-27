@@ -25,9 +25,21 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from sqlalchemy import func, insert, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from scraper.models import Marketplace, PriceSnapshot, Product, RunMode, RunStatus, ScrapeRun, Store
+from scraper.db import PriceSnapshotRow, ProductRow, ScrapeRunRow, StoreRow
+from scraper.models import (
+    Marketplace,
+    PriceSnapshot,
+    Product,
+    RunMode,
+    RunStatus,
+    ScrapeRun,
+    Store,
+    utcnow,
+)
 
 __all__ = [
     "upsert_store",
@@ -36,7 +48,27 @@ __all__ = [
     "start_run",
     "finish_run",
     "get_stats",
+    "latest_prices",
+    "price_history",
+    "recent_price_changes",
+    "recent_runs",
 ]
+
+#: Upper bound on the text stored in ``scrape_runs.error``. A traceback repr from a
+#: parse failure can run to megabytes; the audit log only needs the head of it.
+MAX_ERROR_CHARS = 4000
+
+
+def _stamp(now: datetime | None) -> datetime:
+    """Resolve the timestamp to write, defaulting to :func:`scraper.models.utcnow`.
+
+    Args:
+        now: Caller-supplied timestamp, or None.
+
+    Returns:
+        A timezone-aware UTC datetime.
+    """
+    return now if now is not None else utcnow()
 
 
 def upsert_store(session: Session, store: Store, *, now: datetime | None = None) -> int:
@@ -53,7 +85,40 @@ def upsert_store(session: Session, store: Store, *, now: datetime | None = None)
         ``stores.id`` of the inserted or existing row — pass this as
         ``shop_ref`` to :func:`upsert_product`.
     """
-    raise NotImplementedError
+    ts = _stamp(now)
+    table = StoreRow.__table__
+
+    stmt = pg_insert(StoreRow).values(
+        marketplace=store.marketplace.value,
+        shop_id=store.shop_id,
+        username=store.username,
+        name=store.name,
+        location=store.location,
+        follower_count=store.follower_count,
+        rating_star=store.rating_star,
+        first_seen=ts,
+        last_seen=ts,
+    )
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_stores_marketplace_shop_id",
+        set_={
+            # COALESCE(new, old): a sparse payload leaves the stored value alone
+            # instead of erasing detail a richer earlier scrape captured.
+            "username": func.coalesce(stmt.excluded.username, table.c.username),
+            "name": func.coalesce(stmt.excluded.name, table.c.name),
+            "location": func.coalesce(stmt.excluded.location, table.c.location),
+            "follower_count": func.coalesce(stmt.excluded.follower_count, table.c.follower_count),
+            "rating_star": func.coalesce(stmt.excluded.rating_star, table.c.rating_star),
+            # first_seen is deliberately absent from this SET clause — it is
+            # written once on insert and never touched again.
+            "last_seen": stmt.excluded.last_seen,
+        },
+    ).returning(StoreRow.id)
+
+    # DO UPDATE (rather than DO NOTHING) guarantees RETURNING yields a row on the
+    # conflict path too, so the id comes back in a single round trip with no
+    # read-then-write race between concurrent writers.
+    return session.execute(stmt).scalar_one()
 
 
 def upsert_product(
@@ -73,7 +138,39 @@ def upsert_product(
     Returns:
         ``products.id`` — pass this as ``product_ref`` to :func:`insert_snapshot`.
     """
-    raise NotImplementedError
+    ts = _stamp(now)
+    table = ProductRow.__table__
+
+    stmt = pg_insert(ProductRow).values(
+        marketplace=product.marketplace.value,
+        item_id=product.item_id,
+        # product.shop_id is the MARKETPLACE's id and is not stored here; the
+        # caller resolves it to our stores.id and passes it as shop_ref.
+        shop_ref=shop_ref,
+        name=product.name,
+        url=product.url,
+        image=product.image,
+        category=product.category,
+        first_seen=ts,
+        last_seen=ts,
+    )
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_products_marketplace_item_id",
+        set_={
+            # COALESCE also gives shop_ref backfill semantics: a keyword scrape
+            # that could not resolve the shop passes None and leaves any
+            # previously-resolved ref intact, while a store scrape fills it in.
+            "shop_ref": func.coalesce(stmt.excluded.shop_ref, table.c.shop_ref),
+            "name": func.coalesce(stmt.excluded.name, table.c.name),
+            "url": func.coalesce(stmt.excluded.url, table.c.url),
+            "image": func.coalesce(stmt.excluded.image, table.c.image),
+            "category": func.coalesce(stmt.excluded.category, table.c.category),
+            # first_seen intentionally omitted — insert-only.
+            "last_seen": stmt.excluded.last_seen,
+        },
+    ).returning(ProductRow.id)
+
+    return session.execute(stmt).scalar_one()
 
 
 def insert_snapshot(
@@ -86,13 +183,42 @@ def insert_snapshot(
         snapshot: Observation to store. Its ``item_id`` is not written to the
             table; ``product_ref`` is the link.
         product_ref: ``products.id`` from :func:`upsert_product`.
-        now: Fallback for ``scraped_at`` when the snapshot leaves it None.
-            Defaults to ``models.utcnow()``.
+        now: The observation timestamp to write. When supplied it **wins over**
+            ``snapshot.scraped_at``; when omitted, the snapshot's own value is
+            used, falling back to ``models.utcnow()``.
 
     Returns:
         The new ``price_snapshots.id``.
     """
-    raise NotImplementedError
+    # Precedence note: `now` deliberately overrides the model value rather than
+    # merely filling a None. PriceSnapshot.scraped_at has a `default_factory` of
+    # utcnow(), so it is essentially never None by the time an adapter hands it
+    # over — under fill-only semantics the caller's `now` would be dead code and
+    # the runner's documented "one shared clock per target" would silently not
+    # hold (observed: two snapshots from one batch 34us apart). The runner passes
+    # one timestamp per target precisely so a batch is diffable as a unit.
+    scraped_at = now if now is not None else snapshot.scraped_at
+    if scraped_at is None:
+        scraped_at = utcnow()
+    # No ON CONFLICT here by design: this table is the time series. Two scrapes of
+    # the same product must produce two rows, otherwise there is nothing to diff.
+    stmt = (
+        insert(PriceSnapshotRow)
+        .values(
+            product_ref=product_ref,
+            price=snapshot.price,
+            price_min=snapshot.price_min,
+            price_max=snapshot.price_max,
+            stock=snapshot.stock,
+            sold=snapshot.sold,
+            historical_sold=snapshot.historical_sold,
+            rating_star=snapshot.rating_star,
+            rating_count=snapshot.rating_count,
+            scraped_at=scraped_at,
+        )
+        .returning(PriceSnapshotRow.id)
+    )
+    return session.execute(stmt).scalar_one()
 
 
 def start_run(
@@ -119,7 +245,33 @@ def start_run(
     Returns:
         A :class:`ScrapeRun` with ``id`` and ``started_at`` populated.
     """
-    raise NotImplementedError
+    ts = _stamp(now)
+    row = ScrapeRunRow(
+        marketplace=marketplace.value,
+        mode=mode.value,
+        target=target,
+        started_at=ts,
+        finished_at=None,
+        status=RunStatus.RUNNING.value,
+        item_count=0,
+        error=None,
+    )
+    session.add(row)
+    # flush, not commit: the caller owns the transaction. This populates row.id
+    # from the sequence so the RUNNING row is addressable before scraping starts.
+    session.flush()
+
+    return ScrapeRun(
+        id=row.id,
+        marketplace=marketplace,
+        mode=mode,
+        target=target,
+        started_at=ts,
+        finished_at=None,
+        status=RunStatus.RUNNING,
+        item_count=0,
+        error=None,
+    )
 
 
 def finish_run(
@@ -148,7 +300,29 @@ def finish_run(
     Raises:
         ValueError: If ``run.id`` is None (i.e. ``start_run`` was never called).
     """
-    raise NotImplementedError
+    if run.id is None:
+        raise ValueError("finish_run() requires a ScrapeRun with an id; call start_run() first.")
+
+    ts = _stamp(now)
+    truncated = error[:MAX_ERROR_CHARS] if error is not None else None
+
+    row = session.get(ScrapeRunRow, run.id)
+    if row is None:
+        raise ValueError(f"scrape_runs row {run.id} not found; it may have been rolled back.")
+
+    row.status = status.value
+    row.item_count = item_count
+    row.error = truncated
+    row.finished_at = ts
+    session.flush()
+
+    # Mirror the terminal state back onto the caller's model so it stays the
+    # single object describing this run.
+    run.status = status
+    run.item_count = item_count
+    run.error = truncated
+    run.finished_at = ts
+    return run
 
 
 def get_stats(session: Session, *, marketplace: Marketplace | None = None) -> dict[str, object]:
@@ -171,4 +345,298 @@ def get_stats(session: Session, *, marketplace: Marketplace | None = None) -> di
                 "runs_by_status": dict[str, int],
             }
     """
-    raise NotImplementedError
+    mp = marketplace.value if marketplace is not None else None
+
+    stores_q = select(func.count()).select_from(StoreRow)
+    products_q = select(func.count()).select_from(ProductRow)
+    # price_snapshots has no marketplace column of its own, so scoping a snapshot
+    # count means going through its product.
+    snapshots_q = select(func.count()).select_from(PriceSnapshotRow)
+    last_snapshot_q = select(func.max(PriceSnapshotRow.scraped_at))
+    runs_q = select(func.count()).select_from(ScrapeRunRow)
+    last_run_q = select(func.max(ScrapeRunRow.started_at))
+    by_status_q = select(ScrapeRunRow.status, func.count()).group_by(ScrapeRunRow.status)
+
+    if mp is not None:
+        stores_q = stores_q.where(StoreRow.marketplace == mp)
+        products_q = products_q.where(ProductRow.marketplace == mp)
+        snapshots_q = snapshots_q.join(
+            ProductRow, ProductRow.id == PriceSnapshotRow.product_ref
+        ).where(ProductRow.marketplace == mp)
+        last_snapshot_q = last_snapshot_q.select_from(PriceSnapshotRow).join(
+            ProductRow, ProductRow.id == PriceSnapshotRow.product_ref
+        ).where(ProductRow.marketplace == mp)
+        runs_q = runs_q.where(ScrapeRunRow.marketplace == mp)
+        last_run_q = last_run_q.where(ScrapeRunRow.marketplace == mp)
+        by_status_q = by_status_q.where(ScrapeRunRow.marketplace == mp)
+
+    runs_by_status = {
+        status: count for status, count in session.execute(by_status_q).all() if status is not None
+    }
+
+    return {
+        "stores": session.execute(stores_q).scalar_one(),
+        "products": session.execute(products_q).scalar_one(),
+        "snapshots": session.execute(snapshots_q).scalar_one(),
+        "runs": session.execute(runs_q).scalar_one(),
+        "last_run_at": session.execute(last_run_q).scalar_one(),
+        "last_snapshot_at": session.execute(last_snapshot_q).scalar_one(),
+        "runs_by_status": runs_by_status,
+    }
+
+
+def latest_prices(
+    session: Session,
+    marketplace: Marketplace | None = None,
+    *,
+    limit: int | None = None,
+) -> list[dict[str, object]]:
+    """Return the most recent snapshot for every product — the dashboard's main view.
+
+    One row per product, joined to its shop, carrying the five required output
+    fields (shop username, listing title, price, units sold, product rating) plus
+    the surrounding context. Products with no snapshot yet are omitted.
+
+    Implemented with Postgres ``DISTINCT ON (product_ref) ORDER BY product_ref,
+    scraped_at DESC``, which the ``ix_price_snapshots_product_ref_scraped_at``
+    index serves directly — no correlated subquery, no window function.
+
+    Args:
+        session: Open session, read-only usage.
+        marketplace: Restrict to one marketplace, or None for all.
+        limit: Cap the number of rows, or None for all of them.
+
+    Returns:
+        Rows newest-first, each a dict with keys: ``marketplace``, ``item_id``,
+        ``name``, ``url``, ``image``, ``category``, ``shop_id``, ``shop_username``,
+        ``shop_name``, ``location``, ``price``, ``price_min``, ``price_max``,
+        ``stock``, ``sold``, ``historical_sold``, ``rating_star``,
+        ``rating_count``, ``scraped_at``. Shop-derived keys are None when the
+        product's ``shop_ref`` was never resolved.
+    """
+    latest = (
+        select(
+            PriceSnapshotRow.product_ref.label("product_ref"),
+            PriceSnapshotRow.price.label("price"),
+            PriceSnapshotRow.price_min.label("price_min"),
+            PriceSnapshotRow.price_max.label("price_max"),
+            PriceSnapshotRow.stock.label("stock"),
+            PriceSnapshotRow.sold.label("sold"),
+            PriceSnapshotRow.historical_sold.label("historical_sold"),
+            PriceSnapshotRow.rating_star.label("rating_star"),
+            PriceSnapshotRow.rating_count.label("rating_count"),
+            PriceSnapshotRow.scraped_at.label("scraped_at"),
+        )
+        .distinct(PriceSnapshotRow.product_ref)
+        .order_by(PriceSnapshotRow.product_ref, PriceSnapshotRow.scraped_at.desc())
+        .subquery("latest")
+    )
+
+    query = (
+        select(
+            ProductRow.marketplace.label("marketplace"),
+            ProductRow.item_id.label("item_id"),
+            ProductRow.name.label("name"),
+            ProductRow.url.label("url"),
+            ProductRow.image.label("image"),
+            ProductRow.category.label("category"),
+            StoreRow.shop_id.label("shop_id"),
+            StoreRow.username.label("shop_username"),
+            StoreRow.name.label("shop_name"),
+            StoreRow.location.label("location"),
+            latest.c.price,
+            latest.c.price_min,
+            latest.c.price_max,
+            latest.c.stock,
+            latest.c.sold,
+            latest.c.historical_sold,
+            latest.c.rating_star,
+            latest.c.rating_count,
+            latest.c.scraped_at,
+        )
+        .select_from(latest)
+        .join(ProductRow, ProductRow.id == latest.c.product_ref)
+        # outerjoin: shop_ref is nullable, and a product with an unresolved shop
+        # must still appear in the dashboard.
+        .outerjoin(StoreRow, StoreRow.id == ProductRow.shop_ref)
+        .order_by(latest.c.scraped_at.desc(), ProductRow.item_id)
+    )
+
+    if marketplace is not None:
+        query = query.where(ProductRow.marketplace == marketplace.value)
+    if limit is not None:
+        query = query.limit(limit)
+
+    return [dict(row) for row in session.execute(query).mappings().all()]
+
+
+def recent_runs(
+    session: Session,
+    *,
+    marketplace: Marketplace | None = None,
+    limit: int = 10,
+) -> list[dict[str, object]]:
+    """Return the most recent ``scrape_runs`` rows, newest first.
+
+    Backs the ``stats`` CLI table. Lives here rather than in ``cli.py`` because
+    ``docs/DESIGN.md`` §7 gives ``cli.py`` option parsing and Rich rendering only,
+    and this module all database access.
+
+    Args:
+        session: Open session, read-only usage.
+        marketplace: Restrict to one marketplace, or None for all.
+        limit: Maximum rows to return.
+
+    Returns:
+        Rows newest-first, each a dict with keys ``id``, ``marketplace``,
+        ``mode``, ``target``, ``started_at``, ``finished_at``, ``status``,
+        ``item_count`` and ``error``.
+    """
+    query = (
+        select(
+            ScrapeRunRow.id,
+            ScrapeRunRow.marketplace,
+            ScrapeRunRow.mode,
+            ScrapeRunRow.target,
+            ScrapeRunRow.started_at,
+            ScrapeRunRow.finished_at,
+            ScrapeRunRow.status,
+            ScrapeRunRow.item_count,
+            ScrapeRunRow.error,
+        )
+        # id breaks ties: several targets in one invocation can share a
+        # started_at, and an unstable order makes the table flicker between runs.
+        .order_by(ScrapeRunRow.started_at.desc(), ScrapeRunRow.id.desc())
+        .limit(limit)
+    )
+    if marketplace is not None:
+        query = query.where(ScrapeRunRow.marketplace == marketplace.value)
+    return [dict(row) for row in session.execute(query).mappings().all()]
+
+
+def recent_price_changes(
+    session: Session,
+    *,
+    marketplace: Marketplace | None = None,
+    limit: int = 10,
+) -> list[dict[str, object]]:
+    """Return the most recently observed price *movements*.
+
+    Compares each snapshot with the preceding snapshot of the same product via a
+    ``lag()`` window and keeps only the rows where the price actually changed.
+    This is the headline output of the whole tracker: a price column alone is a
+    catalogue, a price column plus its previous value is a price monitor.
+
+    Rows where either side is NULL are excluded — "price became known" is not a
+    price change, and rendering it as one would invent a fake delta.
+
+    Args:
+        session: Open session, read-only usage.
+        marketplace: Restrict to one marketplace, or None for all.
+        limit: Maximum rows to return.
+
+    Returns:
+        Rows newest-first, each a dict with keys ``scraped_at``, ``marketplace``,
+        ``item_id``, ``product_name``, ``username``, ``previous_price`` and
+        ``price``. ``username`` is None when the product's shop is unresolved.
+    """
+    windowed = (
+        select(
+            PriceSnapshotRow.product_ref.label("product_ref"),
+            PriceSnapshotRow.price.label("price"),
+            PriceSnapshotRow.scraped_at.label("scraped_at"),
+            func.lag(PriceSnapshotRow.price)
+            .over(
+                partition_by=PriceSnapshotRow.product_ref,
+                # id is part of the ordering because the runner stamps one shared
+                # scraped_at across a whole target: without it, two snapshots of
+                # one product in a single batch have no defined predecessor.
+                order_by=(PriceSnapshotRow.scraped_at, PriceSnapshotRow.id),
+            )
+            .label("previous_price"),
+        )
+    ).subquery("windowed")
+
+    query = (
+        select(
+            windowed.c.scraped_at,
+            windowed.c.price,
+            windowed.c.previous_price,
+            ProductRow.marketplace.label("marketplace"),
+            ProductRow.item_id.label("item_id"),
+            ProductRow.name.label("product_name"),
+            StoreRow.username.label("username"),
+        )
+        .select_from(windowed)
+        .join(ProductRow, ProductRow.id == windowed.c.product_ref)
+        .outerjoin(StoreRow, StoreRow.id == ProductRow.shop_ref)
+        .where(windowed.c.previous_price.isnot(None))
+        .where(windowed.c.price.isnot(None))
+        .where(windowed.c.price != windowed.c.previous_price)
+        .order_by(windowed.c.scraped_at.desc())
+        .limit(limit)
+    )
+    if marketplace is not None:
+        query = query.where(ProductRow.marketplace == marketplace.value)
+    return [dict(row) for row in session.execute(query).mappings().all()]
+
+
+def price_history(
+    session: Session,
+    item_id: int,
+    *,
+    marketplace: Marketplace | None = None,
+    limit: int | None = None,
+) -> list[dict[str, object]]:
+    """Return every snapshot recorded for one listing — the dashboard's detail view.
+
+    Consecutive rows are what a price chart and a units-sold velocity calculation
+    are diffed from.
+
+    Note that ``item_id`` alone is not globally unique: uniqueness is
+    ``(marketplace, item_id)``. Left unfiltered this can therefore return rows
+    from two marketplaces that happen to share an id, which is why every row
+    carries its own ``marketplace``. Pass ``marketplace`` to scope it.
+
+    Args:
+        session: Open session, read-only usage.
+        item_id: The marketplace's own item id (``Product.item_id``), not
+            ``products.id``.
+        marketplace: Restrict to one marketplace, or None for all.
+        limit: Cap the number of rows, or None for the full history.
+
+    Returns:
+        Rows ordered newest-first, each a dict with keys: ``marketplace``,
+        ``item_id``, ``name``, ``price``, ``price_min``, ``price_max``, ``stock``,
+        ``sold``, ``historical_sold``, ``rating_star``, ``rating_count``,
+        ``scraped_at``. Empty when the listing is unknown or has no snapshots.
+    """
+    query = (
+        select(
+            ProductRow.marketplace.label("marketplace"),
+            ProductRow.item_id.label("item_id"),
+            ProductRow.name.label("name"),
+            PriceSnapshotRow.price.label("price"),
+            PriceSnapshotRow.price_min.label("price_min"),
+            PriceSnapshotRow.price_max.label("price_max"),
+            PriceSnapshotRow.stock.label("stock"),
+            PriceSnapshotRow.sold.label("sold"),
+            PriceSnapshotRow.historical_sold.label("historical_sold"),
+            PriceSnapshotRow.rating_star.label("rating_star"),
+            PriceSnapshotRow.rating_count.label("rating_count"),
+            PriceSnapshotRow.scraped_at.label("scraped_at"),
+        )
+        .select_from(PriceSnapshotRow)
+        .join(ProductRow, ProductRow.id == PriceSnapshotRow.product_ref)
+        .where(ProductRow.item_id == item_id)
+        # id breaks ties when two snapshots share a scraped_at (the runner stamps
+        # one shared clock value across a batch), keeping the order deterministic.
+        .order_by(PriceSnapshotRow.scraped_at.desc(), PriceSnapshotRow.id.desc())
+    )
+
+    if marketplace is not None:
+        query = query.where(ProductRow.marketplace == marketplace.value)
+    if limit is not None:
+        query = query.limit(limit)
+
+    return [dict(row) for row in session.execute(query).mappings().all()]

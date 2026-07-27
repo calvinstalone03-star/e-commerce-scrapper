@@ -22,17 +22,35 @@ Env var              Field               Notes
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-__all__ = ["Settings", "get_settings", "load_keywords", "load_stores", "load_lines"]
+__all__ = [
+    "Settings",
+    "get_settings",
+    "load_keywords",
+    "load_stores",
+    "load_lines",
+    "dedupe",
+    "normalise_store_entry",
+    "DEFAULT_DATABASE_URL",
+    "DEFAULT_KEYWORDS_FILE",
+    "DEFAULT_STORES_FILE",
+    "DEFAULT_COOKIES_PATH",
+]
 
 DEFAULT_KEYWORDS_FILE = Path("config/keywords.txt")
 DEFAULT_STORES_FILE = Path("config/stores.txt")
 DEFAULT_COOKIES_PATH = Path("cookies.json")
+
+#: Default Postgres URL. Kept as a module constant so tests and the CLI can refer
+#: to it without instantiating :class:`Settings`.
+DEFAULT_DATABASE_URL = "postgresql://calvin@127.0.0.1:5432/ecom_scraper"
 
 
 class Settings(BaseSettings):
@@ -52,7 +70,7 @@ class Settings(BaseSettings):
     )
 
     database_url: str = Field(
-        default="postgresql://calvin@127.0.0.1:5432/ecom_scraper",
+        default=DEFAULT_DATABASE_URL,
         description=(
             "SQLAlchemy/libpq URL for Postgres. scraper.db normalises the driver "
             "prefix to psycopg 3, so a bare 'postgresql://' URL is fine here."
@@ -93,7 +111,14 @@ class Settings(BaseSettings):
         Returns:
             The value unchanged if already a Path, else a Path built from it.
         """
-        raise NotImplementedError
+        if value is None:
+            return DEFAULT_COOKIES_PATH
+        if isinstance(value, Path):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            return DEFAULT_COOKIES_PATH if not text else Path(text).expanduser()
+        return value
 
     @model_validator(mode="after")
     def _check_delay_bounds(self) -> "Settings":
@@ -105,7 +130,11 @@ class Settings(BaseSettings):
         Raises:
             ValueError: If ``min_delay > max_delay``.
         """
-        raise NotImplementedError
+        if self.min_delay > self.max_delay:
+            raise ValueError(
+                f"MIN_DELAY ({self.min_delay}) must not exceed MAX_DELAY ({self.max_delay})"
+            )
+        return self
 
     @property
     def has_credentials(self) -> bool:
@@ -116,7 +145,12 @@ class Settings(BaseSettings):
             set and non-empty. The bootstrap stays logged out otherwise — that
             is the default and supported posture.
         """
-        raise NotImplementedError
+        return bool(
+            self.shopee_username
+            and self.shopee_username.strip()
+            and self.shopee_password
+            and self.shopee_password.strip()
+        )
 
 
 @lru_cache(maxsize=1)
@@ -131,7 +165,7 @@ def get_settings() -> Settings:
     Returns:
         The shared Settings instance.
     """
-    raise NotImplementedError
+    return Settings()
 
 
 def load_lines(path: str | Path) -> list[str]:
@@ -160,7 +194,65 @@ def load_lines(path: str | Path) -> list[str]:
     Raises:
         FileNotFoundError: If ``path`` does not exist.
     """
-    raise NotImplementedError
+    file_path = Path(path).expanduser()
+    if not file_path.is_file():
+        raise FileNotFoundError(f"target file not found: {file_path}")
+
+    lines: list[str] = []
+    for raw in file_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        lines.append(line)
+    return lines
+
+
+def dedupe(values: Iterable[str]) -> list[str]:
+    """Drop repeats from ``values`` while preserving first-seen order.
+
+    Comparison is exact (case- and whitespace-sensitive); callers are expected to
+    have normalised beforehand. Used by :func:`load_keywords`,
+    :func:`load_stores` and ``runner.resolve_targets`` so one invocation never
+    scrapes the same target twice.
+
+    Args:
+        values: Iterable of already-cleaned strings.
+
+    Returns:
+        A new list without duplicates, in first-seen order.
+    """
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
+
+
+def normalise_store_entry(entry: str) -> str:
+    """Reduce one ``config/stores.txt`` line to a bare shop username.
+
+    Tolerates the three forms a human is likely to paste:
+    ``erigostore``, ``@erigostore`` and
+    ``https://shopee.co.id/erigostore?foo=bar#frag``.
+
+    Args:
+        entry: One raw (already whitespace-stripped) line.
+
+    Returns:
+        The bare slug. Returns an empty string when nothing survives, which the
+        caller drops.
+    """
+    text = entry.strip()
+    if "://" in text:
+        text = urlsplit(text).path
+    text = text.split("?", 1)[0].split("#", 1)[0]
+    text = text.strip().strip("/")
+    if "/" in text:
+        text = text.rsplit("/", 1)[-1]
+    return text.lstrip("@").strip()
 
 
 def load_keywords(path: str | Path = DEFAULT_KEYWORDS_FILE) -> list[str]:
@@ -174,12 +266,13 @@ def load_keywords(path: str | Path = DEFAULT_KEYWORDS_FILE) -> list[str]:
         path: Keywords file. Defaults to ``config/keywords.txt``.
 
     Returns:
-        Ordered list of keywords, blanks and ``#`` comments removed.
+        Ordered list of keywords, blanks and ``#`` comments removed, de-duplicated
+        while preserving first-seen order.
 
     Raises:
         FileNotFoundError: If ``path`` does not exist.
     """
-    raise NotImplementedError
+    return dedupe(load_lines(path))
 
 
 def load_stores(path: str | Path = DEFAULT_STORES_FILE) -> list[str]:
@@ -193,9 +286,11 @@ def load_stores(path: str | Path = DEFAULT_STORES_FILE) -> list[str]:
         path: Stores file. Defaults to ``config/stores.txt``.
 
     Returns:
-        Ordered list of bare shop usernames.
+        Ordered list of bare shop usernames, de-duplicated while preserving
+        first-seen order.
 
     Raises:
         FileNotFoundError: If ``path`` does not exist.
     """
-    raise NotImplementedError
+    normalised = (normalise_store_entry(line) for line in load_lines(path))
+    return dedupe(entry for entry in normalised if entry)

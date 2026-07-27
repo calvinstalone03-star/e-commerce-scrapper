@@ -1,0 +1,55 @@
+{
+  "_WARNING": "SYNTHETIC. Not a real capture. Every recon attempt against /api/v4/search/search_items returned the anti-bot envelope {\"error\": 90309999} - see tests/fixtures/shopee_blocked.json - so no genuine search body exists to copy. The shape below is reconstructed from the documented item_basic envelope: field names and the price/rating/sold conventions are taken from the verified get_shop_seo capture plus published field maps, but the VALUES are invented. Replace this file with a real capture the moment one is obtainable.",
+  "version": 2,
+  "error": 0,
+  "nomore": false,
+  "total_count": 2,
+  "items": [
+    {
+      "adsid": null,
+      "campaignid": null,
+      "item_basic": {
+        "itemid": 22334455667,
+        "shopid": 30203584,
+        "name": "Kaos Polos Cotton Combed 30s Unisex Lengan Pendek",
+        "image": "id-11134207-7r98o-lxxxxxxxxxxxxx",
+        "images": ["id-11134207-7r98o-lxxxxxxxxxxxxx"],
+        "currency": "IDR",
+        "stock": 480,
+        "status": 1,
+        "sold": 233,
+        "historical_sold": 18452,
+        "liked_count": 4120,
+        "cmt_count": 3011,
+        "catid": 100011,
+        "price": 5500000000,
+        "price_min": 5500000000,
+        "price_max": 7900000000,
+        "price_before_discount": 9900000000,
+        "shop_location": "JAKARTA BARAT",
+        "shop_name": "Kaos Nusantara",
+        "item_rating": {
+          "rating_star": 4.8231,
+          "rating_count": [1204, 11, 9, 24, 130, 1030]
+        }
+      }
+    },
+    {
+      "adsid": null,
+      "item_basic": {
+        "itemid": 22334455668,
+        "shopid": 991122,
+        "name": "Kaos Polos Oversize Heavyweight 24s",
+        "image": "id-11134207-7r98o-lyyyyyyyyyyyyy",
+        "currency": "IDR",
+        "stock": 0,
+        "sold": 0,
+        "historical_sold": 0,
+        "price": -1,
+        "price_min": 8900000000,
+        "price_max": 12500000000,
+        "shop_location": "BANDUNG"
+      }
+    }
+  ]
+}

@@ -15,9 +15,10 @@ adapter.search_keyword(...)`` unpacks positionally.
 Adapters must:
 
 * return domain models from :mod:`scraper.models`, never raw dicts;
-* leave ``first_seen``/``last_seen``/``scraped_at`` as None and let the
-  repository stamp them (only exception: an adapter may set ``scraped_at`` when
-  the payload carries a server-side observation time);
+* leave ``first_seen``/``last_seen`` as None and let the repository stamp them.
+  ``scraped_at`` is *not* in that list: ``PriceSnapshot`` defaults it to
+  ``utcnow()`` and ``store.insert_snapshot`` only fills it when it is None, so an
+  adapter should simply not pass it and let the model's default stand;
 * convert Shopee-style integer micro-prices to whole-rupiah ``Decimal`` before
   constructing the snapshot;
 * **skip, not raise, on a single malformed item** — one bad entry in a page of
@@ -28,26 +29,33 @@ Adapters must:
 
 from __future__ import annotations
 
-from typing import NamedTuple, Protocol, runtime_checkable
+import importlib
+from collections.abc import Callable
+from typing import Protocol, runtime_checkable
 
-from scraper.models import Marketplace, PriceSnapshot, Product, Store
+from scraper.models import Marketplace, ScrapedItem
 
-__all__ = ["ScrapedItem", "MarketplaceAdapter", "get_adapter"]
+__all__ = [
+    "ScrapedItem",
+    "MarketplaceAdapter",
+    "AdapterFactory",
+    "get_adapter",
+    "register_adapter",
+    "available_marketplaces",
+    "ADAPTER_PATHS",
+]
 
 
-class ScrapedItem(NamedTuple):
-    """One fully-denormalised scraped listing.
-
-    Attributes:
-        store: The owning shop. Carries required output field #1 (``username``).
-        product: The listing. Carries required output field #2 (``name``).
-        snapshot: The volatile observation. Carries required output fields
-            #3 ``price``, #4 ``sold`` and #5 ``rating_star``.
-    """
-
-    store: Store
-    product: Product
-    snapshot: PriceSnapshot
+# ``ScrapedItem`` is re-exported from :mod:`scraper.models`, not redeclared here.
+#
+# The scaffold defined it in both places. Two structurally identical NamedTuples
+# are still two distinct classes, so ``isinstance(item, adapters.ScrapedItem)``
+# would have been False for an item built from ``models.ScrapedItem`` — a bug
+# that only shows up at integration time. ``scraper.models`` is the canonical
+# definition (it is the module every other layer already depends on, and its
+# ``store`` is ``Store | None``, which the runner needs for keyword hits with no
+# resolvable shop). ``from scraper.adapters import ScrapedItem`` keeps working
+# exactly as before.
 
 
 @runtime_checkable
@@ -129,22 +137,106 @@ class MarketplaceAdapter(Protocol):
         ...
 
 
-def get_adapter(marketplace: Marketplace, **kwargs: object) -> MarketplaceAdapter:
+AdapterFactory = Callable[..., MarketplaceAdapter]
+
+#: Marketplace -> ``"module.path:ClassName"`` of its adapter.
+#:
+#: Import is *lazy* (resolved inside :func:`get_adapter`) for two reasons: the
+#: concrete modules import ``ScrapedItem`` from this package, so an eager import
+#: here would be circular; and a marketplace whose adapter needs an optional
+#: dependency must not break ``import scraper.adapters`` for everyone else.
+#:
+#: Adding Tokopedia is exactly one line here — no runner, CLI or store change.
+ADAPTER_PATHS: dict[Marketplace, str] = {
+    Marketplace.SHOPEE: "scraper.adapters.shopee:ShopeeAdapter",
+}
+
+#: Explicitly registered factories, which take precedence over
+#: :data:`ADAPTER_PATHS`. Populated by :func:`register_adapter`.
+_FACTORIES: dict[Marketplace, AdapterFactory] = {}
+
+
+def register_adapter(marketplace: Marketplace | str, factory: AdapterFactory) -> None:
+    """Register (or override) the factory used for a marketplace.
+
+    Lets a test substitute a fake adapter, and lets an out-of-tree marketplace
+    implementation opt into :func:`get_adapter` without editing this module.
+
+    Args:
+        marketplace: Marketplace the factory serves.
+        factory: Any callable returning a :class:`MarketplaceAdapter`; it
+            receives the ``**kwargs`` passed to :func:`get_adapter`.
+
+    Raises:
+        ValueError: If ``marketplace`` is not a known :class:`Marketplace`.
+    """
+    _FACTORIES[_coerce(marketplace)] = factory
+
+
+def available_marketplaces() -> tuple[Marketplace, ...]:
+    """List the marketplaces :func:`get_adapter` can currently build.
+
+    Returns:
+        Marketplaces with a registered factory or a mapped import path, in
+        declaration order.
+    """
+    known = list(ADAPTER_PATHS) + [m for m in _FACTORIES if m not in ADAPTER_PATHS]
+    return tuple(known)
+
+
+def _coerce(marketplace: Marketplace | str) -> Marketplace:
+    """Normalise a marketplace argument to a :class:`Marketplace` member.
+
+    Args:
+        marketplace: Enum member, or its string value (``"shopee"``).
+
+    Returns:
+        The corresponding enum member.
+
+    Raises:
+        ValueError: If the string is not a valid marketplace value.
+    """
+    if isinstance(marketplace, Marketplace):
+        return marketplace
+    try:
+        return Marketplace(str(marketplace).strip().lower())
+    except ValueError as exc:  # pragma: no cover - message construction only
+        valid = ", ".join(m.value for m in Marketplace)
+        raise ValueError(f"unknown marketplace {marketplace!r}; expected one of: {valid}") from exc
+
+
+def get_adapter(marketplace: Marketplace | str, **kwargs: object) -> MarketplaceAdapter:
     """Registry lookup: marketplace -> concrete adapter instance.
 
     The one place that maps an enum member to an implementation, so the CLI and
     the runner never import a concrete adapter module. Adding Tokopedia means
-    adding one entry here.
+    adding one entry to :data:`ADAPTER_PATHS`.
 
     Args:
-        marketplace: Which marketplace to build an adapter for.
+        marketplace: Which marketplace to build an adapter for. Accepts the enum
+            member or its string value, so ``get_adapter("shopee")`` works.
         **kwargs: Forwarded to the adapter's constructor (e.g. ``client=``).
 
     Returns:
         A ready-to-use adapter satisfying :class:`MarketplaceAdapter`.
 
     Raises:
+        ValueError: If ``marketplace`` is not a valid marketplace value at all.
         NotImplementedError: If the marketplace has no adapter yet — the
             expected outcome for ``Marketplace.TOKOPEDIA`` today.
     """
-    raise NotImplementedError
+    member = _coerce(marketplace)
+
+    factory = _FACTORIES.get(member)
+    if factory is None:
+        path = ADAPTER_PATHS.get(member)
+        if path is None:
+            supported = ", ".join(m.value for m in available_marketplaces())
+            raise NotImplementedError(
+                f"no adapter implemented for marketplace {member.value!r}; "
+                f"currently supported: {supported}"
+            )
+        module_name, _, class_name = path.partition(":")
+        factory = getattr(importlib.import_module(module_name), class_name)
+
+    return factory(**kwargs)

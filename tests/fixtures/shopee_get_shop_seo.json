@@ -1,0 +1,63 @@
+{
+  "error": 0,
+  "error_msg": "",
+  "data": {
+    "canonical_url": "https://shopee.co.id/erigostore",
+    "indexable": true,
+    "items": [
+      {
+        "itemid": 2698631224,
+        "shopid": 30203584,
+        "name": "Erigo Chino Pants Sirius Black - Celana Panjang Chino Unisex",
+        "image": "id-11134201-7rbkc-m7umx9q1utm11c",
+        "images": [
+          "id-11134201-7rbkc-m7umx9q1utm11c",
+          "id-11134201-7rbk2-m7umx9rfsr15e9",
+          "id-11134201-7rbk0-m7umx9rpsbz62e",
+          "id-11134201-7rbk7-m7umx9q1uro09f"
+        ],
+        "currency": "IDR",
+        "stock": 1,
+        "status": 1,
+        "ctime": 1566529546,
+        "sold": 612,
+        "historical_sold": 500000,
+        "liked": false,
+        "liked_count": 101148,
+        "catid": 100011,
+        "brand": "0",
+        "cmt_count": 325363,
+        "flag": 33751042,
+        "cb_option": 0,
+        "item_status": "normal",
+        "price": 15290000000,
+        "price_min": 15290000000,
+        "price_max": 15290000000,
+        "price_min_before_discount": 50000000000,
+        "price_max_before_discount": 50000000000,
+        "price_before_discount": 50000000000,
+        "has_lowest_price_guarantee": false,
+        "show_discount": 0,
+        "raw_discount": 69,
+        "discount": "-69%",
+        "size_chart": "",
+        "item_rating": {
+          "rating_star": 4.833337902673064,
+          "rating_count": [328378, 1856, 1196, 6022, 31892, 287412],
+          "rcount_with_context": 65646,
+          "rcount_with_image": 47882
+        },
+        "item_card_display_price": {
+          "price": 15290000000
+        },
+        "item_card_display_sold_count": {
+          "sold_count": 612
+        },
+        "shop_name": "ERIGO Official Shop",
+        "shop_location": "KAB. TANGERANG",
+        "shop_rating": 4.844464,
+        "is_official_shop": true
+      }
+    ]
+  }
+}

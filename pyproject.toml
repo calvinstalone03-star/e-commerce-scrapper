@@ -40,6 +40,9 @@ packages = ["scraper"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "slow: opt-in test that launches a real browser or hits the live network",
+]
 
 [tool.ruff]
 line-length = 100

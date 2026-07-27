@@ -85,6 +85,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 
 from sqlalchemy import (
     BigInteger,
@@ -98,7 +99,14 @@ from sqlalchemy import (
     create_engine,
 )
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    mapped_column,
+    relationship,
+    sessionmaker,
+)
 
 __all__ = [
     "Base",
@@ -207,6 +215,63 @@ class ScrapeRunRow(Base):
     error: Mapped[str | None] = mapped_column(Text)
 
 
+#: Project root — the directory containing ``scraper/`` and ``migrations/``.
+#: Used to resolve a relative ``migrations_dir`` when the process was not started
+#: from the repository root (e.g. pytest invoked from elsewhere).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+#: Process-wide engine cache, keyed on ``(normalised_url, echo)``. Engines own
+#: connection pools, so one per URL for the lifetime of the process — never one
+#: per call.
+_ENGINES: dict[tuple[str, bool], Engine] = {}
+
+#: Process-wide session-factory cache, keyed on the Engine itself rather than on
+#: the URL string — ``str(engine.url)`` masks the password, so two URLs differing
+#: only by credentials would collide on a string key.
+_SESSIONMAKERS: dict[Engine, sessionmaker[Session]] = {}
+
+
+def _resolve_url(database_url: str | None) -> str:
+    """Fall back to configured settings when no explicit URL was supplied.
+
+    Args:
+        database_url: Caller-supplied URL, or None.
+
+    Returns:
+        The URL to connect with, before driver normalisation.
+    """
+    if database_url:
+        return database_url
+    # Imported lazily so that importing scraper.db never forces .env parsing —
+    # tests that pass an explicit URL must not need a Settings instance at all.
+    from scraper.config import get_settings
+
+    return get_settings().database_url
+
+
+def _normalise_url(database_url: str) -> str:
+    """Rewrite a Postgres URL onto the psycopg 3 driver.
+
+    ``postgres://`` (legacy libpq/Heroku form) and bare ``postgresql://`` both
+    become ``postgresql+psycopg://``. A URL that already names a driver
+    (``postgresql+psycopg://``, ``postgresql+asyncpg://``, ...) is left alone, as
+    is any non-Postgres URL.
+
+    Args:
+        database_url: Raw URL from settings or a caller.
+
+    Returns:
+        The URL with an explicit psycopg 3 driver where applicable.
+    """
+    if database_url.startswith("postgresql+"):
+        return database_url
+    if database_url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + database_url[len("postgresql://") :]
+    if database_url.startswith("postgres://"):
+        return "postgresql+psycopg://" + database_url[len("postgres://") :]
+    return database_url
+
+
 def get_engine(database_url: str | None = None, *, echo: bool = False) -> Engine:
     """Build (and process-cache) the SQLAlchemy :class:`Engine`.
 
@@ -224,7 +289,15 @@ def get_engine(database_url: str | None = None, *, echo: bool = False) -> Engine
     Returns:
         A configured Engine with ``pool_pre_ping=True``.
     """
-    raise NotImplementedError
+    url = _normalise_url(_resolve_url(database_url))
+    key = (url, echo)
+    engine = _ENGINES.get(key)
+    if engine is None:
+        # pool_pre_ping guards against connections killed while the scraper was
+        # sleeping out its inter-request delay (a scrape run is mostly waiting).
+        engine = create_engine(url, echo=echo, pool_pre_ping=True, future=True)
+        _ENGINES[key] = engine
+    return engine
 
 
 def get_sessionmaker(database_url: str | None = None) -> sessionmaker[Session]:
@@ -239,7 +312,16 @@ def get_sessionmaker(database_url: str | None = None) -> sessionmaker[Session]:
     Returns:
         A ``sessionmaker`` producing :class:`sqlalchemy.orm.Session` objects.
     """
-    raise NotImplementedError
+    engine = get_engine(database_url)
+    factory = _SESSIONMAKERS.get(engine)
+    if factory is None:
+        # expire_on_commit=False: repository functions hand back ids/rows read off
+        # a flushed instance, and the runner commits underneath them. With the
+        # default (True) every attribute access after commit would re-SELECT, or
+        # blow up once the session is closed.
+        factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+        _SESSIONMAKERS[engine] = factory
+    return factory
 
 
 @contextmanager
@@ -259,7 +341,57 @@ def session_scope(database_url: str | None = None) -> Iterator[Session]:
         Exception: Re-raises whatever the body raised, after rolling back and
             closing the session.
     """
-    raise NotImplementedError
+    session = get_sessionmaker(database_url)()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def _resolve_migrations_dir(migrations_dir: str) -> Path:
+    """Locate the migrations directory, tolerating an unhelpful working directory.
+
+    An absolute path is used as-is. A relative path is tried against the current
+    working directory first, then against the repository root, so ``initdb`` and
+    pytest behave the same no matter where they were launched from.
+
+    Args:
+        migrations_dir: Absolute or relative directory path.
+
+    Returns:
+        The best candidate Path. May not exist — callers treat "no ``.sql`` files"
+        as "nothing to apply" rather than as an error.
+    """
+    candidate = Path(migrations_dir)
+    if candidate.is_absolute():
+        return candidate
+    if candidate.is_dir():
+        return candidate
+    return _PROJECT_ROOT / candidate
+
+
+def _has_ddl(sql: str) -> bool:
+    """Whether a ``.sql`` file contains anything other than comments and blanks.
+
+    The scaffolded ``001_init.sql`` shipped as a comments-only placeholder, and
+    :func:`init_db` needs to tell that apart from real DDL so it knows whether to
+    fall back to ``Base.metadata.create_all``.
+
+    Args:
+        sql: Full text of a migration file.
+
+    Returns:
+        True if at least one line has content outside a ``--`` line comment.
+    """
+    for line in sql.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("--"):
+            return True
+    return False
 
 
 def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> list[str]:
@@ -279,7 +411,24 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> list[s
     Raises:
         sqlalchemy.exc.SQLAlchemyError: If any file fails; earlier files stay applied.
     """
-    raise NotImplementedError
+    directory = _resolve_migrations_dir(migrations_dir)
+    applied: list[str] = []
+    for path in sorted(directory.glob("*.sql"), key=lambda p: p.name):
+        sql = path.read_text(encoding="utf-8")
+        if not _has_ddl(sql):
+            # A comments-only placeholder file. Skip rather than opening an empty
+            # transaction, and do not report it as applied.
+            continue
+        # engine.begin() gives each file its own transaction: a later file failing
+        # leaves earlier ones committed, which is what the docstring promises.
+        with engine.begin() as conn:
+            # exec_driver_sql, not text(): migration SQL is raw and must not be
+            # scanned for ":name" bind parameters or have "%" interpreted. psycopg
+            # happily runs several semicolon-separated statements in one call as
+            # long as no parameters are bound.
+            conn.exec_driver_sql(sql)
+        applied.append(path.name)
+    return applied
 
 
 def init_db(database_url: str | None = None) -> None:
@@ -296,4 +445,10 @@ def init_db(database_url: str | None = None) -> None:
     Raises:
         sqlalchemy.exc.OperationalError: If Postgres is unreachable.
     """
-    raise NotImplementedError
+    engine = get_engine(database_url)
+    applied = run_migrations(engine)
+    if not applied:
+        # No migration file carried real DDL (the scaffolded placeholder state).
+        # Fall back to the ORM metadata so the project is usable regardless.
+        # create_all() is itself checkfirst=True, so this stays idempotent.
+        Base.metadata.create_all(engine)
