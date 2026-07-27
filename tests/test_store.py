@@ -348,6 +348,54 @@ def test_upsert_store_applies_non_null_updates(session):
     assert row.location == "KAB. TANGERANG", "untouched columns keep their value"
 
 
+def test_upsert_store_keeps_a_real_slug_against_a_synthetic_one(session):
+    """A placeholder username must never displace a real one. Regression.
+
+    ``stores.username`` is NOT NULL, so an adapter with no slug in the payload
+    has to invent one (``shop-30203584``). That is a non-null string, so the
+    plain ``COALESCE(excluded, stored)`` rule happily picked it — meaning the
+    first keyword-mode hit for a shop overwrote the real slug a store-mode scrape
+    had captured, and ``latest_prices()`` then reported ``shop-30203584`` as the
+    seller of every one of that shop's products. Required output field #1,
+    corrupted by a routine second scrape.
+    """
+    upsert_store(session, make_store(username="erigostore"), now=T0)
+
+    upsert_store(
+        session,
+        make_store(username="shop-30203584", name=None, location=None,
+                   follower_count=None, rating_star=None),
+        now=T1,
+        username_is_synthetic=True,
+    )
+
+    row = row_of(session, StoreRow)
+    assert row.username == "erigostore", "the stored real slug wins over a placeholder"
+    assert row.last_seen == T1, "the row is still touched — only username is protected"
+
+
+def test_upsert_store_accepts_a_synthetic_username_for_a_brand_new_shop(session):
+    """With nothing stored, the placeholder is better than failing a NOT NULL column."""
+    upsert_store(
+        session,
+        make_store(username="shop-30203584"),
+        now=T0,
+        username_is_synthetic=True,
+    )
+
+    assert row_of(session, StoreRow).username == "shop-30203584"
+
+
+def test_upsert_store_real_slug_still_overwrites_a_stored_placeholder(session):
+    """The guard is one-directional: a real slug must still upgrade a placeholder."""
+    upsert_store(
+        session, make_store(username="shop-30203584"), now=T0, username_is_synthetic=True
+    )
+    upsert_store(session, make_store(username="erigostore"), now=T1)
+
+    assert row_of(session, StoreRow).username == "erigostore"
+
+
 def test_upsert_store_separates_marketplaces(session):
     """Natural key is (marketplace, shop_id): one shop_id on two marketplaces is two rows."""
     shopee_id = upsert_store(session, make_store(marketplace=Marketplace.SHOPEE), now=T0)

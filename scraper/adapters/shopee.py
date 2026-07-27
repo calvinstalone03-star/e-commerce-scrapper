@@ -67,7 +67,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote, urlparse
 
 from scraper.adapters import ScrapedItem
@@ -101,9 +101,38 @@ __all__ = [
     "normalise_username",
     "placeholder_username",
     "is_placeholder_username",
+    "ParseStats",
 ]
 
 log = logging.getLogger(__name__)
+
+
+class ParseStats(NamedTuple):
+    """How a search call's raw payload entries fared through :func:`parse_item`.
+
+    Exists so "the shop is empty" and "Shopee renamed a field overnight" stop
+    looking identical downstream. Both end with zero :class:`ScrapedItem`; only
+    the second has ``raw_seen > 0`` with ``parsed == 0``.
+
+    Attributes:
+        raw_seen: Entries :func:`_extract_items` recognised as listings.
+        parsed: Entries that became a :class:`ScrapedItem`.
+        skipped: Entries dropped as malformed, plus duplicates within the call.
+    """
+
+    raw_seen: int
+    parsed: int
+    skipped: int
+
+    @property
+    def drifted(self) -> bool:
+        """True when the endpoint returned entries but none of them parsed.
+
+        Returns:
+            Whether this looks like a schema change rather than an empty result.
+        """
+        return self.raw_seen > 0 and self.parsed == 0
+
 
 #: Alias of :data:`scraper.models.SHOPEE_PRICE_DIVISOR`, kept because this
 #: module's public surface names it ``PRICE_DIVISOR``. There is exactly one
@@ -342,6 +371,9 @@ def parse_rating(raw: Mapping[str, Any]) -> tuple[Decimal | None, int | None]:
     when the endpoint does not expose ratings at all — which is what the
     verified ``get_shop_seo`` listing does.
 
+    A star of ``0`` backed by a rating count of ``0`` (or none at all) is read as
+    "no ratings yet" and returned as ``None``, not as a zero-star rating.
+
     Values are coerced but deliberately **not** range-checked here: an
     out-of-range star is clamped by :class:`~scraper.models.PriceSnapshot`, which
     emits a :class:`~scraper.models.RatingOutOfRangeWarning` while doing so.
@@ -373,6 +405,16 @@ def parse_rating(raw: Mapping[str, Any]) -> tuple[Decimal | None, int | None]:
         count = _as_int(counts)
     if count is not None and count < 0:
         count = None
+
+    # "Never reviewed" and "reviewed, and the average is 0.0" are different facts
+    # and Shopee spells both `"rating_star": 0`. The rating count disambiguates:
+    # a 0 with no ratings behind it is an absent measurement, so it degrades to
+    # None per this module's rule that a missing numeric means "not exposed", not
+    # zero. Without this, every unreviewed listing sorts below a genuine 1-star
+    # product, drags each shop's AVG(rating_star) toward zero, and is silently
+    # excluded by a "rating >= 4" filter.
+    if star is not None and star == 0 and not count:
+        star = None
 
     return star, count
 
@@ -701,9 +743,19 @@ def _extract_items(payload: Any) -> list[dict[str, Any]]:
         payload: Decoded JSON body.
 
     Returns:
-        The item dicts, or an empty list when the payload carries none. Never
-        raises — an unrecognised shape reads as "no items", which pagination
-        treats as the end of the results.
+        The item dicts from **every** recognised container, concatenated in the
+        order tried and de-duplicated on ``itemid``. Empty when the payload
+        carries none. Never raises — an unrecognised shape reads as "no items",
+        which pagination treats as the end of the results.
+
+    Note:
+        Accumulating rather than returning the first non-empty container is
+        load-bearing. ``/recommend`` genuinely answers with a *list* of sections,
+        and short-circuiting on section 0 both dropped the rest of the page and —
+        because the truncated count then looks like a short page — convinced
+        :meth:`ShopeeAdapter._is_last_page` that pagination was finished, so the
+        remainder of a 2000-item shop was never requested and the run still
+        recorded SUCCESS.
     """
     if not isinstance(payload, Mapping):
         return []
@@ -713,7 +765,6 @@ def _extract_items(payload: Any) -> list[dict[str, Any]]:
         _dig(payload, "data", "items"),
         _dig(payload, "data", "item"),
         _dig(payload, "data", "products"),
-        _dig(payload, "data", "sections", 0, "data", "item"),
     ]
 
     sections = _dig(payload, "data", "sections")
@@ -722,12 +773,30 @@ def _extract_items(payload: Any) -> list[dict[str, Any]]:
             candidates.append(_dig(section, "data", "item"))
             candidates.append(_dig(section, "data", "items"))
 
+    merged: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    seen_objects: set[int] = set()
     for candidate in candidates:
-        if isinstance(candidate, Sequence) and not isinstance(candidate, (str, bytes)):
-            items = [entry for entry in candidate if isinstance(entry, Mapping)]
-            if items:
-                return [dict(entry) for entry in items]
-    return []
+        if not isinstance(candidate, Sequence) or isinstance(candidate, (str, bytes)):
+            continue
+        for entry in candidate:
+            if not isinstance(entry, Mapping):
+                continue
+            # The same list can be reachable by two of the paths above (a
+            # payload with both `data.item` and one section carrying it), so
+            # de-duplicate on the marketplace id, falling back to object
+            # identity for entries that have none.
+            item_id = _as_int(_first(entry, "itemid", "item_id", "itemId"))
+            if item_id is not None:
+                if item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
+            else:
+                if id(entry) in seen_objects:
+                    continue
+                seen_objects.add(id(entry))
+            merged.append(dict(entry))
+    return merged
 
 
 def _is_error_payload(payload: Any) -> bool:
@@ -888,6 +957,12 @@ class ShopeeAdapter:
         self._shop_cache: dict[str, Store] = {}
         self._username_cache: dict[int, str | None] = {}
         self._closed = False
+        #: Raw-vs-parsed tally for the most recent search call. The runner reads
+        #: it (duck-typed, via ``getattr``) to tell "Shopee returned nothing"
+        #: apart from "Shopee returned entries we no longer recognise" — without
+        #: it, a field rename downstream of a 200 OK reads exactly like an empty
+        #: shop and the run goes green while collecting nothing.
+        self.last_parse_stats = ParseStats(0, 0, 0)
 
     # -- properties ------------------------------------------------------- #
 
@@ -926,6 +1001,7 @@ class ShopeeAdapter:
             scraper.client.BlockedError: If blocked and re-bootstrap failed.
         """
         self._check_pages(pages)
+        self._reset_parse_stats()
         term = (keyword or "").strip()
         if not term:
             raise ValueError("keyword is empty")
@@ -948,6 +1024,18 @@ class ShopeeAdapter:
             try:
                 payload = self._client.get_json(SEARCH_PATH, params, referer=referer)
             except BlockedError:
+                # Mirror _walk_shop_strategy: pages already walked are real data
+                # and must survive a mid-walk block. Keyword mode is the mode
+                # most likely to be blocked, so discarding its partials here lost
+                # the most data of any path in the scraper.
+                if collected:
+                    log.warning(
+                        "keyword %r blocked at page %d; keeping %d items collected so far",
+                        term,
+                        page,
+                        len(collected),
+                    )
+                    break
                 raise
             except ScraperHTTPError as exc:
                 log.warning(
@@ -1004,22 +1092,23 @@ class ShopeeAdapter:
             scraper.client.BlockedError: If every listing endpoint was blocked.
         """
         self._check_pages(pages)
+        self._reset_parse_stats()
         store = self.get_shop(username)
         referer = f"{SITE_BASE}/{store.username}"
 
         collected: list[ScrapedItem] = []
         seen: set[int] = set()
         blocked: BlockedError | None = None
-        strategies_tried = 0
+        blocked_count = 0
 
         for strategy in SHOP_LISTING_STRATEGIES:
-            strategies_tried += 1
             try:
                 items = self._walk_shop_strategy(
                     strategy, store.shop_id, pages, referer, seen, store.username
                 )
             except BlockedError as exc:
                 blocked = exc
+                blocked_count += 1
                 log.warning(
                     "shop %s: listing endpoint %s blocked; trying next strategy",
                     store.username,
@@ -1035,10 +1124,23 @@ class ShopeeAdapter:
                 break
             log.debug("shop %s: %s returned no items", store.username, strategy.name)
 
-        if not collected and blocked is not None and strategies_tried == len(
+        # Only "every endpoint was blocked" is an honest block. Counting merely
+        # *tried* strategies re-raised a stale BlockedError whenever one endpoint
+        # was blocked and the others answered 200 with an empty catalogue — a
+        # shop with no active listings was reported FAILED, and an operator was
+        # sent chasing an anti-bot problem that did not exist.
+        if not collected and blocked is not None and blocked_count == len(
             SHOP_LISTING_STRATEGIES
         ):
             raise blocked
+        if not collected and blocked is not None:
+            log.warning(
+                "shop %s: %d of %d listing endpoints blocked, the rest returned no "
+                "items; reporting an empty shop rather than a block",
+                store.username,
+                blocked_count,
+                len(SHOP_LISTING_STRATEGIES),
+            )
 
         return [item._replace(store=store) for item in collected]
 
@@ -1252,7 +1354,9 @@ class ShopeeAdapter:
             The successfully parsed items, in payload order.
         """
         parsed: list[ScrapedItem] = []
+        raw_seen = 0
         for raw in raw_items:
+            raw_seen += 1
             try:
                 item = parse_item(dict(raw) if isinstance(raw, Mapping) else raw)
             except (ValueError, TypeError, KeyError, AttributeError) as exc:
@@ -1271,7 +1375,26 @@ class ShopeeAdapter:
                 continue
             seen.add(item.product.item_id)
             parsed.append(item)
+
+        self.last_parse_stats = ParseStats(
+            raw_seen=self.last_parse_stats.raw_seen + raw_seen,
+            parsed=self.last_parse_stats.parsed + len(parsed),
+            skipped=self.last_parse_stats.skipped + raw_seen - len(parsed),
+        )
+        if raw_seen and not parsed:
+            # Every entry on a page failing is not "a bad item" — it is the shape
+            # of a schema change, and the only place it is visible.
+            log.error(
+                "%s: all %d entries on this page failed to parse — Shopee's payload "
+                "shape may have changed",
+                context,
+                raw_seen,
+            )
         return parsed
+
+    def _reset_parse_stats(self) -> None:
+        """Zero :attr:`last_parse_stats` at the start of a search call."""
+        self.last_parse_stats = ParseStats(0, 0, 0)
 
     def _walk_shop_strategy(
         self,

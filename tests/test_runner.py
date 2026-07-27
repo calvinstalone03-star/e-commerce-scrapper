@@ -240,6 +240,22 @@ class _FakeState:
         self.sequences[kind] += 1
         return self.sequences[kind]
 
+    def restore(self, other: "_FakeState") -> None:
+        """Adopt ``other``'s contents in place, as a SAVEPOINT rollback would.
+
+        In place, not by rebinding, because the session holds a reference to this
+        object and every repository call reads through it.
+
+        Note the deliberate exception: ``sequences`` is NOT restored. Postgres
+        sequences are non-transactional, so an id burned inside a rolled-back
+        savepoint is never handed out again. Modelling that keeps the fake honest
+        about a subtle real behaviour.
+        """
+        self.stores = {k: dict(v) for k, v in other.stores.items()}
+        self.products = {k: dict(v) for k, v in other.products.items()}
+        self.snapshots = [dict(row) for row in other.snapshots]
+        self.runs = {k: dict(v) for k, v in other.runs.items()}
+
 
 class _FakeSession:
     """Stand-in for a SQLAlchemy Session; just carries the working state."""
@@ -247,9 +263,27 @@ class _FakeSession:
     def __init__(self, state: _FakeState) -> None:
         """Bind the session to the transaction's working state."""
         self.state = state
+        self.savepoints = 0
+        self.savepoint_rollbacks = 0
 
     def flush(self) -> None:
         """No-op; the fake assigns ids eagerly."""
+
+    @contextmanager
+    def begin_nested(self) -> Any:
+        """SAVEPOINT semantics: undo only this block's writes on an exception.
+
+        The runner wraps each item in one of these so a row Postgres rejects
+        costs that row and nothing else.
+        """
+        self.savepoints += 1
+        checkpoint = self.state.copy()
+        try:
+            yield self
+        except BaseException:
+            self.savepoint_rollbacks += 1
+            self.state.restore(checkpoint)
+            raise
 
 
 class FakeDatabase:
@@ -265,6 +299,7 @@ class FakeDatabase:
         """Start empty with all call counters at zero."""
         self.committed = _FakeState()
         self.upsert_store_calls: list[int] = []
+        self.synthetic_username_flags: list[bool] = []
         self.upsert_product_calls: list[int] = []
         self.insert_snapshot_calls: list[int] = []
         self.commits = 0
@@ -288,9 +323,17 @@ class FakeDatabase:
 
     # -- repository functions ---------------------------------------------
 
-    def upsert_store(self, session: Any, store: Store, *, now: datetime | None = None) -> int:
+    def upsert_store(
+        self,
+        session: Any,
+        store: Store,
+        *,
+        now: datetime | None = None,
+        username_is_synthetic: bool = False,
+    ) -> int:
         """Insert or update a shop keyed on ``(marketplace, shop_id)``."""
         self.upsert_store_calls.append(store.shop_id)
+        self.synthetic_username_flags.append(username_is_synthetic)
         state: _FakeState = session.state
         key = (store.marketplace.value, store.shop_id)
         row = state.stores.get(key)
@@ -299,6 +342,11 @@ class FakeDatabase:
             state.stores[key] = row
         incoming = store.model_dump(exclude={"first_seen", "last_seen"})
         for name, value in incoming.items():
+            # A synthetic username must never displace a stored real slug — the
+            # column is NOT NULL, so the adapter cannot signal "unknown" with a
+            # None the plain COALESCE rule below would skip.
+            if name == "username" and username_is_synthetic and row.get("username"):
+                continue
             if value is not None or row.get(name) is None:
                 row[name] = value
         row["last_seen"] = now
@@ -340,7 +388,11 @@ class FakeDatabase:
         row = snapshot.model_dump(exclude={"item_id"})
         row["id"] = state.next_id("snapshot")
         row["product_ref"] = product_ref
-        row["scraped_at"] = snapshot.scraped_at or now
+        # Same precedence as store.insert_snapshot: an explicit `now` WINS over
+        # the model's own default_factory value, which is what gives a target one
+        # shared clock. The fake used to have this backwards, which hid the
+        # runner's timestamp ordering entirely.
+        row["scraped_at"] = now if now is not None else snapshot.scraped_at
         state.snapshots.append(row)
         return int(row["id"])
 
@@ -457,11 +509,11 @@ def build_runner(adapter: FakeAdapter, **kwargs: Any) -> ScrapeRunner:
 
 
 def test_failing_target_does_not_abort_the_others(fake_db: FakeDatabase) -> None:
-    """Target 2 blows up mid-write; targets 1 and 3 still commit."""
+    """An un-persistable listing costs that listing only, not its target's siblings."""
     adapter = FakeAdapter(
         {
             "kw-one": [make_item(shop_id=101, item_id=1001, price=10_000, username="othershop")],
-            # kw-two persists one good item, then hits the poison item and dies.
+            # kw-two persists one good item, then hits the poison item.
             "kw-two": [
                 make_item(shop_id=102, item_id=1002, price=20_000, username="othershop"),
                 make_item(shop_id=102, item_id=POISON_ITEM_ID, price=30_000, username="othershop"),
@@ -474,8 +526,10 @@ def test_failing_target_does_not_abort_the_others(fake_db: FakeDatabase) -> None
     summary = runner.run_keywords(["kw-one", "kw-two", "kw-three"])
 
     assert isinstance(summary, RunSummary)
+    # kw-two is PARTIAL, not SUCCESS, so it counts as a failed target — but its
+    # good sibling still made it to disk.
     assert (summary.targets, summary.ok, summary.failed) == (3, 2, 1)
-    assert summary.total_items == 2
+    assert summary.total_items == 3
     assert summary.success is False
     assert summary.elapsed >= 0.0
 
@@ -484,19 +538,22 @@ def test_failing_target_does_not_abort_the_others(fake_db: FakeDatabase) -> None
     assert summary.result.ok is False
     assert summary.result.status is RunStatus.PARTIAL
 
-    # Targets 1 and 3 committed; every write from target 2 rolled back — including
-    # item 1002, which had already been inserted when the poison item failed.
-    assert fake_db.committed_item_ids() == {1001, 1003}
-    assert fake_db.snapshots_for(1002) == []
-    assert fake_db.rollbacks == 1
+    # The SAVEPOINT around the poison item rolled back only that item; 1002,
+    # written just before it, survived.
+    assert fake_db.committed_item_ids() == {1001, 1002, 1003}
+    assert len(fake_db.snapshots_for(1002)) == 1
+    assert fake_db.snapshots_for(POISON_ITEM_ID) == []
+    assert fake_db.rollbacks == 0
 
-    # All three targets still produced an audit row, and target 2's carries the error.
+    # All three targets produced an audit row; kw-two's is PARTIAL and says how
+    # many items it dropped, rather than silently reporting zero.
     runs = fake_db.runs_by_target()
     assert set(runs) == {"kw-one", "kw-two", "kw-three"}
     assert runs["kw-one"]["status"] == RunStatus.SUCCESS.value
     assert runs["kw-three"]["status"] == RunStatus.SUCCESS.value
-    assert runs["kw-two"]["status"] == RunStatus.FAILED.value
-    assert runs["kw-two"]["item_count"] == 0
+    assert runs["kw-two"]["status"] == RunStatus.PARTIAL.value
+    assert runs["kw-two"]["item_count"] == 1
+    assert "1 of 2" in runs["kw-two"]["error"]
     assert "simulated write failure" in runs["kw-two"]["error"]
 
     # And the adapter was asked for all three targets — the loop never short-circuited.
@@ -998,7 +1055,7 @@ def test_pg_target_isolation_and_shop_cache(
     )
 
     assert (summary.targets, summary.ok, summary.failed) == (3, 2, 1)
-    assert summary.total_items == 2
+    assert summary.total_items == 3
 
     with db.session_scope(pg_url) as session:
         persisted = set(
@@ -1006,7 +1063,9 @@ def test_pg_target_isolation_and_shop_cache(
                 select(db.ProductRow.item_id).where(db.ProductRow.item_id >= TEST_ID_BASE)
             ).scalars()
         )
-        assert persisted == {keep_a, keep_b}, "the failing target must have rolled back"
+        assert persisted == {keep_a, keep_b, doomed_ok}, (
+            "only the rejected row may be lost, not its target's siblings"
+        )
 
         shop_rows = list(
             session.execute(
@@ -1025,7 +1084,7 @@ def test_pg_target_isolation_and_shop_cache(
             ).all()
         )
         assert statuses[targets[0]] == RunStatus.SUCCESS.value
-        assert statuses[targets[1]] == RunStatus.FAILED.value
+        assert statuses[targets[1]] == RunStatus.PARTIAL.value
         assert statuses[targets[2]] == RunStatus.SUCCESS.value
 
 
@@ -1071,3 +1130,311 @@ def test_pg_snapshots_accumulate_across_runs(pg_url: str) -> None:
             .where(db.ProductRow.item_id == item_id)
         ).scalar_one()
         assert product_count == 1
+
+
+# --------------------------------------------------------------------------
+# Regressions from the review
+# --------------------------------------------------------------------------
+
+
+def test_the_run_is_committed_before_the_network_phase(fake_db: FakeDatabase) -> None:
+    """No transaction may be held open across the fetch. Regression.
+
+    ``_execute_target`` used to open one ``session_scope``, flush the RUNNING
+    audit row (which opens a Postgres write transaction) and only *then* start
+    the paged HTTP walk — sleeps, 30s timeouts, a possible Playwright
+    re-bootstrap and all. The connection sat ``idle in transaction`` for the
+    whole scrape, so any ``idle_in_transaction_session_timeout`` or
+    transaction-pooling proxy killed it and discarded a target that had actually
+    succeeded. It also meant the flushed RUNNING row was invisible to every other
+    connection and vanished on rollback, contradicting ``start_run``'s docstring.
+
+    Asserted structurally: the fake records a commit per transaction, and the
+    adapter records the commit count it observed at fetch time.
+    """
+    adapter = FakeAdapter({"kw": [make_item(shop_id=1, item_id=11, price=1000)]})
+    commits_at_fetch: list[int] = []
+    runs_visible_at_fetch: list[int] = []
+
+    original_search = adapter.search_keyword
+
+    def observing_search(keyword: str, pages: int = 1) -> list[ScrapedItem]:
+        commits_at_fetch.append(fake_db.commits)
+        runs_visible_at_fetch.append(len(fake_db.committed.runs))
+        return original_search(keyword, pages)
+
+    adapter.search_keyword = observing_search  # type: ignore[method-assign]
+    runner = build_runner(adapter, enrich_shops=False)
+
+    runner.run_keywords(["kw"])
+
+    assert commits_at_fetch == [1], "the RUNNING row's transaction closed before the fetch"
+    assert runs_visible_at_fetch == [1], (
+        "a crashed process must leave a committed RUNNING row behind as evidence"
+    )
+    assert fake_db.commits == 2, "one transaction for the audit row, one for the data"
+
+
+def test_a_placeholder_username_is_flagged_to_the_repository(fake_db: FakeDatabase) -> None:
+    """The adapter's synthetic-slug predicate must reach ``upsert_store``. Regression.
+
+    ``is_placeholder_username``'s own docstring claimed store.upsert_store used it
+    "to avoid overwriting a real slug with a synthetic one" — but nothing in the
+    persist path ever consulted it, so every keyword-mode scrape overwrote the
+    real slug with ``shop-<id>``.
+    """
+    adapter = FakeAdapter(
+        {"kw": [make_item(shop_id=30203584, item_id=11, price=1000,
+                          username="shop-30203584")]}
+    )
+    adapter.is_placeholder_username = lambda name: bool(name) and name.startswith("shop-")  # type: ignore[attr-defined]
+    runner = build_runner(adapter, enrich_shops=False)
+
+    runner.run_keywords(["kw"])
+
+    assert fake_db.synthetic_username_flags == [True]
+
+
+def test_a_real_username_is_not_flagged_as_synthetic(fake_db: FakeDatabase) -> None:
+    """The flag must be off for a genuine slug, or real usernames stop updating."""
+    adapter = FakeAdapter(
+        {"kw": [make_item(shop_id=30203584, item_id=11, price=1000, username="erigostore")]}
+    )
+    adapter.is_placeholder_username = lambda name: bool(name) and name.startswith("shop-")  # type: ignore[attr-defined]
+    runner = build_runner(adapter, enrich_shops=False)
+
+    runner.run_keywords(["kw"])
+
+    assert fake_db.synthetic_username_flags == [False]
+
+
+def test_one_listing_matched_by_two_targets_is_snapshotted_once(
+    fake_db: FakeDatabase,
+) -> None:
+    """Overlapping targets must not put two points on the chart. Regression.
+
+    Two keywords in one invocation that both return the same listing produced two
+    near-identical snapshots milliseconds apart, so ``price_history`` showed
+    duplicate points and any "units sold since the previous snapshot" velocity
+    divided a zero delta by a ~25 ms interval.
+    """
+    shared = make_item(shop_id=1, item_id=2698631224, price=152_900, username="erigostore")
+    adapter = FakeAdapter({"kaos polos": [shared], "celana chino": [shared]})
+    runner = build_runner(adapter, enrich_shops=False)
+
+    summary = runner.run_keywords(["kaos polos", "celana chino"])
+
+    assert len(fake_db.snapshots_for(2698631224)) == 1
+    assert summary.total_items == 1
+    assert summary.ok == 2, "the second target is still a success, just with nothing new"
+
+
+def test_separate_invocations_still_snapshot_the_same_listing_again(
+    fake_db: FakeDatabase,
+) -> None:
+    """De-duplication is per invocation only — the time series must keep growing."""
+    item = make_item(shop_id=1, item_id=42, price=1000, username="erigostore")
+    adapter = FakeAdapter({"kw": [item]})
+    runner = build_runner(adapter, enrich_shops=False)
+
+    runner.run_keywords(["kw"])
+    runner.run_keywords(["kw"])
+
+    assert len(fake_db.snapshots_for(42)) == 2
+
+
+def test_snapshot_timestamp_is_not_earlier_than_the_observation(
+    fake_db: FakeDatabase,
+) -> None:
+    """``scraped_at`` must not predate the fetch it labels. Regression.
+
+    The shared clock was stamped before ``_fetch`` ran, so every snapshot carried
+    a timestamp earlier than the observation by the full duration of the scrape —
+    seconds for a store target, minutes for a multi-page walk, with page 5's
+    items stamped with page 1's clock.
+
+    The autouse ``frozen_clock`` gives ``runner.utcnow`` a strictly increasing
+    tick, so "the snapshot clock was read after the run opened" is exactly
+    ``scraped_at > started_at`` — which was false before, both being tick #1.
+    """
+    adapter = FakeAdapter({"kw": [make_item(shop_id=1, item_id=11, price=1000)]})
+    runner = build_runner(adapter, enrich_shops=False)
+
+    runner.run_keywords(["kw"])
+
+    started_at = fake_db.runs_by_target()["kw"]["started_at"]
+    stamped = fake_db.snapshots_for(11)[0]["scraped_at"]
+    assert stamped > started_at, "the observation clock is read after the fetch, not before"
+
+
+def test_a_closed_runner_refuses_to_mint_a_second_adapter() -> None:
+    """close() is terminal for an owned adapter. Regression.
+
+    ``close()`` cleared ``_adapter`` but left ``_owns_adapter`` True, so touching
+    ``.adapter`` afterwards silently built a second adapter — and with it a second
+    httpx.Client and cookie session — that nothing would ever close. Reachable via
+    the documented "the object is reusable" pattern; a scheduler embedding
+    ScrapeRunner leaked a connection pool per cycle.
+    """
+    runner = ScrapeRunner(quiet=True, database_url="postgresql://fake/fake")
+    runner.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = runner.adapter
+
+
+def test_an_injected_adapter_survives_close() -> None:
+    """Ownership is the discriminator: an adapter we did not build is not ours to seal."""
+    adapter = FakeAdapter({})
+    runner = build_runner(adapter)
+    runner.close()
+
+    assert runner.adapter is adapter
+
+
+def test_schema_drift_is_reported_as_partial_not_success(fake_db: FakeDatabase) -> None:
+    """Entries that all fail to parse must not read as an empty result. Regression.
+
+    A renamed Shopee field made every item unparseable; the adapter returned [],
+    the runner recorded SUCCESS with item_count=0 and the CLI exited 0. Nothing
+    distinguished "Shopee changed their schema last night" from "the shop is
+    empty", so a nightly cron went green while collecting nothing indefinitely.
+    """
+    from scraper.adapters.shopee import ParseStats
+
+    adapter = FakeAdapter({"kw": []})
+    adapter.last_parse_stats = ParseStats(raw_seen=60, parsed=0, skipped=60)  # type: ignore[attr-defined]
+    runner = build_runner(adapter, enrich_shops=False)
+
+    summary = runner.run_keywords(["kw"])
+
+    run = fake_db.runs_by_target()["kw"]
+    assert run["status"] == RunStatus.PARTIAL.value
+    assert "payload shape may have changed" in run["error"]
+    assert summary.ok == 0
+
+
+def test_a_genuinely_empty_target_is_still_a_success(fake_db: FakeDatabase) -> None:
+    """Zero items with zero raw entries is an honest empty result, not drift."""
+    from scraper.adapters.shopee import ParseStats
+
+    adapter = FakeAdapter({"kw": []})
+    adapter.last_parse_stats = ParseStats(raw_seen=0, parsed=0, skipped=0)  # type: ignore[attr-defined]
+    runner = build_runner(adapter, enrich_shops=False)
+
+    summary = runner.run_keywords(["kw"])
+
+    assert fake_db.runs_by_target()["kw"]["status"] == RunStatus.SUCCESS.value
+    assert summary.ok == 1
+
+
+@requires_postgres
+def test_pg_scrape_survives_an_idle_in_transaction_timeout(pg_url: str) -> None:
+    """A slow fetch must not be killed by idle_in_transaction_session_timeout. Regression.
+
+    The definitive proof for the transaction-scope fix. ``_execute_target`` used
+    to open a write transaction (start_run + flush) and hold it for the whole
+    network phase, leaving the connection ``idle in transaction`` for minutes.
+    Against a server with this GUC set — the default on several managed Postgres
+    products, and the effect any PgBouncer/Supabase/Neon transaction pooler has —
+    the connection was terminated mid-scrape and the target's entire harvest was
+    discarded: ``status=failed``, ``items=0``, zero rows in price_snapshots, even
+    though the scrape itself had succeeded.
+
+    Here the fetch idles for four times the timeout. It must still commit.
+    """
+    import time
+
+    from sqlalchemy import select
+
+    from scraper import db
+
+    # 500ms is far shorter than the 2-5s the client sleeps between requests.
+    strict_url = f"{pg_url}?options=-c%20idle_in_transaction_session_timeout%3D500"
+    item_id = TEST_ID_BASE + 41
+    target = f"{TARGET_PREFIX}slowfetch"
+
+    class SlowAdapter(FakeAdapter):
+        """Idles well past the timeout before returning, as a real paged walk does."""
+
+        def search_keyword(self, keyword: str, pages: int = 1) -> list[ScrapedItem]:
+            time.sleep(2.0)
+            return super().search_keyword(keyword, pages)
+
+    adapter = SlowAdapter(
+        {target: [make_item(shop_id=TEST_ID_BASE + 4, item_id=item_id, price=99_000,
+                            username="erigostore")]}
+    )
+
+    summary = ScrapeRunner(
+        adapter=adapter, quiet=True, database_url=strict_url
+    ).run_keywords([target])
+
+    assert summary.result is not None
+    run = summary.result.runs[0]
+    assert run.status is RunStatus.SUCCESS, f"target was killed mid-scrape: {run.error!r}"
+    assert run.item_count == 1
+
+    with db.session_scope(pg_url) as session:
+        product_ref = session.execute(
+            select(db.ProductRow.id).where(db.ProductRow.item_id == item_id)
+        ).scalar_one()
+        prices = list(
+            session.execute(
+                select(db.PriceSnapshotRow.price).where(
+                    db.PriceSnapshotRow.product_ref == product_ref
+                )
+            ).scalars()
+        )
+        assert [int(price) for price in prices] == [99_000]
+
+
+def test_repeated_blocks_abort_the_remaining_targets(fake_db: FakeDatabase) -> None:
+    """A blocking marketplace must not be worked through one target at a time. Regression.
+
+    The runner marked each blocked target FAILED and moved straight to the next,
+    so a 40-shop list became 40 more blocked requests (and, before the client-side
+    breaker, 40 more Chromium launches) aimed at a site that had already stopped
+    serving us.
+    """
+    from scraper.client import BlockedError
+
+    class FakeBlocked(BlockedError):
+        def __init__(self) -> None:
+            RuntimeError.__init__(self, "blocked")
+
+    targets = [f"kw-{n}" for n in range(6)]
+    adapter = FakeAdapter(raise_for={name: FakeBlocked() for name in targets})
+    runner = build_runner(adapter, enrich_shops=False)
+
+    summary = runner.run_keywords(targets)
+
+    assert adapter.keyword_calls == [
+        (name, 1) for name in targets[:runner_mod.MAX_CONSECUTIVE_BLOCKED_TARGETS]
+    ], "the loop stops asking once the marketplace is clearly refusing us"
+    assert summary.failed == len(targets), "un-attempted targets are reported, not hidden"
+    assert summary.success is False
+
+
+def test_an_isolated_block_does_not_abort_the_run(fake_db: FakeDatabase) -> None:
+    """The counter is consecutive: one block between successes must not end the run."""
+    from scraper.client import BlockedError
+
+    class FakeBlocked(BlockedError):
+        def __init__(self) -> None:
+            RuntimeError.__init__(self, "blocked")
+
+    adapter = FakeAdapter(
+        {
+            "kw-a": [make_item(shop_id=1, item_id=1, price=10)],
+            "kw-c": [make_item(shop_id=1, item_id=3, price=30)],
+            "kw-e": [make_item(shop_id=1, item_id=5, price=50)],
+        },
+        raise_for={"kw-b": FakeBlocked(), "kw-d": FakeBlocked()},
+    )
+    runner = build_runner(adapter, enrich_shops=False)
+
+    summary = runner.run_keywords(["kw-a", "kw-b", "kw-c", "kw-d", "kw-e"])
+
+    assert len(adapter.keyword_calls) == 5, "every target was still attempted"
+    assert summary.ok == 3

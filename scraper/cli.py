@@ -75,6 +75,64 @@ RECENT_RUNS_LIMIT = 10
 RECENT_CHANGES_LIMIT = 10
 
 
+@app.callback()
+def _configure(
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Show INFO-level diagnostics: every request, cookie bootstraps, "
+        "per-strategy item counts.",
+    ),
+    quiet: bool = typer.Option(
+        False, "--quiet", "-q", help="Only show errors."
+    ),
+    log_file: Path | None = typer.Option(
+        None, "--log-file", help="Also append plain-text logs here, for cron runs."
+    ),
+) -> None:
+    """Install logging before any command runs.
+
+    The package had no logging configuration at all, so the root logger sat at
+    its WARNING default and every INFO diagnostic the code carefully emits — the
+    per-request ``GET /api/v4/... -> 403``, ``bootstrapped N cookies``, the
+    per-strategy item counts — was discarded with no way to get it back short of
+    editing source. That is exactly the trail an operator needs when a run comes
+    back green with zero items. What did survive went to a bare stderr handler
+    that interleaved with, and corrupted, the live Rich progress display.
+
+    Args:
+        verbose: Lower the threshold to INFO.
+        quiet: Raise it to ERROR. Ignored when ``verbose`` is also set.
+        log_file: Optional path to append a plain-text copy to.
+    """
+    import logging
+
+    from rich.logging import RichHandler
+
+    level = logging.INFO if verbose else (logging.ERROR if quiet else logging.WARNING)
+    root = logging.getLogger()
+    root.setLevel(level)
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    # Bound to the same Console the progress reporter uses, so log lines and the
+    # spinner cooperate instead of overwriting each other.
+    rich_handler = RichHandler(
+        console=console, show_path=False, rich_tracebacks=True, log_time_format="%H:%M:%S"
+    )
+    rich_handler.setLevel(level)
+    root.addHandler(rich_handler)
+
+    if log_file is not None:
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(level)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+        )
+        root.addHandler(file_handler)
+
+
 # ---------------------------------------------------------------------------
 # Presentation helpers
 # ---------------------------------------------------------------------------

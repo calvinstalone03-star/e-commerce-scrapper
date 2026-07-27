@@ -99,13 +99,41 @@ RETRY_INITIAL_WAIT = 1.0
 RETRY_MAX_WAIT = 30.0
 RETRY_JITTER = 1.0
 
-#: Statuses worth retrying: transient server/edge failures and rate limiting.
-#: A 429 that survives every retry is escalated to the block path by
-#: :meth:`ShopeeClient.get_json`.
-RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504, 520, 522, 524})
+#: Statuses worth retrying: transient server/edge failures.
+#:
+#: 429 is deliberately **not** here. It used to be in both this set and
+#: :data:`BLOCK_STATUS_CODES`, which meant one rate-limited request fired four
+#: retried attempts, escalated to the block path, launched Chromium for fresh
+#: cookies, and replayed for four more — eight requests and a headless browser
+#: aimed at the endpoint that had just asked us to slow down, with the server's
+#: own ``Retry-After`` never read. A soft rate limit is the last warning before a
+#: hard ban; it gets a single request and an immediate stop.
+RETRYABLE_STATUS_CODES = frozenset({408, 425, 500, 502, 503, 504, 520, 522, 524})
 
 #: Statuses that mean "anti-bot", not "server had a bad day".
 BLOCK_STATUS_CODES = frozenset({403, 429})
+
+#: Statuses fresh cookies cannot fix. A rate limit is about request volume, not
+#: about who we are, so :meth:`ShopeeClient._on_block` refuses to spend a browser
+#: bootstrap on one.
+NO_REBOOTSTRAP_STATUS_CODES = frozenset({429})
+
+#: Minimum seconds between two forced cookie bootstraps on one client. A
+#: structural block (Shopee simply refusing logged-out API traffic) is not
+#: cleared by new cookies, and without this floor every blocked request bought
+#: another real Chromium launch — the scraper hit Shopee harder the harder
+#: Shopee pushed back.
+MIN_REBOOTSTRAP_INTERVAL = 600.0
+
+#: How many forced bootstraps may fail to clear a block before this client stops
+#: trying for the rest of its life and fails fast instead.
+MAX_INEFFECTIVE_REBOOTSTRAPS = 2
+
+#: How often to re-check cookie freshness. The jar goes stale after ~12h but one
+#: client lives for a whole invocation, so checking once at construction meant
+#: mid-run expiry was only ever discovered by getting blocked — one wasted
+#: request and one browser launch per discovery.
+SESSION_RECHECK_INTERVAL = 1800.0
 
 #: Shopee's own block codes. ``90309999`` is the one observed live in ``.recon/``
 #: on ``search_items`` / ``rcmd_items`` / ``pdp/get_pc``; it is emitted both as a
@@ -301,7 +329,13 @@ class ShopeeClient:
             )
         )
         self._closed = False
-        self._session_checked = False
+        #: ``time.monotonic()`` of the last cookie-freshness check, or None when
+        #: it has never run. Re-armed every :data:`SESSION_RECHECK_INTERVAL`.
+        self._session_checked_at: float | None = None
+        #: ``time.monotonic()`` of the last cookie bootstrap of any kind.
+        self._last_bootstrap_at: float | None = None
+        #: Forced bootstraps that did not clear the block that triggered them.
+        self._ineffective_rebootstraps = 0
 
     # ------------------------------------------------------------------
     # context manager
@@ -320,21 +354,31 @@ class ShopeeClient:
         return self
 
     def _ensure_session(self) -> None:
-        """Guarantee a usable cookie jar exists before the first outbound request.
+        """Guarantee a usable cookie jar exists before an outbound request.
 
-        Runs at most once per client. ``__enter__`` calls it, but the client is
-        not always used as a context manager: :class:`scraper.adapters.shopee.
-        ShopeeAdapter` constructs a ``ShopeeClient`` itself and holds it for the
-        life of the adapter. Without this hook a whole run would go out with an
-        empty ``Cookie`` header and only recover via the much more expensive
-        block -> forced-rebootstrap -> replay path, burning one request (and one
-        block on Shopee's ledger) per client.
+        ``__enter__`` calls it, but the client is not always used as a context
+        manager: :class:`scraper.adapters.shopee.ShopeeAdapter` constructs a
+        ``ShopeeClient`` itself and holds it for the life of the adapter. Without
+        this hook a whole run would go out with an empty ``Cookie`` header and
+        only recover via the much more expensive block -> forced-rebootstrap ->
+        replay path, burning one request (and one block on Shopee's ledger) per
+        client.
+
+        The check re-arms every :data:`SESSION_RECHECK_INTERVAL` rather than
+        running exactly once. A jar goes stale after ~12h and one client serves a
+        whole invocation, so a once-only check meant a long run discovered
+        expiry only by being blocked — paying a wasted request and a Chromium
+        launch per discovery instead of one cheap proactive refresh.
         """
-        if self._session_checked:
+        now = time.monotonic()
+        if (
+            self._session_checked_at is not None
+            and now - self._session_checked_at < SESSION_RECHECK_INTERVAL
+        ):
             return
         # Set before the call, not after: a bootstrap that raises must not leave
-        # the flag clear and have every subsequent request retry the browser.
-        self._session_checked = True
+        # the marker clear and have every subsequent request retry the browser.
+        self._session_checked_at = now
         try:
             expired = self.session.is_expired()
         except Exception as exc:  # noqa: BLE001 - a broken jar must not kill the run
@@ -349,6 +393,10 @@ class ShopeeClient:
             # A failed bootstrap is not fatal here: some endpoints answer without
             # cookies at all, and the block path can still re-mint later.
             log.warning("cookie bootstrap failed (%s); continuing without cookies", exc)
+        finally:
+            # Recorded even on failure: a bootstrap that just ran and did not help
+            # is precisely the one _on_block must not immediately repeat.
+            self._last_bootstrap_at = time.monotonic()
 
     def __exit__(
         self,
@@ -501,13 +549,15 @@ class ShopeeClient:
             The payload from the successful replay.
 
         Raises:
-            BlockedError: When we have already replayed once, or when the
-                ``on_blocked`` callback itself failed.
+            BlockedError: When we have already replayed once, when the status is
+                one fresh cookies cannot fix, when the bootstrap breaker is open,
+                or when the ``on_blocked`` callback itself failed.
         """
         status = response.status_code
         excerpt = _body_excerpt(response)
 
         if not allow_rebootstrap:
+            self._ineffective_rebootstraps += 1
             log.error(
                 "blocked again after re-bootstrap: %s (status=%s)",
                 url,
@@ -522,12 +572,50 @@ class ShopeeClient:
                 body_excerpt=excerpt,
             )
 
+        if status in NO_REBOOTSTRAP_STATUS_CODES:
+            # Rate limiting is about how much we asked for, not about who we
+            # look like. Re-minting cookies cannot clear it and the browser
+            # launch is itself more traffic; stop on the first one and carry the
+            # server's own Retry-After up to the caller.
+            retry_after = response.headers.get("Retry-After")
+            suffix = f"; server asked for Retry-After: {retry_after}" if retry_after else ""
+            log.warning(
+                "rate limited on %s (status=%s)%s; not re-bootstrapping",
+                url,
+                status,
+                suffix,
+                extra={"path": path, "status": status},
+            )
+            raise BlockedError(
+                f"rate limited by Shopee at {url} (HTTP {status}){suffix}",
+                status_code=status,
+                url=url,
+                body_excerpt=excerpt,
+            )
+
+        breaker = self._rebootstrap_refusal()
+        if breaker is not None:
+            log.error(
+                "block detected on %s (status=%s); %s",
+                url,
+                status,
+                breaker,
+                extra={"path": path, "status": status},
+            )
+            raise BlockedError(
+                f"blocked by Shopee at {url} (HTTP {status}); {breaker}",
+                status_code=status,
+                url=url,
+                body_excerpt=excerpt,
+            )
+
         log.warning(
             "block detected on %s (status=%s); re-bootstrapping cookies once",
             url,
             status,
             extra={"path": path, "status": status},
         )
+        self._last_bootstrap_at = time.monotonic()
         try:
             self.on_blocked()
         except Exception as exc:
@@ -540,6 +628,38 @@ class ShopeeClient:
             ) from exc
 
         return self.get_json(path, params, referer=referer, allow_rebootstrap=False)
+
+    def _rebootstrap_refusal(self) -> str | None:
+        """Whether the bootstrap circuit breaker is open, and why.
+
+        Two independent brakes on the "block -> launch Chromium" reflex:
+
+        * a minimum interval, which also covers the cold-start double launch —
+          :meth:`_ensure_session` mints a jar, the very first request is refused
+          anyway, and the old code immediately minted a second one seconds later;
+        * a cap on bootstraps that demonstrably failed to clear a block, because
+          a structural block (Shopee refusing logged-out API traffic outright)
+          never clears and every attempt is another real browser hitting the site
+          that is already refusing us.
+
+        Returns:
+            A reason string when the call must be refused, else None.
+        """
+        if self._ineffective_rebootstraps >= MAX_INEFFECTIVE_REBOOTSTRAPS:
+            return (
+                f"{self._ineffective_rebootstraps} cookie re-bootstraps have already "
+                "failed to clear a block on this client; refusing to launch another "
+                "browser and failing fast"
+            )
+        if self._last_bootstrap_at is not None:
+            elapsed = time.monotonic() - self._last_bootstrap_at
+            if elapsed < MIN_REBOOTSTRAP_INTERVAL:
+                return (
+                    f"cookies were already bootstrapped {elapsed:.0f}s ago (minimum "
+                    f"interval {MIN_REBOOTSTRAP_INTERVAL:.0f}s); refusing to launch "
+                    "another browser"
+                )
+        return None
 
     def _send_with_retries(
         self,

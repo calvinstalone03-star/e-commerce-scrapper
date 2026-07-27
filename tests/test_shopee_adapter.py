@@ -1007,6 +1007,184 @@ def test_search_shop_reads_the_recommend_sections_envelope() -> None:
     assert items[0].snapshot.price == Decimal("20000")
 
 
+def test_search_shop_merges_every_recommend_section() -> None:
+    """A multi-section page must yield all of its items, and keep paginating. Regression.
+
+    ``_extract_items`` returned the *first* non-empty container and dropped the
+    rest. ``/recommend`` genuinely answers with a list of sections, so a 50-item
+    page split 20/30 came back as 20 — and because 20 < SHOP_PAGE_SIZE also
+    convinced ``_is_last_page`` the walk was over, so the remainder of the shop
+    was never requested. The run recorded SUCCESS with a silently truncated
+    catalogue: a 2456-item shop showing as 20 products, with no error anywhere.
+    """
+
+    def section(start: int, count: int) -> dict[str, Any]:
+        return {
+            "data": {
+                "item": [
+                    {
+                        "itemid": start + i,
+                        "shopid": 30203584,
+                        "name": f"Item {start + i}",
+                        "price": 1_000_000_000,
+                    }
+                    for i in range(count)
+                ]
+            }
+        }
+
+    page_one = {"error": 0, "data": {"sections": [section(100, 20), section(200, 10)]}}
+    page_two = {"error": 0, "data": {"sections": [section(300, 5)]}}
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": load_fixture("shopee_get_shop_detail.json"),
+            "/api/v4/recommend/recommend": [page_one, page_two],
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    items = adapter.search_shop("erigostore", pages=3)
+
+    # 20 + 10 from page 1 (a full SHOP_PAGE_SIZE, so the walk continues) and 5
+    # from page 2 (short, so it stops).
+    assert len(items) == 35
+    assert len(client.calls_to("/api/v4/recommend/recommend")) == 2
+    assert sorted(item.product.item_id for item in items) == (
+        list(range(100, 120)) + list(range(200, 210)) + list(range(300, 305))
+    )
+
+
+def test_extract_items_deduplicates_a_list_reachable_by_two_paths() -> None:
+    """Merging containers must not double-count one list found under two keys."""
+    from scraper.adapters.shopee import _extract_items
+
+    entries = [{"itemid": 7, "shopid": 1, "name": "one"}]
+    payload = {"data": {"item": entries, "sections": [{"data": {"item": entries}}]}}
+
+    assert len(_extract_items(payload)) == 1
+
+
+def test_search_shop_reports_an_empty_shop_when_only_some_endpoints_were_blocked() -> None:
+    """One blocked endpoint plus two clean empty ones is an empty shop, not a block.
+
+    Regression: the guard counted strategies *tried*, not strategies *blocked*, so
+    a shop with no active listings during a partial block was recorded FAILED and
+    the CLI exited 1 — sending an operator to chase an anti-bot problem that two
+    HTTP 200s had already disproved.
+    """
+    client = FakeClient(
+        {
+            "/api/v4/shop/get_shop_detail": load_fixture("shopee_get_shop_detail.json"),
+            "/api/v4/recommend/recommend": FakeBlockedError(),
+            "/api/v4/shop/rcmd_items": {"error": 0, "items": []},
+            "/api/v4/shop/get_shop_seo": {"error": 0, "data": {"items": []}},
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    assert adapter.search_shop("erigostore", pages=1) == []
+
+
+def test_search_keyword_keeps_pages_already_walked_when_blocked() -> None:
+    """A mid-walk block keeps what was collected, exactly as store mode does. Regression.
+
+    ``search_keyword`` re-raised BlockedError verbatim, discarding every page it
+    had already parsed, while ``_walk_shop_strategy`` explicitly kept its
+    partials. The same event lost all data in one mode and none in the other —
+    and keyword mode, which is the one structurally most likely to be blocked
+    mid-walk, was the one with no protection.
+    """
+    client = FakeClient(
+        {
+            "/api/v4/search/search_items": [
+                make_search_page(SEARCH_PAGE_SIZE, start_id=1000),
+                make_search_page(SEARCH_PAGE_SIZE, start_id=2000),
+                FakeBlockedError(),
+            ]
+        }
+    )
+    adapter = ShopeeAdapter(client=client)
+
+    items = adapter.search_keyword("kaos polos", pages=5)
+
+    assert len(items) == 2 * SEARCH_PAGE_SIZE
+
+
+def test_search_keyword_still_raises_when_blocked_on_the_very_first_page() -> None:
+    """With nothing collected there is no partial to protect: the block is the answer."""
+    client = FakeClient({"/api/v4/search/search_items": FakeBlockedError()})
+    adapter = ShopeeAdapter(client=client)
+
+    with pytest.raises(BlockedError):
+        adapter.search_keyword("kaos", pages=5)
+
+
+def test_parse_stats_distinguishes_schema_drift_from_an_empty_result() -> None:
+    """Entries that all fail to parse must be visible as drift, not as "no items".
+
+    Regression: a Shopee field rename made every item unparseable, the adapter
+    returned [], and the run finished SUCCESS with item_count=0 and exit code 0 —
+    indistinguishable from an empty shop, so a nightly cron stayed green while
+    collecting nothing indefinitely.
+    """
+    drifted_page = {
+        "error": 0,
+        # `name` renamed: parse_item raises ValueError on every entry.
+        "items": [
+            {"itemid": 900 + i, "shopid": 5, "product_title": "renamed", "price": 1_000_000_000}
+            for i in range(3)
+        ],
+    }
+    client = FakeClient({"/api/v4/search/search_items": drifted_page})
+    adapter = ShopeeAdapter(client=client)
+
+    assert adapter.search_keyword("kaos", pages=1) == []
+    assert adapter.last_parse_stats.raw_seen == 3
+    assert adapter.last_parse_stats.parsed == 0
+    assert adapter.last_parse_stats.drifted is True
+
+    # A genuinely empty page is NOT drift — that is the whole point.
+    empty = ShopeeAdapter(client=FakeClient({"/api/v4/search/search_items": {"error": 0,
+                                                                             "items": []}}))
+    assert empty.search_keyword("kaos", pages=1) == []
+    assert empty.last_parse_stats.drifted is False
+
+
+def test_unrated_listing_reports_no_rating_rather_than_zero_stars() -> None:
+    """`rating_star: 0` with no ratings behind it is missing data, not a 0-star rating.
+
+    Regression: every unreviewed listing persisted rating_star = 0, so it sorted
+    below a genuine 1-star product, dragged each shop's AVG(rating_star) toward
+    zero, and was silently excluded by a "rating >= 4" filter.
+    """
+    item = parse_item(
+        {
+            "itemid": 1,
+            "shopid": 2,
+            "name": "Brand new listing",
+            "price": 1_000_000_000,
+            "item_rating": {"rating_star": 0, "rating_count": [0, 0, 0, 0, 0, 0]},
+        }
+    )
+    assert item.snapshot.rating_star is None
+    assert item.snapshot.rating_count == 0
+
+
+def test_a_zero_star_rating_backed_by_reviews_is_preserved() -> None:
+    """The guard keys on the count, so a real (if implausible) 0.0 average survives."""
+    item = parse_item(
+        {
+            "itemid": 1,
+            "shopid": 2,
+            "name": "Genuinely awful",
+            "price": 1_000_000_000,
+            "item_rating": {"rating_star": 0, "rating_count": [7, 7, 0, 0, 0, 0]},
+        }
+    )
+    assert item.snapshot.rating_star == Decimal("0")
+    assert item.snapshot.rating_count == 7
+
+
 def test_search_shop_propagates_lookup_error() -> None:
     """A renamed shop fails the target before any listing request is made."""
     client = FakeClient(

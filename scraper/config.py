@@ -71,9 +71,16 @@ class Settings(BaseSettings):
 
     database_url: str = Field(
         default=DEFAULT_DATABASE_URL,
+        # repr=False: the URL embeds the database password. runner._record_failure
+        # stores repr(exc) for arbitrary exceptions into scrape_runs.error, so a
+        # single future `log.debug("settings=%s", settings)` would put the
+        # password on stderr and, via an exception, into the database. Keeping it
+        # out of __repr__ costs nothing — nothing formats a Settings today.
+        repr=False,
         description=(
             "SQLAlchemy/libpq URL for Postgres. scraper.db normalises the driver "
-            "prefix to psycopg 3, so a bare 'postgresql://' URL is fine here."
+            "prefix to psycopg 3, so a bare 'postgresql://' URL is fine here. "
+            "Excluded from repr() because it embeds a password."
         ),
     )
     shopee_username: str | None = Field(
@@ -82,7 +89,12 @@ class Settings(BaseSettings):
         "ShopeeSession.bootstrap_cookies() may perform an authenticated bootstrap.",
     )
     shopee_password: str | None = Field(
-        default=None, description="Shopee password. See shopee_username."
+        default=None,
+        # repr=False for the same reason as database_url above. Kept a plain str
+        # rather than SecretStr so session._attempt_login needs no unwrapping
+        # and cannot grow a `.get_secret_value()` that leaks it back into a log.
+        repr=False,
+        description="Shopee password. See shopee_username. Excluded from repr().",
     )
     headless: bool = Field(
         default=True,

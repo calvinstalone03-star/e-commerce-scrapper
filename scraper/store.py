@@ -71,7 +71,13 @@ def _stamp(now: datetime | None) -> datetime:
     return now if now is not None else utcnow()
 
 
-def upsert_store(session: Session, store: Store, *, now: datetime | None = None) -> int:
+def upsert_store(
+    session: Session,
+    store: Store,
+    *,
+    now: datetime | None = None,
+    username_is_synthetic: bool = False,
+) -> int:
     """Insert or update a shop, keyed on ``(marketplace, shop_id)``.
 
     Args:
@@ -80,6 +86,13 @@ def upsert_store(session: Session, store: Store, *, now: datetime | None = None)
             are ignored — this function owns those columns.
         now: Timestamp to stamp. Defaults to ``models.utcnow()``. The runner
             passes one shared value per target so a batch has a coherent clock.
+        username_is_synthetic: True when ``store.username`` is a placeholder the
+            adapter invented (e.g. ``"shop-30203584"``) rather than a real slug
+            scraped from the payload. ``stores.username`` is NOT NULL, so the
+            adapter cannot signal "unknown" with None and plain COALESCE would
+            happily overwrite a real slug with the placeholder. When this flag is
+            set the SET clause keeps whatever is already stored and only falls
+            back to the placeholder for a genuinely new row.
 
     Returns:
         ``stores.id`` of the inserted or existing row — pass this as
@@ -99,12 +112,24 @@ def upsert_store(session: Session, store: Store, *, now: datetime | None = None)
         first_seen=ts,
         last_seen=ts,
     )
+    # A synthetic username reverses the COALESCE arguments: the stored slug wins,
+    # and the placeholder is only used when there is nothing stored yet. Without
+    # this a keyword-mode hit — which carries no shop_username and so always
+    # arrives with a placeholder — would overwrite the real slug a store-mode
+    # scrape captured, corrupting required output field #1 for every product of
+    # that shop.
+    username_set = (
+        func.coalesce(table.c.username, stmt.excluded.username)
+        if username_is_synthetic
+        else func.coalesce(stmt.excluded.username, table.c.username)
+    )
+
     stmt = stmt.on_conflict_do_update(
         constraint="uq_stores_marketplace_shop_id",
         set_={
             # COALESCE(new, old): a sparse payload leaves the stored value alone
             # instead of erasing detail a richer earlier scrape captured.
-            "username": func.coalesce(stmt.excluded.username, table.c.username),
+            "username": username_set,
             "name": func.coalesce(stmt.excluded.name, table.c.name),
             "location": func.coalesce(stmt.excluded.location, table.c.location),
             "follower_count": func.coalesce(stmt.excluded.follower_count, table.c.follower_count),
@@ -231,9 +256,18 @@ def start_run(
 ) -> ScrapeRun:
     """Open an audit row with ``status = RUNNING`` and flush it to get an id.
 
-    Must ``session.flush()`` (not commit) so ``scrape_runs.id`` is populated on
-    the returned model before any scraping happens — that way a crashed process
-    still leaves a RUNNING row behind as evidence.
+    ``session.flush()`` (not commit) populates ``scrape_runs.id`` on the returned
+    model; transaction ownership stays with the caller, as everywhere else in
+    this module.
+
+    Durability caveat: a flushed row is invisible outside its transaction and
+    disappears with a rollback, so "a crashed process leaves a RUNNING row behind
+    as evidence" holds **only if the caller commits this transaction before it
+    starts scraping**. :meth:`scraper.runner.ScrapeRunner._execute_target` does
+    exactly that — it commits the RUNNING row, then fetches with no transaction
+    open, then persists and closes the run in a second transaction. A caller that
+    keeps one transaction open across the network phase gets no audit trail from
+    a SIGKILL and holds a connection idle-in-transaction for the whole scrape.
 
     Args:
         session: Open session. Not committed by this function.

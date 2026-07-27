@@ -363,23 +363,29 @@ def test_html_without_content_type_is_treated_as_blocked() -> None:
 
 
 @respx.mock
-def test_429_after_retries_is_treated_as_a_block() -> None:
+def test_429_stops_after_one_request_and_never_launches_a_browser() -> None:
+    """A rate limit is honoured, not escalated into eight requests and a Chromium.
+
+    Regression: 429 was in both RETRYABLE_STATUS_CODES and BLOCK_STATUS_CODES, so
+    a single rate-limited request produced 4 retried attempts, a forced cookie
+    bootstrap, and 4 more attempts on the replay — an 8x traffic burst plus a
+    headless browser aimed at the endpoint that had just asked us to back off.
+    """
     route = respx.get(URL).mock(
-        side_effect=[
-            httpx.Response(429, text="slow down"),
-            httpx.Response(429, text="slow down"),
-            httpx.Response(429, text="slow down"),
-            httpx.Response(429, text="slow down"),
-            httpx.Response(200, json=OK_PAYLOAD),
-        ]
+        return_value=httpx.Response(429, text="slow down", headers={"Retry-After": "600"})
     )
     session = FakeSession()
 
     with make_client(session=session) as client:
-        assert client.get_json(PATH) == OK_PAYLOAD
+        with pytest.raises(BlockedError) as excinfo:
+            client.get_json(PATH)
 
-    assert route.call_count == 5, "4 retried attempts, then one replay after bootstrap"
-    assert session.bootstrap_calls == [True]
+    assert route.call_count == 1, "a rate limit gets exactly one request"
+    assert session.bootstrap_calls == [], "fresh cookies cannot clear a rate limit"
+    assert excinfo.value.status_code == 429
+    # The server's own instruction reaches the operator instead of being replaced
+    # by a 1-4s exponential backoff.
+    assert "600" in str(excinfo.value)
 
 
 @respx.mock
@@ -580,6 +586,81 @@ def test_context_manager_skips_bootstrap_when_the_jar_is_fresh() -> None:
         pass
 
     assert session.bootstrap_calls == []
+
+
+@respx.mock
+def test_cold_start_does_not_double_bootstrap_on_an_immediate_block() -> None:
+    """A jar minted seconds ago must not be re-minted by the first 403. Regression.
+
+    ``_ensure_session`` bootstrapped a stale jar, then the very first request came
+    back 403 and ``_on_block`` unconditionally forced a *second* browser launch
+    seconds later — two real Chromium launches inside one ``get_json`` call, on a
+    block the first launch had just demonstrably failed to prevent.
+    """
+    respx.get(URL).mock(return_value=httpx.Response(403, text="nope"))
+    session = FakeSession(expired=True)
+
+    with make_client(session=session) as client:
+        with pytest.raises(BlockedError) as excinfo:
+            client.get_json(PATH)
+
+    assert session.bootstrap_calls == [False], "the lazy bootstrap only, no forced encore"
+    assert "already bootstrapped" in str(excinfo.value)
+
+
+@respx.mock
+def test_repeated_blocks_stop_launching_browsers_after_the_breaker_trips() -> None:
+    """A structural block must not make the scraper hit Shopee harder. Regression.
+
+    Every blocked request independently forced a full Chromium launch with no
+    cross-request memory, so modelling the live shape (three store targets, all
+    listing endpoints 403) produced nine real browser launches aimed at the site
+    that was already refusing us. After MAX_INEFFECTIVE_REBOOTSTRAPS failures the
+    client fails fast instead.
+    """
+    from scraper.client import MAX_INEFFECTIVE_REBOOTSTRAPS
+
+    respx.get(URL).mock(return_value=httpx.Response(403, text="nope"))
+    session = FakeSession(expired=False)
+
+    with make_client(session=session) as client:
+        for _ in range(4):
+            # Neutralise the minimum-interval brake; this test is about the cap
+            # on bootstraps that demonstrably failed to clear the block.
+            client._last_bootstrap_at = None
+            with pytest.raises(BlockedError):
+                client.get_json(PATH)
+
+        assert client._ineffective_rebootstraps >= MAX_INEFFECTIVE_REBOOTSTRAPS
+
+    assert len(session.bootstrap_calls) == MAX_INEFFECTIVE_REBOOTSTRAPS, (
+        "the breaker caps forced bootstraps for the life of the client"
+    )
+
+
+@respx.mock
+def test_cookie_freshness_is_rechecked_during_a_long_run() -> None:
+    """Freshness must be re-armed on an interval, not checked once per client. Regression.
+
+    ``_session_checked`` was set once and never cleared, so a client that outlived
+    its 12-hour jar discovered expiry only by being blocked — one wasted request
+    and one Chromium launch per discovery, instead of one cheap refresh.
+    """
+    from scraper import client as client_module
+
+    respx.get(URL).mock(return_value=httpx.Response(200, json=OK_PAYLOAD))
+    session = FakeSession(expired=False)
+
+    with make_client(session=session) as client:
+        client.get_json(PATH)
+        client.get_json(PATH)
+        assert session.expired_calls == 1, "no re-check inside the interval"
+
+        # Pretend the interval elapsed.
+        client._session_checked_at -= client_module.SESSION_RECHECK_INTERVAL + 1
+        client.get_json(PATH)
+
+    assert session.expired_calls == 2, "the check re-arms once the interval passes"
 
 
 def test_context_manager_closes_the_transport() -> None:
