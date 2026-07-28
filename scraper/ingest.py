@@ -43,6 +43,8 @@ __all__ = [
     "IngestResult",
     "IngestService",
     "build_app",
+    "deep_find_items",
+    "is_captured",
     "resolve_token",
 ]
 
@@ -142,6 +144,78 @@ def resolve_token(settings: Settings | None = None) -> str:
     return token
 
 
+#: Keys that identify a Shopee listing object wherever it is buried. ``itemid``
+#: plus a name is the minimum ``parse_item`` needs; requiring both keeps the
+#: walk from collecting every id-shaped dict on the page.
+_ITEM_MARKERS = ("itemid", "item_id")
+_NAME_MARKERS = ("name", "title")
+
+#: Bounds for the structural walk. A page-state blob is deep and wide, and an
+#: unbounded walk over a few MB of JSON would stall the request.
+_MAX_DEPTH = 12
+_MAX_NODES = 200_000
+
+
+def deep_find_items(payload: Any) -> list[dict[str, Any]]:
+    """Find Shopee listing objects anywhere inside a structure.
+
+    Server-rendered pages embed listings in a page-state blob rather than in one
+    of the API envelopes :func:`_extract_items` knows, and the path to them moves
+    with the front end. Rather than chase it, look for the shape: a dict with an
+    item id and a name, or one wrapping ``item_basic``.
+
+    Deduplicates on item id, since page state routinely holds the same listing
+    under several keys.
+
+    Args:
+        payload: Any decoded JSON.
+
+    Returns:
+        Candidate listing dicts, in discovery order.
+    """
+    found: dict[Any, dict[str, Any]] = {}
+    nodes = 0
+
+    def looks_like_item(node: dict[str, Any]) -> bool:
+        if "item_basic" in node and isinstance(node["item_basic"], dict):
+            return True
+        has_id = any(key in node for key in _ITEM_MARKERS)
+        has_name = any(key in node for key in _NAME_MARKERS)
+        return has_id and has_name
+
+    def identity(node: dict[str, Any]) -> Any:
+        inner = node.get("item_basic") if isinstance(node.get("item_basic"), dict) else node
+        for key in _ITEM_MARKERS:
+            if key in inner:
+                return inner[key]
+        return id(node)
+
+    def walk(node: Any, depth: int) -> None:
+        nonlocal nodes
+        if depth > _MAX_DEPTH or nodes > _MAX_NODES:
+            return
+        nodes += 1
+
+        if isinstance(node, dict):
+            if looks_like_item(node):
+                key = identity(node)
+                if key not in found:
+                    found[key] = node
+                # Do not descend into a matched item: its nested variation
+                # models carry itemid too and would each become a phantom row.
+                return
+            for value in node.values():
+                walk(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, depth + 1)
+
+    walk(payload, 0)
+    if found:
+        log.info("structural walk found %d listing(s) in an unrecognised envelope", len(found))
+    return list(found.values())
+
+
 def is_captured(url: str) -> bool:
     """Whether a captured URL is one this endpoint stores.
 
@@ -202,6 +276,13 @@ class IngestService:
 
         raw_items = _extract_items(payload)
         if not raw_items:
+            # The known envelopes are the ones the *API* uses. Server-rendered
+            # pages park the same listings somewhere inside a page-state blob
+            # whose shape is not documented and changes with the front end, so
+            # fall back to finding them structurally rather than by path.
+            raw_items = deep_find_items(payload)
+        if not raw_items:
+            self._dump_unrecognized(url, payload)
             return IngestResult(seen=0, reason="payload carried no items")
 
         stamp = captured_at or datetime.now(timezone.utc)
@@ -246,6 +327,38 @@ class IngestService:
             len(result.shops),
         )
         return result
+
+
+    def _dump_unrecognized(self, url: str, payload: Any) -> None:
+        """Save a payload nothing could be extracted from, for inspection.
+
+        Shopee's page-state shape is undocumented and moves. When both the known
+        envelopes and the structural walk come up empty, the only way to fix it
+        is to look at the actual bytes — so keep them instead of discarding the
+        one sample that would have explained the failure.
+
+        Written under ``.recon/`` (gitignored, ``0600``), capped so a browsing
+        session cannot fill the disk.
+        """
+        from pathlib import Path
+
+        try:
+            directory = Path(__file__).resolve().parent.parent / ".recon" / "unrecognized"
+            directory.mkdir(parents=True, exist_ok=True)
+            existing = sorted(directory.glob("*.json"))
+            if len(existing) >= 20:
+                return
+            import json as jsonlib
+
+            name = urlsplit(url).path.strip("/").replace("/", "_") or "payload"
+            target = directory / f"{name}-{len(existing):02d}.json"
+            target.write_text(
+                jsonlib.dumps(payload, ensure_ascii=False)[:8_000_000], encoding="utf-8"
+            )
+            target.chmod(0o600)
+            log.info("saved an unrecognised payload to %s for inspection", target)
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never break ingest
+            log.debug("could not save unrecognised payload: %s", exc)
 
 
 def _is_synthetic(username: str | None, shop_id: int) -> bool:

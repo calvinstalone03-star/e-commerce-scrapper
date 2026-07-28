@@ -248,3 +248,82 @@ def test_generated_token_is_cached_and_private(settings, monkeypatch, tmp_path) 
     cache = tmp_path / ".ingest-token"
     assert cache.exists()
     assert oct(cache.stat().st_mode)[-3:] == "600"
+
+
+# ----------------------------------------------------------------------
+# Structural fallback for server-rendered payloads
+# ----------------------------------------------------------------------
+
+
+def test_deep_find_items_reaches_listings_buried_in_page_state() -> None:
+    """Shopee renders the first page server-side; the listings sit inside an
+    undocumented page-state blob whose path moves with the front end."""
+    from scraper.ingest import deep_find_items
+
+    blob = {
+        "props": {
+            "pageProps": {
+                "initialState": {
+                    "search": {"sections": [{"data": {"item": [item(1), item(2)]}}]},
+                    "unrelated": {"banners": [{"id": 9, "url": "x"}]},
+                }
+            }
+        }
+    }
+
+    found = deep_find_items(blob)
+
+    assert sorted(entry["itemid"] for entry in found) == [1, 2]
+
+
+def test_deep_find_items_deduplicates_the_same_listing() -> None:
+    """Page state parks the same listing under several keys."""
+    from scraper.ingest import deep_find_items
+
+    blob = {"a": {"list": [item(7)]}, "b": {"byId": {"7": item(7)}}}
+
+    assert len(deep_find_items(blob)) == 1
+
+
+def test_deep_find_items_does_not_descend_into_a_matched_item() -> None:
+    """Variation models nested inside a listing carry itemid too, and each one
+    would otherwise become a phantom product row."""
+    from scraper.ingest import deep_find_items
+
+    parent = item(11)
+    parent["models"] = [
+        {"itemid": 11, "name": "Merah / L", "price": 1},
+        {"itemid": 11, "name": "Biru / M", "price": 2},
+    ]
+
+    found = deep_find_items({"items": [parent]})
+
+    assert len(found) == 1
+    assert found[0]["name"] == "Kaos Polos Cotton Combed 30s"
+
+
+def test_deep_find_items_handles_the_item_basic_wrapper() -> None:
+    from scraper.ingest import deep_find_items
+
+    found = deep_find_items({"deep": {"nest": [{"item_basic": item(5)}]}})
+
+    assert len(found) == 1
+
+
+def test_deep_find_items_ignores_structures_with_no_listings() -> None:
+    from scraper.ingest import deep_find_items
+
+    assert deep_find_items({"banners": [{"id": 1, "img": "a"}], "n": 3}) == []
+    assert deep_find_items(None) == []
+    assert deep_find_items("just a string") == []
+
+
+def test_deep_find_items_is_bounded_on_pathological_nesting() -> None:
+    """A page-state blob is deep and wide; an unbounded walk would stall."""
+    from scraper.ingest import deep_find_items
+
+    node: dict = {"leaf": item(1)}
+    for _ in range(400):
+        node = {"next": node}
+
+    assert deep_find_items(node) == []  # beyond _MAX_DEPTH, returns rather than hangs

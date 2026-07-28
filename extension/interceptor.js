@@ -125,8 +125,17 @@
       return; // not JSON: a challenge page or an HTML error, nothing to store
     }
     // Shopee answers a refusal with HTTP 200 and a tiny {"error": 90309999}
-    // envelope. Forwarding those would fill the log with non-data.
-    if (payload && typeof payload === 'object' && payload.error) return;
+    // envelope. Drop those — but only when there is genuinely nothing in them.
+    // Some endpoints set a non-zero error on a partial response that still
+    // carries listings, and discarding those loses real data.
+    if (payload && typeof payload === 'object' && payload.error) {
+      const hasItems =
+        (Array.isArray(payload.items) && payload.items.length > 0) ||
+        (payload.data &&
+          Array.isArray(payload.data.items) &&
+          payload.data.items.length > 0);
+      if (!hasItems) return;
+    }
 
     try {
       window.postMessage(
