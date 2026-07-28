@@ -1,0 +1,108 @@
+@import "tailwindcss";
+
+/**
+ * Palette.
+ *
+ * Two layers on purpose. The raw values below flip with the colour scheme; the
+ * `@theme inline` block maps them onto Tailwind names, so `bg-surface` compiles
+ * to `var(--surface)` rather than to a snapshot of it. A component written once
+ * therefore reads correctly in both themes without a `dark:` twin for every
+ * colour it touches — and `dark:` still works where a real divergence is needed.
+ *
+ * The scale is deliberately short. This is a table-heavy tool: every extra
+ * accent is one more thing competing with the numbers for attention.
+ */
+:root {
+  /* Tells the browser to render native controls and scrollbars to match, which
+     is what keeps <select> menus from flashing white on a dark page. */
+  color-scheme: light dark;
+
+  --background: #f6f7f9;
+  --surface: #ffffff;
+  --surface-muted: #f0f2f5;
+  --foreground: #101317;
+  --muted: #5b6472;
+  --line: #e2e5ea;
+
+  --accent: #1d4ed8;
+  --accent-soft: #e9f0ff;
+
+  --positive: #15803d;
+  --negative: #b91c1c;
+
+  /* Brand hues darkened from the marketplaces' own orange (#ee4d2d) and green
+     (#03ac0e): the originals sit near 3:1 on white and fail as badge text. */
+  --shopee: #c33d1c;
+  --tokopedia: #0a7c14;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0b0d10;
+    --surface: #14171c;
+    --surface-muted: #1c2027;
+    --foreground: #e8eaee;
+    --muted: #98a0ae;
+    --line: #262b33;
+
+    --accent: #7fa5ff;
+    --accent-soft: #172239;
+
+    --positive: #4ade80;
+    --negative: #f87171;
+
+    --shopee: #ff7a5c;
+    --tokopedia: #5bd75b;
+  }
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+
+  --color-positive: var(--positive);
+  --color-negative: var(--negative);
+
+  --color-shopee: var(--shopee);
+  --color-tokopedia: var(--tokopedia);
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+  }
+
+  /* One focus treatment for every control, so a primitive that forgets to style
+     its own focus state still lands somewhere visible. */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: var(--accent-soft);
+    color: var(--foreground);
+  }
+}
+
+/**
+ * Scroll containers that hold tables get a thin scrollbar. A default macOS
+ * overlay scrollbar is invisible until touched, which hides the fact that a
+ * wide table has more columns off to the right.
+ */
+@utility scrollbar-slim {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
