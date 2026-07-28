@@ -86,6 +86,31 @@ $('enabled').addEventListener('change', async (event) => {
   refresh();
 });
 
+function setScrapeStatus(text, kind) {
+  const node = $('scrapestatus');
+  node.textContent = text;
+  node.className = kind || '';
+}
+
+async function runScrape(keyword) {
+  setScrapeStatus(keyword ? `Membuka "${keyword}" lalu scrape…` : 'Membaca halaman…');
+  const result = await chrome.runtime.sendMessage({ type: 'scrape', keyword: keyword || null });
+  if (result?.ok) {
+    setScrapeStatus(`${result.found} produk ditemukan, ${result.stored} tersimpan.`, 'ok');
+  } else {
+    setScrapeStatus(result?.error || 'gagal', 'bad');
+  }
+  refresh();
+}
+
+$('scrapepage').addEventListener('click', () => runScrape(null));
+
+$('keyword').addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter') return;
+  const keyword = $('keyword').value.trim();
+  if (keyword) runScrape(keyword);
+});
+
 $('copydiag').addEventListener('click', async () => {
   const state = await chrome.runtime.sendMessage({ type: 'state' });
   const diag = state?.diag || {};

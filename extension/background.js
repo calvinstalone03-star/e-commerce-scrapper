@@ -203,6 +203,25 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === 'scrape') {
+    (async () => {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id) return sendResponse({ ok: false, error: 'no active tab' });
+
+      if (message.keyword) {
+        const target = `https://shopee.co.id/search?keyword=${encodeURIComponent(message.keyword)}`;
+        await chrome.tabs.update(tab.id, { url: target });
+        // Wait for the SPA to render. There is no reliable "results are in"
+        // event from outside the page, so this is a plain settle delay — the
+        // user can always press Scrape again if it fired early.
+        await new Promise((resolve) => setTimeout(resolve, message.waitMs || 6000));
+      }
+
+      sendResponse(await scrapeTab(tab.id));
+    })();
+    return true;
+  }
+
   if (message?.type === 'flush') {
     flush().then(() => sendResponse({ ok: true }));
     return true; // keep the channel open for the async response
@@ -226,6 +245,79 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   return false;
 });
+
+// --- DOM scrape -----------------------------------------------------------
+//
+// The network interceptor turned out to be a dead end for search: Shopee's
+// search XHR answers with an empty items array and the page HTML carries no
+// listings, yet the products render fine. So the primary path is to read the
+// DOM the user is already looking at.
+
+async function ensureScraper(tabId) {
+  // The content script is declared in the manifest, but a tab opened before the
+  // extension was loaded (or reloaded) has no copy of it. Inject on demand so
+  // the user never has to think about reload order.
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['dom-scraper.js'],
+    });
+  } catch (err) {
+    /* already present, or the tab is not scriptable */
+  }
+}
+
+async function scrapeTab(tabId) {
+  await ensureScraper(tabId);
+  let result;
+  try {
+    result = await chrome.tabs.sendMessage(tabId, { type: 'scrapeDom' });
+  } catch (err) {
+    return { ok: false, error: 'could not reach the page — reload the Shopee tab and retry' };
+  }
+  if (!result?.ok) return { ok: false, error: result?.error || 'the page returned nothing' };
+  if (!result.items.length) {
+    return {
+      ok: false,
+      error: `no product cards found (${result.anchorsSeen} links on the page). Is this a search or shop page, and have the results finished loading?`,
+      items: 0,
+    };
+  }
+
+  const { endpoint, token } = await getState();
+  if (!token) return { ok: false, error: 'no ingest token set' };
+
+  let response;
+  try {
+    response = await fetch(`${endpoint}/ingest-dom`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': token },
+      body: JSON.stringify({
+        pageUrl: result.pageUrl,
+        scrapedAt: result.scrapedAt,
+        items: result.items,
+      }),
+    });
+  } catch (err) {
+    return { ok: false, error: `cannot reach ${endpoint} — is 'ecom-scraper serve' running?` };
+  }
+
+  if (response.status === 401) return { ok: false, error: 'ingest token rejected' };
+  if (!response.ok) return { ok: false, error: `server answered HTTP ${response.status}` };
+
+  const body = await response.json().catch(() => ({}));
+  const { stats } = await getState();
+  await chrome.storage.local.set({
+    [STATS_KEY]: {
+      ...stats,
+      captured: (stats.captured || 0) + result.items.length,
+      stored: (stats.stored || 0) + (body.stored || 0),
+      lastError: null,
+      lastOk: new Date().toISOString(),
+    },
+  });
+  return { ok: true, found: result.items.length, stored: body.stored || 0 };
+}
 
 chrome.alarms.create(FLUSH_ALARM, { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener((alarm) => {

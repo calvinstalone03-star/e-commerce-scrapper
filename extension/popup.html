@@ -116,6 +116,13 @@
       Sends no requests to Shopee of its own.
     </p>
 
+    <label for="keyword">scrape by keyword</label>
+    <input type="text" id="keyword" placeholder="mis. kaos polos — Enter untuk cari + scrape" />
+    <div class="actions">
+      <button id="scrapepage"><b>Scrape halaman ini</b></button>
+    </div>
+    <div id="scrapestatus" style="margin:8px 0 12px;font-size:11px;min-height:15px"></div>
+
     <div class="row"><span class="k">captured</span><span class="v" id="captured">–</span></div>
     <div class="row"><span class="k">stored in Postgres</span><span class="v" id="stored">–</span></div>
     <div class="row"><span class="k">waiting to send</span><span class="v" id="queued">–</span></div>

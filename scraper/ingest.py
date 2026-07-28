@@ -29,13 +29,14 @@ import os
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlsplit
 
 from scraper.adapters.shopee import _extract_items, parse_item
 from scraper.config import Settings, get_settings
 from scraper.db import session_scope
-from scraper.models import Marketplace
+from scraper.models import Marketplace, PriceSnapshot, Product, Store, parse_sold
 from scraper.store import insert_snapshot, upsert_product, upsert_store
 
 __all__ = [
@@ -329,6 +330,80 @@ class IngestService:
         return result
 
 
+    def ingest_dom(
+        self,
+        items: list[dict[str, Any]],
+        page_url: str = "",
+        scraped_at: datetime | None = None,
+    ) -> IngestResult:
+        """Store listings the extension read off the rendered page.
+
+        The DOM path exists because the network path could not be made to work:
+        Shopee's search XHR answers with an empty ``items`` array and the page
+        HTML carries no listings, yet the products render fine. Rather than keep
+        hunting for the endpoint, the extension reads what is on screen.
+
+        Prices arrive already in whole rupiah — the page renders "Rp404.800", not
+        micro-units — so no divisor applies here. ``sold`` arrives as the page's
+        own text ("5RB+"), which :func:`scraper.models.parse_sold` normalises.
+
+        Args:
+            items: Entries from ``dom-scraper.js``: ``shopId``, ``itemId``,
+                ``name``, ``price``, and optionally ``sold``, ``ratingStar``,
+                ``location``, ``url``, ``image``.
+            page_url: Page they were read from, for the log.
+            scraped_at: One timestamp shared by the whole page, so a screenful
+                forms a single point in the time series.
+
+        Returns:
+            An :class:`IngestResult`.
+        """
+        if not items:
+            return IngestResult(seen=0, reason="no items supplied")
+
+        stamp = scraped_at or datetime.now(timezone.utc)
+        result = IngestResult(seen=len(items))
+
+        with session_scope(self.database_url) as session:
+            store_refs: dict[int, int] = {}
+            for entry in items:
+                parsed = _dom_entry_to_models(entry)
+                if parsed is None:
+                    result.skipped += 1
+                    continue
+                store, product, snapshot = parsed
+
+                try:
+                    if store.shop_id not in store_refs:
+                        store_refs[store.shop_id] = upsert_store(
+                            session,
+                            store,
+                            now=stamp,
+                            # The DOM never shows the shop slug on a search card,
+                            # only the numeric id from the product URL. Flagging
+                            # it synthetic stops it overwriting a real slug the
+                            # web adapter stored for the same shop.
+                            username_is_synthetic=True,
+                        )
+                        result.shops.add(store.shop_id)
+                    product_ref = upsert_product(
+                        session, product, store_refs[store.shop_id], now=stamp
+                    )
+                    insert_snapshot(session, snapshot, product_ref, now=stamp)
+                    result.stored += 1
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("failed to persist DOM item %s: %s", entry.get("itemId"), exc)
+                    result.skipped += 1
+
+        log.info(
+            "DOM ingest from %s: %d seen, %d stored, %d skipped",
+            page_url[:120],
+            result.seen,
+            result.stored,
+            result.skipped,
+        )
+        return result
+
     def _dump_unrecognized(self, url: str, payload: Any) -> None:
         """Save a payload nothing could be extracted from, for inspection.
 
@@ -359,6 +434,68 @@ class IngestService:
             log.info("saved an unrecognised payload to %s for inspection", target)
         except Exception as exc:  # noqa: BLE001 - diagnostics must never break ingest
             log.debug("could not save unrecognised payload: %s", exc)
+
+
+def _dom_entry_to_models(
+    entry: dict[str, Any],
+) -> tuple[Store, Product, PriceSnapshot] | None:
+    """Convert one DOM-scraped card into domain models.
+
+    Returns None for an entry missing anything load-bearing, so one unreadable
+    card cannot lose the rest of the page.
+
+    Args:
+        entry: One item from ``dom-scraper.js``.
+
+    Returns:
+        ``(store, product, snapshot)``, or None when unusable.
+    """
+    try:
+        shop_id = int(entry["shopId"])
+        item_id = int(entry["itemId"])
+        name = str(entry.get("name") or "").strip()
+        raw_price = entry.get("price")
+        if not name or raw_price is None:
+            return None
+        # Rendered prices are whole rupiah. Going through str() keeps the
+        # Decimal exact instead of inheriting a float's artefacts.
+        price = Decimal(str(raw_price))
+        if price < 0:
+            return None
+    except (KeyError, TypeError, ValueError, InvalidOperation):
+        return None
+
+    rating = entry.get("ratingStar")
+    try:
+        rating_star = Decimal(str(rating)) if rating is not None else None
+    except (InvalidOperation, ValueError):
+        rating_star = None
+
+    store = Store(
+        marketplace=Marketplace.SHOPEE,
+        shop_id=shop_id,
+        # A search card shows no shop slug; the numeric id is all the DOM has.
+        username=f"shop-{shop_id}",
+        location=(str(entry["location"]).strip() or None) if entry.get("location") else None,
+    )
+    product = Product(
+        marketplace=Marketplace.SHOPEE,
+        item_id=item_id,
+        shop_id=shop_id,
+        name=name,
+        url=(str(entry["url"]) or None) if entry.get("url") else None,
+        image=(str(entry["image"]) or None) if entry.get("image") else None,
+    )
+    snapshot = PriceSnapshot(
+        item_id=item_id,
+        price=price,
+        # parse_sold owns every "5RB+" / "1,5RB" / "10K+" spelling; the
+        # extension deliberately forwards the page's raw text rather than
+        # growing a second copy of that logic in JavaScript.
+        sold=parse_sold(entry.get("sold")),
+        rating_star=rating_star,
+    )
+    return store, product, snapshot
 
 
 def _is_synthetic(username: str | None, shop_id: int) -> bool:
@@ -439,6 +576,33 @@ def build_app(settings: Settings | None = None, service: IngestService | None = 
                 captured_at = None
 
         result = service.ingest(url, body.get("payload"), captured_at)
+        return result.as_dict()
+
+    @app.post("/ingest-dom")
+    def ingest_dom(
+        body: dict[str, Any] = Body(...),
+        x_ingest_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Accept listings the extension read off a rendered page.
+
+        Body: ``{"items": [...], "pageUrl": str, "scrapedAt": iso8601 | null}``.
+        """
+        _authorise(x_ingest_token)
+
+        items = body.get("items")
+        if not isinstance(items, list):
+            raise HTTPException(status_code=422, detail="items must be a list")
+
+        scraped_at = None
+        raw_stamp = body.get("scrapedAt")
+        if isinstance(raw_stamp, str) and raw_stamp:
+            try:
+                scraped_at = datetime.fromisoformat(raw_stamp.replace("Z", "+00:00"))
+            except ValueError:
+                scraped_at = None
+
+        entries = [entry for entry in items if isinstance(entry, dict)]
+        result = service.ingest_dom(entries, str(body.get("pageUrl") or ""), scraped_at)
         return result.as_dict()
 
     return app

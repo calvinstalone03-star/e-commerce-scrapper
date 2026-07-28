@@ -9,6 +9,7 @@ second one that drifts.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -327,3 +328,120 @@ def test_deep_find_items_is_bounded_on_pathological_nesting() -> None:
         node = {"next": node}
 
     assert deep_find_items(node) == []  # beyond _MAX_DEPTH, returns rather than hangs
+
+
+# ----------------------------------------------------------------------
+# DOM path
+# ----------------------------------------------------------------------
+
+
+def dom_item(**overrides) -> dict:
+    """One card as dom-scraper.js reports it, using strings seen on a real page."""
+    entry = {
+        "shopId": 30203584,
+        "itemId": 111222333,
+        "name": "1:8 Formula 1 Balap Blok Bangunan Mobil Sport",
+        "price": 404800,
+        "sold": "158",
+        "ratingStar": 4.8,
+        "location": "Tangerang",
+        "url": "https://shopee.co.id/slug-i.30203584.111222333",
+        "image": "https://cf.shopee.co.id/file/abc",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_dom_entry_maps_all_five_required_fields() -> None:
+    from scraper.ingest import _dom_entry_to_models
+
+    store, product, snapshot = _dom_entry_to_models(dom_item())
+
+    assert store.shop_id == 30203584
+    assert product.item_id == 111222333
+    assert product.name.startswith("1:8 Formula 1")
+    assert snapshot.price == Decimal("404800")
+    assert snapshot.sold == 158
+    assert snapshot.rating_star == Decimal("4.8")
+
+
+def test_dom_prices_are_whole_rupiah_not_micro_units() -> None:
+    """The page renders "Rp404.800". Applying the API's 100000 divisor here
+    would file it as Rp 4."""
+    from scraper.ingest import _dom_entry_to_models
+
+    _store, _product, snapshot = _dom_entry_to_models(dom_item(price=404800))
+
+    assert snapshot.price == Decimal("404800")
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("158", 158),
+        ("5RB+", 5000),
+        ("10RB+", 10000),
+        ("1,5RB", 1500),
+        ("10K+", 10000),
+        ("2RB+", 2000),
+        (None, None),
+    ],
+)
+def test_dom_sold_text_is_normalised_by_the_shared_parser(text, expected) -> None:
+    """Every one of these spellings appears on a live Shopee results page."""
+    from scraper.ingest import _dom_entry_to_models
+
+    _store, _product, snapshot = _dom_entry_to_models(dom_item(sold=text))
+
+    assert snapshot.sold == expected
+
+
+def test_dom_entry_without_a_name_or_price_is_skipped() -> None:
+    """One unreadable card must not lose the rest of the page."""
+    from scraper.ingest import _dom_entry_to_models
+
+    assert _dom_entry_to_models(dom_item(name="")) is None
+    assert _dom_entry_to_models(dom_item(price=None)) is None
+    assert _dom_entry_to_models({"shopId": 1}) is None
+    assert _dom_entry_to_models(dom_item(price=-5)) is None
+
+
+def test_dom_entry_tolerates_missing_optional_fields() -> None:
+    from scraper.ingest import _dom_entry_to_models
+
+    store, product, snapshot = _dom_entry_to_models(
+        dom_item(sold=None, ratingStar=None, location=None, image=None, url=None)
+    )
+
+    assert snapshot.sold is None
+    assert snapshot.rating_star is None
+    assert store.location is None
+    assert product.image is None
+
+
+def test_dom_shop_username_is_flagged_synthetic() -> None:
+    """A search card shows no shop slug, only the numeric id from the product
+    URL. Storing "shop-<id>" unflagged would overwrite a real slug."""
+    from scraper.ingest import _dom_entry_to_models
+
+    store, _product, _snapshot = _dom_entry_to_models(dom_item())
+
+    assert store.username == "shop-30203584"
+
+
+def test_ingest_dom_endpoint_requires_the_token(client) -> None:
+    http, _service = client
+
+    response = http.post("/ingest-dom", json={"items": [dom_item()]})
+
+    assert response.status_code == 401
+
+
+def test_ingest_dom_rejects_a_non_list_items_field(client) -> None:
+    http, _service = client
+
+    response = http.post(
+        "/ingest-dom", json={"items": "nope"}, headers={"X-Ingest-Token": "test-token"}
+    )
+
+    assert response.status_code == 422

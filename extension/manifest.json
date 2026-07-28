@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "ecom-scraper collector",
-  "version": "0.1.0",
-  "description": "Collects Shopee listing data from pages you are already browsing, and files it into your local ecom-scraper database. Issues no requests of its own.",
-  "permissions": ["storage", "alarms"],
+  "version": "0.2.0",
+  "description": "Reads Shopee listings off pages you have open and files them into your local ecom-scraper database.",
+  "permissions": ["storage", "alarms", "tabs", "scripting"],
   "host_permissions": [
-    "http://127.0.0.1:8787/*"
+    "http://127.0.0.1:8787/*",
+    "*://shopee.co.id/*"
   ],
   "content_scripts": [
     {
@@ -16,7 +17,7 @@
     },
     {
       "matches": ["*://shopee.co.id/*"],
-      "js": ["bridge.js"],
+      "js": ["bridge.js", "dom-scraper.js"],
       "world": "ISOLATED",
       "run_at": "document_start"
     }
