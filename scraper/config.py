@@ -96,6 +96,27 @@ class Settings(BaseSettings):
         repr=False,
         description="Shopee password. See shopee_username. Excluded from repr().",
     )
+    shopee_affiliate_app_id: str | None = Field(
+        default=None,
+        description="App ID from the Shopee Affiliate dashboard's Open API section. "
+        "When this and the secret are both set, the affiliate adapter is preferred "
+        "over web scraping for Shopee — it is the supported route to keyword search, "
+        "which the web endpoint refuses.",
+    )
+    shopee_affiliate_app_secret: str | None = Field(
+        default=None,
+        # repr=False for the same reason as database_url: this is signing
+        # material, and runner._record_failure persists repr(exc) into
+        # scrape_runs.error.
+        repr=False,
+        description="App Secret from the Shopee Affiliate dashboard. Signing input "
+        "only, never transmitted. Excluded from repr().",
+    )
+    shopee_affiliate_region: str = Field(
+        default="id",
+        description="Region key selecting the affiliate GraphQL endpoint "
+        "(id, vn, br, th, my, ph, sg, tw).",
+    )
     headless: bool = Field(
         default=True,
         description="Run the Playwright bootstrap browser headless. Set false to debug "
@@ -165,6 +186,23 @@ class Settings(BaseSettings):
             and self.shopee_username.strip()
             and self.shopee_password
             and self.shopee_password.strip()
+        )
+
+    @property
+    def has_affiliate_credentials(self) -> bool:
+        """Whether the Shopee Affiliate Open API can be used.
+
+        Returns:
+            True only when both the App ID and App Secret are set and non-empty.
+            When True, ``scraper.adapters.get_adapter`` builds the affiliate
+            adapter for Shopee instead of the web-scraping one, because the web
+            path cannot reach keyword search at all.
+        """
+        return bool(
+            self.shopee_affiliate_app_id
+            and self.shopee_affiliate_app_id.strip()
+            and self.shopee_affiliate_app_secret
+            and self.shopee_affiliate_app_secret.strip()
         )
 
 

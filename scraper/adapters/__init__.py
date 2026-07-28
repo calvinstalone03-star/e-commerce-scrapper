@@ -42,6 +42,7 @@ __all__ = [
     "get_adapter",
     "register_adapter",
     "available_marketplaces",
+    "build_shopee_adapter",
     "ADAPTER_PATHS",
 ]
 
@@ -148,8 +149,67 @@ AdapterFactory = Callable[..., MarketplaceAdapter]
 #:
 #: Adding Tokopedia is exactly one line here — no runner, CLI or store change.
 ADAPTER_PATHS: dict[Marketplace, str] = {
-    Marketplace.SHOPEE: "scraper.adapters.shopee:ShopeeAdapter",
+    Marketplace.SHOPEE: "scraper.adapters:build_shopee_adapter",
 }
+
+
+def build_shopee_adapter(**kwargs: object) -> MarketplaceAdapter:
+    """Choose between Shopee's two transports based on available credentials.
+
+    Shopee has two adapters, not because of taste but because the web endpoints
+    are partly closed: ``/api/v4/search/search_items`` refuses this client, and
+    four hypotheses were tested and disproven before that was understood — it is
+    an anti-bot CAPTCHA gate, not signing, not login, not the browser. So:
+
+    * **Affiliate API** when ``SHOPEE_AFFILIATE_APP_ID`` and
+      ``SHOPEE_AFFILIATE_APP_SECRET`` are set. Supported, credentialed, reaches
+      keyword search, and lifts store mode past one item per shop.
+    * **Web scraping** otherwise. Reaches shop metadata, categories and a single
+      SEO-exposed item per shop. Keyword mode will fail as blocked.
+
+    Both write ``Marketplace.SHOPEE`` rows, so price history is continuous across
+    the switch.
+
+    Args:
+        **kwargs: Forwarded to whichever adapter is built. An explicit
+            ``client=`` is honoured and suppresses credential-based selection,
+            which is what tests and the runner's injection path rely on.
+
+    Returns:
+        The selected adapter.
+    """
+    if "client" in kwargs:
+        # Caller supplied a transport; it decides which adapter it belongs to.
+        from scraper.adapters.shopee import ShopeeAdapter
+
+        return ShopeeAdapter(**kwargs)  # type: ignore[arg-type]
+
+    from scraper.config import get_settings
+
+    settings = kwargs.pop("settings", None) or get_settings()
+
+    if getattr(settings, "has_affiliate_credentials", False):
+        from scraper.affiliate_client import AffiliateClient, AffiliateCredentials, ENDPOINTS
+        from scraper.adapters.shopee_affiliate import ShopeeAffiliateAdapter
+
+        region = (getattr(settings, "shopee_affiliate_region", "id") or "id").lower()
+        endpoint = ENDPOINTS.get(region)
+        if endpoint is None:
+            raise ValueError(
+                f"unknown SHOPEE_AFFILIATE_REGION {region!r}; "
+                f"expected one of {', '.join(sorted(ENDPOINTS))}"
+            )
+        credentials = AffiliateCredentials(
+            app_id=str(settings.shopee_affiliate_app_id).strip(),
+            app_secret=str(settings.shopee_affiliate_app_secret).strip(),
+        )
+        return ShopeeAffiliateAdapter(
+            AffiliateClient(credentials, endpoint=endpoint), **kwargs  # type: ignore[arg-type]
+        )
+
+    from scraper.adapters.shopee import ShopeeAdapter
+
+    return ShopeeAdapter(**kwargs)  # type: ignore[arg-type]
 
 #: Explicitly registered factories, which take precedence over
 #: :data:`ADAPTER_PATHS`. Populated by :func:`register_adapter`.
