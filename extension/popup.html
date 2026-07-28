@@ -139,6 +139,26 @@
 
     <div id="status"></div>
 
+    <details id="diagbox">
+      <summary style="cursor: pointer; font-size: 11px; color: var(--muted)">
+        diagnostics
+      </summary>
+      <div class="row">
+        <span class="k">script injected</span><span class="v" id="injected">–</span>
+      </div>
+      <div style="margin-top: 6px; font-size: 11px; color: var(--muted)">
+        /api/ paths this page called:
+      </div>
+      <pre id="paths" style="
+        margin: 4px 0 0; padding: 6px; max-height: 130px; overflow: auto;
+        font-size: 10px; line-height: 1.35; border: 1px solid var(--line);
+        border-radius: 5px; white-space: pre-wrap; word-break: break-all;"></pre>
+      <div class="actions">
+        <button id="copydiag">Copy</button>
+        <button id="resetdiag">Reset</button>
+      </div>
+    </details>
+
     <script src="popup.js"></script>
   </body>
 </html>

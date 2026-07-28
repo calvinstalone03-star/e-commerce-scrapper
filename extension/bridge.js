@@ -19,9 +19,19 @@
 
     const data = event.data;
     if (!data || data.source !== CHANNEL) return;
-    if (typeof data.url !== 'string' || !data.payload) return;
 
     try {
+      if (data.kind === 'injected') {
+        chrome.runtime.sendMessage({ type: 'injected', href: String(data.href || '') });
+        return;
+      }
+
+      if (data.kind === 'observed') {
+        chrome.runtime.sendMessage({ type: 'observed', path: String(data.path || '') });
+        return;
+      }
+
+      if (typeof data.url !== 'string' || !data.payload) return;
       chrome.runtime.sendMessage({
         type: 'capture',
         url: data.url,

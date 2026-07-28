@@ -12,6 +12,10 @@ const TOKEN_KEY = 'token';
 const QUEUE_KEY = 'queue';
 const STATS_KEY = 'stats';
 const ENABLED_KEY = 'enabled';
+// Diagnostics: proof the content script ran, and every /api/ path the page
+// actually called. Without these, "captured 0" is indistinguishable from "the
+// script never injected" and every fix is a guess.
+const DIAG_KEY = 'diag';
 
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787';
 const FLUSH_ALARM = 'flush';
@@ -28,12 +32,14 @@ async function getState() {
     QUEUE_KEY,
     STATS_KEY,
     ENABLED_KEY,
+    DIAG_KEY,
   ]);
   return {
     endpoint: stored[ENDPOINT_KEY] || DEFAULT_ENDPOINT,
     token: stored[TOKEN_KEY] || '',
     queue: Array.isArray(stored[QUEUE_KEY]) ? stored[QUEUE_KEY] : [],
     enabled: stored[ENABLED_KEY] !== false,
+    diag: stored[DIAG_KEY] || { injectedAt: null, lastHref: null, paths: {} },
     stats: stored[STATS_KEY] || {
       captured: 0,
       stored: 0,
@@ -149,6 +155,44 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  if (message?.type === 'injected') {
+    (async () => {
+      const { diag } = await getState();
+      await chrome.storage.local.set({
+        [DIAG_KEY]: {
+          ...diag,
+          injectedAt: new Date().toISOString(),
+          lastHref: message.href || null,
+        },
+      });
+    })();
+    return false;
+  }
+
+  if (message?.type === 'observed') {
+    (async () => {
+      const { diag } = await getState();
+      const paths = { ...(diag.paths || {}) };
+      const path = message.path || '';
+      if (path) paths[path] = (paths[path] || 0) + 1;
+      // Bound it: a long session touches a lot of telemetry endpoints.
+      const trimmed = Object.fromEntries(
+        Object.entries(paths)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 40),
+      );
+      await chrome.storage.local.set({ [DIAG_KEY]: { ...diag, paths: trimmed } });
+    })();
+    return false;
+  }
+
+  if (message?.type === 'resetDiag') {
+    chrome.storage.local
+      .set({ [DIAG_KEY]: { injectedAt: null, lastHref: null, paths: {} } })
+      .then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
   if (message?.type === 'flush') {
     flush().then(() => sendResponse({ ok: true }));
     return true; // keep the channel open for the async response
@@ -164,6 +208,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         enabled: state.enabled,
         queued: state.queue.length,
         stats: state.stats,
+        diag: state.diag,
       }),
     );
     return true;

@@ -39,6 +39,83 @@
     return WANTED.some((path) => url.includes(path));
   }
 
+  // Diagnostics. When nothing is captured, the question is always the same:
+  // did this script run at all, and what API paths did the page actually call?
+  // Guessing at that from outside costs a round trip per guess, so report it.
+  function observe(url) {
+    if (typeof url !== 'string' || !url.includes('/api/')) return;
+    try {
+      const path = new URL(url, window.location.origin).pathname;
+      window.postMessage(
+        { source: CHANNEL, kind: 'observed', path },
+        window.location.origin,
+      );
+    } catch (err) {
+      /* not a parseable URL; nothing to report */
+    }
+  }
+
+  // Announce injection immediately, so "captured 0" can be told apart from
+  // "the content script never ran".
+  window.postMessage(
+    { source: CHANNEL, kind: 'injected', href: window.location.href },
+    window.location.origin,
+  );
+
+  // Shopee renders the first page of results server-side: the listing JSON is
+  // embedded in the HTML, and no XHR carries it. Only later pages and scroll
+  // loads go over the network. Sweep the inline state once the DOM is parsed so
+  // the first screenful is not silently missed.
+  function sweepInlineState() {
+    const KEYS = ['__INITIAL_STATE__', '__NEXT_DATA__', '__NUXT__', '__STORE__'];
+    for (const key of KEYS) {
+      const blob = window[key];
+      if (!blob) continue;
+      try {
+        window.postMessage(
+          {
+            source: CHANNEL,
+            kind: 'capture',
+            url: `${window.location.origin}/api/v4/search/search_items#inline:${key}`,
+            payload: blob,
+            capturedAt: new Date().toISOString(),
+          },
+          window.location.origin,
+        );
+      } catch (err) {
+        /* not structured-cloneable */
+      }
+    }
+
+    // Also scan JSON <script> blocks, which is where Shopee has historically
+    // parked the SSR payload.
+    for (const node of document.querySelectorAll('script[type="application/json"]')) {
+      const text = node.textContent || '';
+      if (text.length < 200 || text.length > MAX_BODY_BYTES) continue;
+      if (!text.includes('itemid') && !text.includes('item_basic')) continue;
+      try {
+        window.postMessage(
+          {
+            source: CHANNEL,
+            kind: 'capture',
+            url: `${window.location.origin}/api/v4/search/search_items#inline:script`,
+            payload: JSON.parse(text),
+            capturedAt: new Date().toISOString(),
+          },
+          window.location.origin,
+        );
+      } catch (err) {
+        /* not JSON we can use */
+      }
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => setTimeout(sweepInlineState, 1500));
+  } else {
+    setTimeout(sweepInlineState, 1500);
+  }
+
   function publish(url, bodyText) {
     if (!bodyText || bodyText.length > MAX_BODY_BYTES) return;
     let payload;
@@ -55,6 +132,7 @@
       window.postMessage(
         {
           source: CHANNEL,
+          kind: 'capture',
           url: String(url),
           payload,
           capturedAt: new Date().toISOString(),
@@ -78,6 +156,7 @@
             ? request.url
             : '';
 
+      observe(url);
       const pending = nativeFetch.apply(this, args);
       if (!isWanted(url)) return pending;
 
@@ -111,6 +190,7 @@
 
   XMLHttpRequest.prototype.send = function patchedSend(...args) {
     const url = this.__ecomScraperUrl;
+    observe(url);
     if (isWanted(url)) {
       this.addEventListener('load', () => {
         try {
