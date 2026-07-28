@@ -210,6 +210,20 @@ on every server restart, forking each listing's price history.
 Guards: loopback bind, shared token compared with `compare_digest`, and an
 unknown `marketplace` is a 422 rather than a silent default.
 
+Product image URLs come along with everything else, in `products.image`. They
+are stored as the CDN base URL and are directly usable — no referer header, no
+token. Shopee's CDN takes a size suffix, which matters more than it sounds:
+
+```
+<url>            467 KB  JPEG   full size
+<url>_tn          40 KB  JPEG   thumbnail
+<url>_tn.webp     28 KB  WebP   thumbnail
+```
+
+A 60-product grid is ~28 MB at full size and ~1.7 MB with `_tn.webp`. The base
+URL is what gets stored, so append the suffix at render time and full resolution
+stays one string concatenation away.
+
 Its honest limit: it collects only what you actually browse. No browsing, no
 data, and nothing to schedule.
 
