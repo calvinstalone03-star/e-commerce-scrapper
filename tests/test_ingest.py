@@ -14,6 +14,7 @@ from decimal import Decimal
 import pytest
 
 from scraper.config import Settings
+from scraper.models import Marketplace
 from scraper.ingest import (
     CAPTURED_PATHS,
     IngestResult,
@@ -442,6 +443,142 @@ def test_ingest_dom_rejects_a_non_list_items_field(client) -> None:
 
     response = http.post(
         "/ingest-dom", json={"items": "nope"}, headers={"X-Ingest-Token": "test-token"}
+    )
+
+    assert response.status_code == 422
+
+
+# ----------------------------------------------------------------------
+# Multi-marketplace
+# ----------------------------------------------------------------------
+
+
+def test_shopee_numeric_keys_pass_through_unchanged() -> None:
+    """Shopee ids must stay recognisable so DOM rows match the ones the API and
+    scraping paths wrote for the same listing."""
+    from scraper.ingest import _dom_entry_to_models
+
+    store, product, _snapshot = _dom_entry_to_models(
+        {"shopKey": "30203584", "itemKey": "111222333", "name": "Kaos", "price": 55000},
+        Marketplace.SHOPEE,
+    )
+
+    assert store.shop_id == 30203584
+    assert product.item_id == 111222333
+
+
+def test_tokopedia_slugs_become_stable_ids() -> None:
+    """Tokopedia URLs carry no numeric id, but price history needs the same
+    listing to resolve to the same id on every scrape."""
+    from scraper.ingest import _dom_entry_to_models, stable_id
+
+    entry = {
+        "shopKey": "tokosaya",
+        "itemKey": "tokosaya/lego-technic-42115",
+        "name": "LEGO Technic 42115",
+        "price": 4999000,
+    }
+
+    first = _dom_entry_to_models(entry, Marketplace.TOKOPEDIA)
+    second = _dom_entry_to_models(dict(entry), Marketplace.TOKOPEDIA)
+
+    assert first[1].item_id == second[1].item_id
+    assert first[1].item_id == stable_id("tokosaya/lego-technic-42115")
+    assert first[1].marketplace is Marketplace.TOKOPEDIA
+
+
+def test_stable_id_survives_a_restart() -> None:
+    """hash() is salted per process and would mint a fresh product row on every
+    server restart, forking each listing's price history."""
+    import subprocess
+    import sys
+
+    code = (
+        "from scraper.ingest import stable_id; print(stable_id('tokosaya/lego-technic-42115'))"
+    )
+    runs = {
+        subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        for _ in range(2)
+    }
+
+    assert len(runs) == 1
+
+
+def test_stable_id_fits_a_signed_bigint() -> None:
+    from scraper.ingest import stable_id
+
+    for key in ("a", "tokosaya/produk", "x" * 500, "ñ-unicode-slug"):
+        value = stable_id(key)
+        assert 0 < value < 2**63
+
+
+def test_distinct_slugs_get_distinct_ids() -> None:
+    from scraper.ingest import stable_id
+
+    keys = [f"toko{n}/produk-{n}" for n in range(2000)]
+    assert len(({stable_id(key) for key in keys})) == len(keys)
+
+
+def test_tokopedia_shop_slug_is_a_real_username_not_a_placeholder() -> None:
+    """Shopee search cards expose no slug so they get "shop-<id>"; Tokopedia's
+    URL IS the slug, and flagging it synthetic would stop it ever being stored."""
+    from scraper.ingest import _dom_entry_to_models, _is_synthetic
+
+    store, _product, _snapshot = _dom_entry_to_models(
+        {"shopKey": "tokosaya", "itemKey": "tokosaya/x-y", "name": "Produk", "price": 1000},
+        Marketplace.TOKOPEDIA,
+    )
+
+    assert store.username == "tokosaya"
+    assert _is_synthetic(store.username, store.shop_id) is False
+
+
+def test_shopee_dom_username_is_still_synthetic() -> None:
+    from scraper.ingest import _dom_entry_to_models, _is_synthetic
+
+    store, _product, _snapshot = _dom_entry_to_models(
+        {"shopKey": "30203584", "itemKey": "901", "name": "Produk", "price": 1000},
+        Marketplace.SHOPEE,
+    )
+
+    assert store.username == "shop-30203584"
+    assert _is_synthetic(store.username, store.shop_id) is True
+
+
+def test_the_same_slug_on_two_marketplaces_stays_separate() -> None:
+    """(marketplace, item_id) is the natural key; a collision across sites would
+    merge two unrelated products' price histories."""
+    from scraper.ingest import _dom_entry_to_models
+
+    entry = {"shopKey": "toko", "itemKey": "toko/produk", "name": "P", "price": 1}
+
+    shopee = _dom_entry_to_models(dict(entry), Marketplace.SHOPEE)
+    tokped = _dom_entry_to_models(dict(entry), Marketplace.TOKOPEDIA)
+
+    assert shopee[1].item_id == tokped[1].item_id  # same key, same derived id
+    assert shopee[1].marketplace is not tokped[1].marketplace  # but different rows
+
+
+def test_legacy_numeric_field_names_still_work(client) -> None:
+    """The extension used to send shopId/itemId; do not break an old build."""
+    from scraper.ingest import _dom_entry_to_models
+
+    store, product, _snapshot = _dom_entry_to_models(
+        {"shopId": 42, "itemId": 99, "name": "Produk", "price": 1000}
+    )
+
+    assert (store.shop_id, product.item_id) == (42, 99)
+
+
+def test_unknown_marketplace_is_rejected(client) -> None:
+    http, _service = client
+
+    response = http.post(
+        "/ingest-dom",
+        json={"marketplace": "bukalapak", "items": []},
+        headers={"X-Ingest-Token": "test-token"},
     )
 
     assert response.status_code == 422

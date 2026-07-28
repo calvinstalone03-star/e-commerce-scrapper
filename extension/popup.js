@@ -1,138 +1,99 @@
-// Popup: show counters, let the user point at the ingest server and paste the
-// token, and surface diagnostics. Deliberately thin — the service worker owns
-// all state, so the popup closing (which it does constantly) loses nothing.
+// Popup. Deliberately thin: the service worker owns every decision, this only
+// renders and dispatches.
+//
+// The marketplace is detected from the active tab rather than chosen from a
+// dropdown — the tab already knows which site it is on, so asking would be
+// asking the user to restate something visible. Server and token live behind
+// the gear because they are set once and never touched again.
 
 const $ = (id) => document.getElementById(id);
 
-function setStatus(text, kind) {
-  const node = $('status');
-  node.textContent = text;
-  node.className = kind || '';
+function setResult(text, kind = 'muted') {
+  $('result').textContent = text;
+  $('result').className = kind;
 }
 
 async function refresh() {
-  const state = await chrome.runtime.sendMessage({ type: 'state' });
-  if (!state) return;
+  const context = await chrome.runtime.sendMessage({ type: 'context' });
+  if (!context) return;
 
-  $('captured').textContent = state.stats.captured ?? 0;
-  $('stored').textContent = state.stats.stored ?? 0;
-  $('queued').textContent = state.queued ?? 0;
-  $('dropped').textContent = state.stats.dropped ?? 0;
-  $('enabled').checked = state.enabled;
-  $('endpoint').value = state.endpoint;
-  // The token is never returned by the worker; show only whether one is set, so
-  // the popup cannot become a place a token gets read off the screen.
-  $('token').placeholder = state.hasToken
-    ? '•••••••• (saved — type to replace)'
-    : 'paste from: ecom-scraper serve';
-
-  const diag = state.diag || {};
-  $('injected').textContent = diag.injectedAt
-    ? new Date(diag.injectedAt).toLocaleTimeString()
-    : 'never — reload the Shopee tab';
-
-  const paths = Object.entries(diag.paths || {}).sort(
-    (a, b) => (b[1].max || 0) - (a[1].max || 0),
-  );
-  $('paths').textContent = paths.length
-    ? paths
-        .map(([path, v]) => {
-          const kb = Math.round((v.max || 0) / 1024);
-          return `${String(kb).padStart(5)}KB x${String(v.n).padEnd(3)} ${path}`;
-        })
-        .join('\n')
-    : 'none seen yet';
-
-  if (state.stats.lastError) {
-    setStatus(state.stats.lastError, 'bad');
-  } else if (state.stats.lastOk) {
-    setStatus(`last sent ${new Date(state.stats.lastOk).toLocaleTimeString()}`, 'ok');
+  const site = $('site');
+  if (context.marketplace) {
+    site.textContent = context.marketplace;
+    site.className = '';
+    $('scrape').disabled = false;
   } else {
-    setStatus('Browse a Shopee search or shop page to start collecting.');
+    site.textContent = 'buka tab Shopee / Tokopedia';
+    site.className = 'off';
+    $('scrape').disabled = true;
+  }
+
+  $('endpoint').value = context.endpoint;
+  $('token').placeholder = context.hasToken
+    ? '•••••••• tersimpan'
+    : 'dari: ecom-scraper serve';
+
+  if (context.stats) {
+    $('tproducts').textContent = context.stats.products ?? '–';
+    $('tsnapshots').textContent = context.stats.snapshots ?? '–';
+    $('tstores').textContent = context.stats.stores ?? '–';
+  } else {
+    for (const id of ['tproducts', 'tsnapshots', 'tstores']) $(id).textContent = '–';
+    if (!$('result').textContent) {
+      setResult(`server tidak aktif — jalankan: ecom-scraper serve`, 'bad');
+    }
   }
 }
+
+async function run(keyword) {
+  $('scrape').disabled = true;
+  setResult(keyword ? `mencari "${keyword}"…` : 'membaca halaman…');
+
+  const result = await chrome.runtime.sendMessage({ type: 'scrape', keyword: keyword || null });
+
+  if (result?.ok) {
+    const parts = [`${result.found} produk`, `${result.stored} baru`];
+    // Unchanged is not a failure — it is deduplication doing its job, and
+    // hiding it would make a working repeat scrape look like it did nothing.
+    if (result.unchanged) parts.push(`${result.unchanged} tidak berubah`);
+    if (result.skipped) parts.push(`${result.skipped} dilewati`);
+    setResult(parts.join(' · '), 'ok');
+  } else {
+    setResult(result?.error || 'gagal', 'bad');
+  }
+
+  $('scrape').disabled = false;
+  refresh();
+}
+
+$('scrape').addEventListener('click', () => run(null));
+
+$('keyword').addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter') return;
+  const keyword = $('keyword').value.trim();
+  if (keyword) run(keyword);
+});
+
+$('gear').addEventListener('click', () => {
+  $('settings').classList.toggle('open');
+});
 
 $('save').addEventListener('click', async () => {
   const endpoint = $('endpoint').value.trim() || 'http://127.0.0.1:8787';
   const token = $('token').value.trim();
 
   const patch = { endpoint };
-  if (token) patch.token = token; // empty means "keep the saved one"
+  if (token) patch.token = token; // blank means "keep what is stored"
   await chrome.storage.local.set(patch);
   $('token').value = '';
 
   try {
     const response = await fetch(`${endpoint}/health`);
-    setStatus(
-      response.ok
-        ? 'Saved. Ingest server is reachable.'
-        : `Saved, but the server answered HTTP ${response.status}.`,
-      response.ok ? 'ok' : 'bad',
-    );
+    setResult(response.ok ? 'tersimpan, server terhubung' : `server balas HTTP ${response.status}`,
+      response.ok ? 'ok' : 'bad');
   } catch (err) {
-    setStatus(`Saved, but ${endpoint} is unreachable. Run: ecom-scraper serve`, 'bad');
+    setResult(`tersimpan, tapi ${endpoint} tidak bisa dihubungi`, 'bad');
   }
-  refresh();
-});
-
-$('flush').addEventListener('click', async () => {
-  setStatus('Sending…');
-  await chrome.runtime.sendMessage({ type: 'flush' });
-  refresh();
-});
-
-$('enabled').addEventListener('change', async (event) => {
-  await chrome.storage.local.set({ enabled: event.target.checked });
-  refresh();
-});
-
-function setScrapeStatus(text, kind) {
-  const node = $('scrapestatus');
-  node.textContent = text;
-  node.className = kind || '';
-}
-
-async function runScrape(keyword) {
-  setScrapeStatus(keyword ? `Membuka "${keyword}" lalu scrape…` : 'Membaca halaman…');
-  const result = await chrome.runtime.sendMessage({ type: 'scrape', keyword: keyword || null });
-  if (result?.ok) {
-    setScrapeStatus(`${result.found} produk ditemukan, ${result.stored} tersimpan.`, 'ok');
-  } else {
-    setScrapeStatus(result?.error || 'gagal', 'bad');
-  }
-  refresh();
-}
-
-$('scrapepage').addEventListener('click', () => runScrape(null));
-
-$('keyword').addEventListener('keydown', (event) => {
-  if (event.key !== 'Enter') return;
-  const keyword = $('keyword').value.trim();
-  if (keyword) runScrape(keyword);
-});
-
-$('copydiag').addEventListener('click', async () => {
-  const state = await chrome.runtime.sendMessage({ type: 'state' });
-  const diag = state?.diag || {};
-  const report = [
-    `injectedAt: ${diag.injectedAt || 'never'}`,
-    `lastHref:   ${diag.lastHref || '-'}`,
-    `captured:   ${state?.stats?.captured ?? 0}`,
-    `stored:     ${state?.stats?.stored ?? 0}`,
-    `queued:     ${state?.queued ?? 0}`,
-    `lastError:  ${state?.stats?.lastError || '-'}`,
-    '',
-    'paths:',
-    ...Object.entries(diag.paths || {})
-      .sort((a, b) => (b[1].max || 0) - (a[1].max || 0))
-      .map(([path, v]) => `  ${Math.round((v.max || 0) / 1024)}KB x${v.n}  ${path}`),
-  ].join('\n');
-  await navigator.clipboard.writeText(report);
-  setStatus('Diagnostics copied to clipboard.', 'ok');
-});
-
-$('resetdiag').addEventListener('click', async () => {
-  await chrome.runtime.sendMessage({ type: 'resetDiag' });
   refresh();
 });
 

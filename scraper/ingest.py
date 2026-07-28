@@ -24,6 +24,7 @@ write path into the user's database otherwise.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import secrets
@@ -47,6 +48,7 @@ __all__ = [
     "deep_find_items",
     "is_captured",
     "resolve_token",
+    "stable_id",
 ]
 
 log = logging.getLogger(__name__)
@@ -352,6 +354,7 @@ class IngestService:
         items: list[dict[str, Any]],
         page_url: str = "",
         scraped_at: datetime | None = None,
+        marketplace: Marketplace | str = Marketplace.SHOPEE,
     ) -> IngestResult:
         """Store listings the extension read off the rendered page.
 
@@ -378,13 +381,14 @@ class IngestService:
         if not items:
             return IngestResult(seen=0, reason="no items supplied")
 
+        market = Marketplace(marketplace) if not isinstance(marketplace, Marketplace) else marketplace
         stamp = scraped_at or datetime.now(timezone.utc)
         result = IngestResult(seen=len(items))
 
         with session_scope(self.database_url) as session:
             store_refs: dict[int, int] = {}
             for entry in items:
-                parsed = _dom_entry_to_models(entry)
+                parsed = _dom_entry_to_models(entry, market)
                 if parsed is None:
                     result.skipped += 1
                     continue
@@ -396,11 +400,12 @@ class IngestService:
                             session,
                             store,
                             now=stamp,
-                            # The DOM never shows the shop slug on a search card,
-                            # only the numeric id from the product URL. Flagging
-                            # it synthetic stops it overwriting a real slug the
-                            # web adapter stored for the same shop.
-                            username_is_synthetic=True,
+                            # Only a placeholder is synthetic. Tokopedia's shop
+                            # key IS the real slug, and flagging it would stop it
+                            # ever being stored.
+                            username_is_synthetic=_is_synthetic(
+                                store.username, store.shop_id
+                            ),
                         )
                         result.shops.add(store.shop_id)
                     product_ref = upsert_product(
@@ -459,8 +464,53 @@ class IngestService:
             log.debug("could not save unrecognised payload: %s", exc)
 
 
+#: Mask keeping a derived id inside PostgreSQL's signed BIGINT range.
+_ID_MASK = (1 << 62) - 1
+
+
+def stable_id(key: str) -> int:
+    """Derive a stable positive integer id from a string key.
+
+    Shopee puts both ids in its product URL, so its keys arrive numeric and pass
+    straight through. Tokopedia's URLs are ``/<shopSlug>/<productSlug>`` with no
+    numeric id anywhere, so its keys are slugs — but the schema's natural key is
+    ``(marketplace, item_id) BIGINT``, and price history depends on the same
+    listing resolving to the same id every time.
+
+    BLAKE2b truncated to 62 bits gives that: deterministic across processes and
+    restarts (unlike :func:`hash`, which is salted per process and would mint a
+    fresh id — and therefore a fresh product row — on every server restart).
+
+    Args:
+        key: Marketplace-scoped key, e.g. ``"tokosaya/lego-technic-42115"``.
+
+    Returns:
+        A positive int that fits a signed BIGINT.
+    """
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") & _ID_MASK
+
+
+def _resolve_key(value: Any) -> int | None:
+    """Turn a marketplace key into an integer id.
+
+    Numeric keys are used as-is so Shopee ids stay recognisable in the database
+    and continue to match rows written by the API and scraping paths. Anything
+    else is hashed.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    return stable_id(text)
+
+
 def _dom_entry_to_models(
     entry: dict[str, Any],
+    marketplace: Marketplace = Marketplace.SHOPEE,
 ) -> tuple[Store, Product, PriceSnapshot] | None:
     """Convert one DOM-scraped card into domain models.
 
@@ -468,24 +518,27 @@ def _dom_entry_to_models(
     card cannot lose the rest of the page.
 
     Args:
-        entry: One item from ``dom-scraper.js``.
+        entry: One item from ``dom-scraper.js``. Ids arrive as ``shopKey`` /
+            ``itemKey`` strings; the older numeric ``shopId`` / ``itemId`` names
+            are still accepted.
+        marketplace: Which site the page belonged to.
 
     Returns:
         ``(store, product, snapshot)``, or None when unusable.
     """
     try:
-        shop_id = int(entry["shopId"])
-        item_id = int(entry["itemId"])
+        shop_id = _resolve_key(entry.get("shopKey", entry.get("shopId")))
+        item_id = _resolve_key(entry.get("itemKey", entry.get("itemId")))
         name = str(entry.get("name") or "").strip()
         raw_price = entry.get("price")
-        if not name or raw_price is None:
+        if shop_id is None or item_id is None or not name or raw_price is None:
             return None
         # Rendered prices are whole rupiah. Going through str() keeps the
         # Decimal exact instead of inheriting a float's artefacts.
         price = Decimal(str(raw_price))
         if price < 0:
             return None
-    except (KeyError, TypeError, ValueError, InvalidOperation):
+    except (TypeError, ValueError, InvalidOperation):
         return None
 
     rating = entry.get("ratingStar")
@@ -494,15 +547,21 @@ def _dom_entry_to_models(
     except (InvalidOperation, ValueError):
         rating_star = None
 
+    # Shopee search cards expose no shop slug, only the numeric id from the URL,
+    # so the username is a placeholder there. Tokopedia's URL *is* the slug, so
+    # it is the real thing and must not be flagged synthetic.
+    raw_shop_key = str(entry.get("shopKey", entry.get("shopId", ""))).strip()
+    username = raw_shop_key if raw_shop_key and not raw_shop_key.isdigit() else f"shop-{shop_id}"
+
     store = Store(
-        marketplace=Marketplace.SHOPEE,
+        marketplace=marketplace,
         shop_id=shop_id,
-        # A search card shows no shop slug; the numeric id is all the DOM has.
-        username=f"shop-{shop_id}",
+        username=username,
+        name=(str(entry["shopName"]).strip() or None) if entry.get("shopName") else None,
         location=(str(entry["location"]).strip() or None) if entry.get("location") else None,
     )
     product = Product(
-        marketplace=Marketplace.SHOPEE,
+        marketplace=marketplace,
         item_id=item_id,
         shop_id=shop_id,
         name=name,
@@ -624,8 +683,32 @@ def build_app(settings: Settings | None = None, service: IngestService | None = 
             except ValueError:
                 scraped_at = None
 
+        raw_market = str(body.get("marketplace") or Marketplace.SHOPEE.value).lower()
+        try:
+            market = Marketplace(raw_market)
+        except ValueError:
+            raise HTTPException(
+                status_code=422, detail=f"unknown marketplace {raw_market!r}"
+            ) from None
+
         entries = [entry for entry in items if isinstance(entry, dict)]
-        result = service.ingest_dom(entries, str(body.get("pageUrl") or ""), scraped_at)
+        result = service.ingest_dom(
+            entries, str(body.get("pageUrl") or ""), scraped_at, marketplace=market
+        )
         return result.as_dict()
+
+    @app.get("/stats")
+    def stats(x_ingest_token: str | None = Header(default=None)) -> dict[str, Any]:
+        """Row counts for the extension popup, so it can show progress."""
+        _authorise(x_ingest_token)
+        from scraper.db import session_scope as _scope
+        from scraper.store import get_stats
+
+        with _scope(settings.database_url) as session:
+            return {
+                key: value
+                for key, value in get_stats(session).items()
+                if isinstance(value, int)
+            }
 
     return app

@@ -160,7 +160,7 @@ anonymous one and every subsequent scrape would quietly run logged out. When
 Shopee starts refusing an imported jar, it has expired: log in again in your
 browser and re-import.
 
-### The collector extension — when nothing else gets through
+### The collector extension — Shopee and Tokopedia
 
 Keyword search stays closed to this project's HTTP client no matter what. Four
 hypotheses were tested and disproven: request signing (in-page requests *are*
@@ -169,46 +169,49 @@ live logged-in jar behaves identically), and an automation-flagged browser (real
 Chrome over CDP hits the same gate). What is left is an anti-bot CAPTCHA, and
 this project does not solve it, work around it, or hand it to a solver service.
 
-What is *not* blocked is ordinary browsing. So the collector inverts the
-direction: a Chrome extension watches the listing JSON that Shopee pages fetch
-**while you browse them anyway**, and files it into the same Postgres tables.
-
-It issues **no requests to Shopee of its own** — it reads responses the page
-already received. The marginal load on Shopee is zero, which is the entire point
-of the design. There is deliberately no background crawl loop; that would just
-be the scraper wearing a costume, and would deserve the block it got.
+What *is* available is the rendered page. Both sites build their results
+client-side — Shopee's search HTML is 157KB of app shell with zero listings in
+it, Tokopedia's is 598KB without a single `Rp` — so the extension reads the DOM
+after the browser has rendered it. That is also the copy the user can see, which
+means a wrong result is visibly wrong.
 
 ```bash
 ecom-scraper serve          # prints the ingest token
 ```
 
-Then load the extension: Chrome → `chrome://extensions` → enable **Developer
-mode** → **Load unpacked** → select the `extension/` folder. Open its popup,
-paste the token, Save. Browse Shopee search and shop pages normally; the counters
-move as data lands.
+Chrome → `chrome://extensions` → **Developer mode** → **Load unpacked** →
+`extension/`. Open the popup, click the gear, paste the token, Save.
 
-How the pieces fit:
+Then either open a search or shop page and press **Scrape halaman ini**, or type
+a keyword and press Enter to navigate and scrape in one go. One click, one page —
+there is no background crawl loop, which would just be the scraper wearing a
+costume and would deserve the block it got.
 
-| Piece | Job |
+| File | Job |
 |---|---|
-| `extension/interceptor.js` | MAIN world; wraps `fetch`/XHR to *observe* listing responses. Never modifies a request or what the page sees. |
-| `extension/bridge.js` | ISOLATED world; origin-pinned relay to the service worker. Treats page messages as untrusted. |
-| `extension/background.js` | Buffers in `chrome.storage.local` (MV3 workers die constantly) and POSTs to the ingest server. |
-| `scraper/ingest.py` | Parses with `parse_item` — the scraper's own parser, not a second one — and persists. |
+| `extension/sites.js` | Per-marketplace config. Adding a third site is one entry plus a manifest match. |
+| `extension/dom-scraper.js` | Generic extractor: find product links, walk out to the card, read the text. |
+| `extension/background.js` | Injects the scraper on demand, POSTs the result. No queue — scraping is synchronous. |
+| `scraper/ingest.py` | Turns cards into rows, reusing `models.parse_sold` rather than a second copy in JS. |
 
-The extension is deliberately dumb and the server is smart: raw payloads go over
-the wire and every bit of parsing reuses the tested Python. A second parser
-written in JavaScript would drift from this one within a week.
+The one genuinely site-specific piece is how a product link identifies itself:
 
-Guards worth knowing about: the endpoint binds loopback, requires a shared token
-(`X-Ingest-Token`, compared with `compare_digest`), checks **host and path** so a
-lookalike like `shopee.co.id.evil.example` is refused, and stores only the
-listing paths in `CAPTURED_PATHS` — a Shopee front-end change cannot fill your
-database with telemetry.
+```
+Shopee     /<slug>-i.<shopId>.<itemId>   both ids sit in the URL
+Tokopedia  /<shopSlug>/<productSlug>     no numeric ids anywhere
+```
+
+So links yield string keys and the server resolves them: numeric ones pass
+through unchanged (keeping Shopee ids matching rows the API and scraping paths
+wrote), slugs go through `stable_id`, a truncated BLAKE2b. Not `hash()` — that is
+salted per process and would mint a fresh id, and therefore a fresh product row,
+on every server restart, forking each listing's price history.
+
+Guards: loopback bind, shared token compared with `compare_digest`, and an
+unknown `marketplace` is a 422 rather than a silent default.
 
 Its honest limit: it collects only what you actually browse. No browsing, no
-data, and nothing to schedule. Use the affiliate API for unattended collection
-and this for coverage of whatever you can see.
+data, and nothing to schedule.
 
 ### Did that actually unlock anything? `ecom-scraper doctor`
 
