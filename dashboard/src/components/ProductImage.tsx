@@ -3,7 +3,7 @@
 import Image from 'next/image';
 import { useState } from 'react';
 
-import { imageUrl } from '@/lib/image';
+import { imageUrl, isAllowedImageHost } from '@/lib/image';
 import { cn } from '@/components/ui/cn';
 
 type ProductImageProps = {
@@ -39,7 +39,13 @@ export function ProductImage({
 }: ProductImageProps) {
   // Always thumbnailed: the full-size Shopee asset is ~467KB against ~28KB for
   // the `_tn.webp` variant, and a 50-row page would fetch that fifty times.
-  const resolved = imageUrl(src, 'thumb');
+  //
+  // A host outside `IMAGE_HOSTS` is treated as no image at all. `next/image`
+  // throws on one rather than reporting it through `onError`, and a thrown
+  // render takes the product list with it — so the check happens before the
+  // element exists, not after it fails.
+  const sized = imageUrl(src, 'thumb');
+  const resolved = sized !== null && isAllowedImageHost(sized) ? sized : null;
 
   // The failed URL rather than a boolean — a recycled component instance that
   // receives a different product would otherwise stay stuck on the placeholder.

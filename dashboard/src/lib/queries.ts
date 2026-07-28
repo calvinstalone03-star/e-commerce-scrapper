@@ -124,7 +124,12 @@ export async function getStores(
       LEFT JOIN latest   l ON l.product_ref = p.id
       ${where}
       GROUP BY s.id
-      ${orderBy}
+      -- The trailing s.id is the tiebreak, and it is not decoration: none of the
+      -- sort keys above is unique, and an ORDER BY that leaves rows tied leaves
+      -- Postgres free to return them in a different order on the next execution.
+      -- Under LIMIT/OFFSET that is a paging bug — a shop can appear on both page
+      -- 1 and page 2 while another is never shown at all.
+      ${orderBy}, s.id ASC
       LIMIT ${filter.pageSize} OFFSET ${offset}
     `,
     sql`SELECT count(*) AS total FROM stores s ${where}`,
@@ -220,7 +225,10 @@ export async function getProducts(
       LEFT JOIN stores s ON s.id = p.shop_ref
       LEFT JOIN latest l ON l.product_ref = p.id
       ${where}
-      ${orderBy}
+      -- Unique tiebreak, so a page boundary cannot duplicate or swallow a row.
+      -- Ties are the norm here rather than the exception: sold and rating_star
+      -- repeat across most of the table.
+      ${orderBy}, p.id ASC
       LIMIT ${filter.pageSize} OFFSET ${offset}
     `,
     sql`
@@ -245,7 +253,9 @@ export async function getPriceHistory(productId: number): Promise<PricePoint[]> 
     SELECT scraped_at AS "scrapedAt", price, sold, rating_star AS "ratingStar"
     FROM price_snapshots
     WHERE product_ref = ${productId}
-    ORDER BY scraped_at ASC
+    -- Two snapshots of one product can share a timestamp; id decides which of
+    -- them the line visits first instead of leaving it to the planner.
+    ORDER BY scraped_at ASC, id ASC
   `;
   return rows.map((row) => pricePointSchema.parse(row));
 }
@@ -269,7 +279,10 @@ export async function getKeywords(marketplace?: string): Promise<KeywordRow[]> {
     LEFT JOIN latest l ON l.product_ref = pk.product_ref
     ${marketplace ? sql`WHERE pk.marketplace = ${marketplace}` : sql``}
     GROUP BY pk.keyword, pk.marketplace
-    ORDER BY products DESC, pk.keyword ASC
+    -- The group is (keyword, marketplace), so keyword alone does not break a
+    -- tie: one term scraped on both marketplaces is two rows that can hold the
+    -- same product count.
+    ORDER BY products DESC, pk.keyword ASC, pk.marketplace ASC
   `;
   return rows.map((row) => keywordRowSchema.parse(row));
 }
@@ -306,7 +319,12 @@ export async function getKeywordComparison(keyword: string): Promise<
     WHERE pk.keyword = ${keyword}
     GROUP BY s.id, s.username
     HAVING count(DISTINCT p.id) > 0
-    ORDER BY avg(l.price) ASC NULLS LAST
+    -- Shops that price a keyword identically are common, and without a tiebreak
+    -- they swap places between requests — which reorders the bars in the
+    -- comparison chart, and with them which shop the page calls "termurah".
+    -- s.id is NULL for the one synthetic row of shopless products, so it sorts
+    -- last rather than jumping to the front of its tie group.
+    ORDER BY avg(l.price) ASC NULLS LAST, s.id ASC NULLS LAST
   `;
   return rows.map((row) => ({
     storeId: row.storeId ?? null,

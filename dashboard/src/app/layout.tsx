@@ -41,7 +41,7 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="id" className={`${geistSans.variable} ${geistMono.variable}`}>
-      <body className="flex min-h-screen flex-col antialiased">
+      <body className="antialiased">
         <a
           href="#konten"
           className="sr-only rounded-md border border-line bg-surface px-3 py-2 text-sm focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50"
@@ -49,10 +49,19 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           Lewati ke konten
         </a>
         <Providers>
-          <Nav />
-          <main id="konten" className="mx-auto w-full max-w-[96rem] flex-1 px-4 py-6 sm:px-6">
-            {children}
-          </main>
+          {/* Stacked below `lg`, where `Nav` renders a bar and a drawer; a rail
+              beside the content above it. `min-w-0` on the content column stops
+              a wide product table from stretching the row and pushing the rail
+              off-screen. */}
+          <div className="flex min-h-screen flex-col lg:flex-row">
+            <Nav />
+            <main
+              id="konten"
+              className="mx-auto w-full max-w-[96rem] min-w-0 flex-1 px-4 py-6 sm:px-6"
+            >
+              {children}
+            </main>
+          </div>
         </Providers>
       </body>
     </html>

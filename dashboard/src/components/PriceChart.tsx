@@ -220,7 +220,12 @@ export function PriceChart({ points }: PriceChartProps) {
           resolves to zero — a blank box that reads as a rendering bug. */}
       <ChartFrame height={260}>
         {(box) => (
-          <LineChart data={data} margin={{ top: 8, right: 16, bottom: 4, left: 4 }}>
+          <LineChart
+            width={box.width}
+            height={box.height}
+            data={data}
+            margin={{ top: 8, right: 16, bottom: 4, left: 4 }}
+          >
             <CartesianGrid stroke="var(--line)" strokeDasharray="3 3" vertical={false} />
             <XAxis
               type="number"

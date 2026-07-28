@@ -38,12 +38,39 @@ export function imageUrl(url: string | null | undefined, size: ImageSize = 'thum
  *
  * Kept here rather than only in next.config.ts so the list has one home; the
  * config imports it.
+ *
+ * `**.` matches any subdomain, the same syntax `remotePatterns.hostname` takes.
+ * Both marketplaces shard their CDN across numbered hostnames that no one
+ * enumerated up front — `p16-images-sign-sg`, `p19-images-sign-sg`, and however
+ * many exist that this database has not seen — so those two families are matched
+ * by pattern. Enumerating them is how the list fell behind the data: a host
+ * missing here does not degrade, it throws.
  */
 export const IMAGE_HOSTS = [
-  'down-id.img.susercontent.com',
   'cf.shopee.co.id',
-  'down-ws-id.img.susercontent.com',
-  'images.tokopedia.net',
-  'ecs7.tokopedia.net',
-  'ecs7-p.tokopedia.net',
+  '**.img.susercontent.com',
+  '**.tokopedia.net',
+  '**.tokopedia-static.net',
 ] as const;
+
+/**
+ * Whether `next/image` will accept this URL.
+ *
+ * `next/image` does not fail softly on a host outside `remotePatterns`: it
+ * throws during render, which takes the whole route down rather than the one
+ * thumbnail. Callers check first and fall back to their own placeholder, so an
+ * unrecognised CDN costs a picture instead of a page.
+ */
+export function isAllowedImageHost(url: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  return IMAGE_HOSTS.some((pattern) =>
+    // `**.example.com` allows subdomains of example.com but not the bare domain,
+    // which is how Next reads the same pattern.
+    pattern.startsWith('**.') ? hostname.endsWith(pattern.slice(2)) : hostname === pattern,
+  );
+}

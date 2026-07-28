@@ -103,8 +103,17 @@ export type ComparisonDatum = {
 type BarDatum = {
   key: string;
   avg: number;
-  /** `ErrorBar` reads offsets relative to the bar value: [avg − min, max − avg]. */
-  spread: [number, number];
+  /**
+   * `ErrorBar` reads offsets relative to the bar value: [avg − min, max − avg].
+   *
+   * `undefined` for a shop with no internal range. Recharts skips a datum whose
+   * error value is falsy, which is the only way to leave one whisker out of an
+   * otherwise-drawn `ErrorBar` — and leaving it out is what we want twice over.
+   * A whisker of length zero implies a measurement that was never taken; it also
+   * puts both caps of the `|--|` at the same x, and Recharts keys those `<line>`
+   * elements by their own coordinates, so the two collide into one React key.
+   */
+  spread: [number, number] | undefined;
   source: ComparisonDatum;
 };
 
@@ -139,11 +148,13 @@ export function ComparisonChart({ rows }: { rows: ComparisonDatum[] }) {
 
     const min = toNumber(row.minPrice) ?? avg;
     const max = toNumber(row.maxPrice) ?? avg;
+    const below = Math.max(avg - min, 0);
+    const above = Math.max(max - avg, 0);
 
     data.push({
       key: seen === 0 ? row.label : `${row.label} (${row.storeId ?? seen + 1})`,
       avg,
-      spread: [Math.max(avg - min, 0), Math.max(max - avg, 0)],
+      spread: below === 0 && above === 0 ? undefined : [below, above],
       source: row,
     });
   }
@@ -157,9 +168,10 @@ export function ComparisonChart({ rows }: { rows: ComparisonDatum[] }) {
     );
   }
 
-  // A shop with one product has no internal range, and whiskers of length zero
-  // would imply a measurement that was never taken.
-  const hasSpread = data.some((datum) => datum.spread[0] > 0 || datum.spread[1] > 0);
+  // Whether to mount `ErrorBar` at all. Individual shops without a range are
+  // already skipped by their `undefined` spread; this only decides whether the
+  // caption should mention whiskers that nothing would draw.
+  const hasSpread = data.some((datum) => datum.spread !== undefined);
   // Cheapest and dearest only mean something once there is something to be
   // cheaper than.
   const ranked = data.length > 1;

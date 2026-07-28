@@ -20,8 +20,15 @@ import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
  * and passes every type check.
  *
  * Children receive the measured box and must pass it straight to the chart.
- * Nothing renders until a real width is known, which also avoids the flash of a
- * zero-width chart snapping to size on the first frame.
+ *
+ * The chart is also deliberately absent from the server-rendered HTML. Recharts
+ * decides which axis ticks fit by measuring the rendered text, and its
+ * measurement helper returns a hard-coded `{width: 0, height: 0}` whenever there
+ * is no DOM (`Global.isSsr`). Server and client therefore compute *different*
+ * ticks from identical props — different labels, at different positions — which
+ * React reports as a hydration mismatch and "repairs" by discarding the whole
+ * chart and rendering it again on the client. Rendering it only after mount
+ * makes the first client render the only render.
  */
 export function ChartFrame({
   height,
@@ -34,7 +41,14 @@ export function ChartFrame({
   children: (box: { width: number; height: number }) => ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  const [measured, setMeasured] = useState(0);
+  // `null` means "has not mounted yet" and is the only thing gating the chart.
+  //
+  // Gating on a *measurement* instead looks tidier and is a trap: any
+  // environment where the observer does not fire or `clientWidth` reads 0 leaves
+  // the chart permanently blank, with no error and nothing to debug — which is
+  // exactly what happened here. So a zero measurement still falls back to a
+  // plausible width, degrading to "slightly wrong" instead of "invisible".
+  const [width, setWidth] = useState<number | null>(null);
 
   useLayoutEffect(() => {
     const element = ref.current;
@@ -42,7 +56,7 @@ export function ChartFrame({
 
     // Measure synchronously before paint, so the chart appears in the same
     // frame as the layout rather than one frame later.
-    const measure = () => setMeasured(element.clientWidth);
+    const measure = () => setWidth(element.clientWidth || FALLBACK_WIDTH);
     measure();
 
     const observer = new ResizeObserver(measure);
@@ -50,19 +64,12 @@ export function ChartFrame({
     return () => observer.disconnect();
   }, []);
 
-  // Render at a fallback width rather than waiting for a measurement.
-  //
-  // Gating on `measured > 0` looks tidier and is a trap: any environment where
-  // the observer does not fire or `clientWidth` reads 0 leaves the chart
-  // permanently blank, with no error and nothing to debug — which is exactly
-  // what happened here. Drawing at a plausible width and correcting on measure
-  // degrades to "slightly wrong for one frame" instead of "invisible forever",
-  // and it also means the chart is in the server-rendered HTML.
-  const width = measured > 0 ? measured : FALLBACK_WIDTH;
-
+  // The box keeps its height on the server and on the first client render, so
+  // the chart lands in space already reserved for it rather than shoving the
+  // rest of the card down when it appears.
   return (
     <div ref={ref} style={{ height, width: '100%' }} className={className}>
-      {children({ width, height })}
+      {width === null ? null : children({ width, height })}
     </div>
   );
 }
