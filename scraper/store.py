@@ -23,7 +23,10 @@ Upsert semantics:
 
 from __future__ import annotations
 
-from datetime import datetime
+import logging
+
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -45,6 +48,7 @@ __all__ = [
     "upsert_store",
     "upsert_product",
     "insert_snapshot",
+    "insert_snapshot_if_changed",
     "start_run",
     "finish_run",
     "get_stats",
@@ -57,6 +61,8 @@ __all__ = [
 #: Upper bound on the text stored in ``scrape_runs.error``. A traceback repr from a
 #: parse failure can run to megabytes; the audit log only needs the head of it.
 MAX_ERROR_CHARS = 4000
+
+log = logging.getLogger(__name__)
 
 
 def _stamp(now: datetime | None) -> datetime:
@@ -244,6 +250,115 @@ def insert_snapshot(
         .returning(PriceSnapshotRow.id)
     )
     return session.execute(stmt).scalar_one()
+
+
+#: Fields that decide whether an observation says anything new.
+#:
+#: ``stock`` is deliberately excluded. It moves on almost every scrape of a
+#: busy listing, so including it would defeat deduplication entirely while
+#: telling a price-comparison dashboard nothing it asked about.
+_SNAPSHOT_SIGNIFICANT_FIELDS = (
+    "price",
+    "price_min",
+    "price_max",
+    "sold",
+    "historical_sold",
+    "rating_star",
+    "rating_count",
+)
+
+
+def insert_snapshot_if_changed(
+    session: Session,
+    snapshot: PriceSnapshot,
+    product_ref: int,
+    *,
+    now: datetime | None = None,
+    window_hours: float | None = 24.0,
+) -> int | None:
+    """Append an observation, unless it repeats the previous one verbatim.
+
+    The snapshots table is a time series and must stay append-only, but scraping
+    the same page twice in a row produces two byte-identical rows that carry no
+    information — they are not price history, they are noise, and they distort
+    any "how often did this change" reading of the data.
+
+    So an observation is skipped when every significant field matches the
+    product's most recent snapshot *and* that snapshot is recent enough. Past
+    ``window_hours``, an unchanged observation is written anyway, because
+    "the price was still 55.000 a week later" is a real, useful fact that a
+    gap in the series cannot express.
+
+    Args:
+        session: Open session. Not committed by this function.
+        snapshot: Observation to consider.
+        product_ref: ``products.id`` from :func:`upsert_product`.
+        now: Observation timestamp; wins over ``snapshot.scraped_at``.
+        window_hours: How long an unchanged observation stays redundant. None
+            disables the check entirely, restoring plain append behaviour.
+
+    Returns:
+        The new ``price_snapshots.id``, or None when the observation was
+        skipped as unchanged.
+    """
+    if window_hours is None:
+        return insert_snapshot(session, snapshot, product_ref, now=now)
+
+    scraped_at = now or snapshot.scraped_at or utcnow()
+
+    latest = session.execute(
+        select(PriceSnapshotRow)
+        .where(PriceSnapshotRow.product_ref == product_ref)
+        .order_by(PriceSnapshotRow.scraped_at.desc(), PriceSnapshotRow.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+    if latest is not None and _snapshot_matches(latest, snapshot):
+        previous_at = latest.scraped_at
+        if previous_at is not None:
+            # Rows written before timezone handling settled can be naive; treat
+            # those as UTC rather than raising on the subtraction.
+            if previous_at.tzinfo is None:
+                previous_at = previous_at.replace(tzinfo=timezone.utc)
+            # abs(): the previous row can legitimately carry a *later* timestamp
+            # than this observation — a backfilled capturedAt, an out-of-order
+            # replay, a clock skew. An identical observation within the window is
+            # redundant whichever side of it the neighbour sits on, and requiring
+            # a forward-only delta silently disabled deduplication for exactly
+            # those cases.
+            age_hours = abs((scraped_at - previous_at).total_seconds()) / 3600.0
+            if age_hours < window_hours:
+                log.debug(
+                    "skipping unchanged snapshot for product_ref=%s (%.1fh since the last one)",
+                    product_ref,
+                    age_hours,
+                )
+                return None
+
+    return insert_snapshot(session, snapshot, product_ref, now=now)
+
+
+def _snapshot_matches(row: PriceSnapshotRow, snapshot: PriceSnapshot) -> bool:
+    """Whether a stored row carries the same significant values as an observation.
+
+    Numeric comparison goes through Decimal so that a stored ``55000.00`` and an
+    observed ``55000`` count as equal — otherwise every scrape would look like a
+    change and nothing would ever be deduplicated.
+    """
+    for field_name in _SNAPSHOT_SIGNIFICANT_FIELDS:
+        stored = getattr(row, field_name, None)
+        observed = getattr(snapshot, field_name, None)
+        if stored is None and observed is None:
+            continue
+        if stored is None or observed is None:
+            return False
+        try:
+            if Decimal(str(stored)) != Decimal(str(observed)):
+                return False
+        except (InvalidOperation, ValueError):
+            if str(stored) != str(observed):
+                return False
+    return True
 
 
 def start_run(

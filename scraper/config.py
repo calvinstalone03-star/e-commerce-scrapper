@@ -117,6 +117,15 @@ class Settings(BaseSettings):
         description="Region key selecting the affiliate GraphQL endpoint "
         "(id, vn, br, th, my, ph, sg, tw).",
     )
+    snapshot_dedupe_hours: float = Field(
+        default=24.0,
+        ge=0.0,
+        description="Skip a price snapshot that repeats the previous one verbatim "
+        "when the previous one is younger than this. Scraping the same page twice "
+        "otherwise writes two identical rows, which are noise rather than history. "
+        "Past this age an unchanged observation is written anyway, because "
+        "'still this price a week later' is a real fact. Set 0 to always insert.",
+    )
     headless: bool = Field(
         default=True,
         description="Run the Playwright bootstrap browser headless. Set false to debug "

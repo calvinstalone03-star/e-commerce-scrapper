@@ -37,7 +37,7 @@ from scraper.adapters.shopee import _extract_items, parse_item
 from scraper.config import Settings, get_settings
 from scraper.db import session_scope
 from scraper.models import Marketplace, PriceSnapshot, Product, Store, parse_sold
-from scraper.store import insert_snapshot, upsert_product, upsert_store
+from scraper.store import insert_snapshot_if_changed, upsert_product, upsert_store
 
 __all__ = [
     "CAPTURED_PATHS",
@@ -87,6 +87,9 @@ class IngestResult:
         seen: Raw item entries found in the payload.
         stored: Snapshots actually written.
         skipped: Entries that could not be parsed into a usable item.
+        unchanged: Entries whose values repeated the previous snapshot, so no
+            new row was written. Not an error — the product row's last_seen
+            still advanced.
         shops: Distinct shop ids touched.
         reason: Why nothing was stored, when nothing was.
     """
@@ -95,6 +98,7 @@ class IngestResult:
     seen: int = 0
     stored: int = 0
     skipped: int = 0
+    unchanged: int = 0
     shops: set[int] = field(default_factory=set)
     reason: str | None = None
 
@@ -105,6 +109,7 @@ class IngestResult:
             "seen": self.seen,
             "stored": self.stored,
             "skipped": self.skipped,
+            "unchanged": self.unchanged,
             "shops": sorted(self.shops),
             "reason": self.reason,
         }
@@ -257,6 +262,9 @@ class IngestService:
     def __init__(self, settings: Settings | None = None, database_url: str | None = None) -> None:
         self.settings = settings or get_settings()
         self.database_url = database_url or self.settings.database_url
+        window = getattr(self.settings, "snapshot_dedupe_hours", 24.0)
+        #: None disables deduplication entirely; 0 in config means the same.
+        self._dedupe_window = window if window and window > 0 else None
 
     def ingest(self, url: str, payload: Any, captured_at: datetime | None = None) -> IngestResult:
         """Store every listing found in one captured payload.
@@ -313,8 +321,17 @@ class IngestService:
                         shop_ref = store_refs[shop_id]
 
                     product_ref = upsert_product(session, item.product, shop_ref, now=stamp)
-                    insert_snapshot(session, item.snapshot, product_ref, now=stamp)
-                    result.stored += 1
+                    written = insert_snapshot_if_changed(
+                        session,
+                        item.snapshot,
+                        product_ref,
+                        now=stamp,
+                        window_hours=self._dedupe_window,
+                    )
+                    if written is None:
+                        result.unchanged += 1
+                    else:
+                        result.stored += 1
                 except Exception as exc:  # noqa: BLE001
                     log.warning("failed to persist item %s: %s", item.product.item_id, exc)
                     result.skipped += 1
@@ -389,8 +406,14 @@ class IngestService:
                     product_ref = upsert_product(
                         session, product, store_refs[store.shop_id], now=stamp
                     )
-                    insert_snapshot(session, snapshot, product_ref, now=stamp)
-                    result.stored += 1
+                    written = insert_snapshot_if_changed(
+                        session, snapshot, product_ref, now=stamp,
+                        window_hours=self._dedupe_window,
+                    )
+                    if written is None:
+                        result.unchanged += 1
+                    else:
+                        result.stored += 1
                 except Exception as exc:  # noqa: BLE001
                     log.warning("failed to persist DOM item %s: %s", entry.get("itemId"), exc)
                     result.skipped += 1

@@ -1008,3 +1008,215 @@ def test_recent_price_changes_survives_an_unresolved_shop(session):
     assert len(rows) == 1
     assert rows[0]["username"] is None, "outer join keeps the row despite a null shop_ref"
     assert rows[0]["price"] == Decimal("90000")
+
+
+# ----------------------------------------------------------------------
+# Snapshot deduplication
+# ----------------------------------------------------------------------
+
+
+class TestInsertSnapshotIfChanged:
+    """Scraping the same page twice must not write two identical rows.
+
+    The table stays append-only — that is what makes it a time series — but a
+    row that repeats its predecessor verbatim is noise, not history, and it
+    distorts any "how often did this change" reading of the data.
+    """
+
+    def _product(self, session) -> int:
+        from scraper.store import upsert_product, upsert_store
+
+        shop_ref = upsert_store(
+            session, Store(marketplace=Marketplace.SHOPEE, shop_id=901, username="dedupeshop")
+        )
+        return upsert_product(
+            session,
+            Product(
+                marketplace=Marketplace.SHOPEE, item_id=9001, shop_id=901, name="Dedupe target"
+            ),
+            shop_ref,
+        )
+
+    def _snapshot(self, **overrides) -> PriceSnapshot:
+        values = {
+            "item_id": 9001,
+            "price": Decimal("55000"),
+            "sold": 233,
+            "rating_star": Decimal("4.82"),
+        }
+        values.update(overrides)
+        return PriceSnapshot(**values)
+
+    def test_identical_observation_is_skipped(self, session) -> None:
+        from scraper.store import insert_snapshot_if_changed
+
+        product_ref = self._product(session)
+        base = datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc)
+
+        first = insert_snapshot_if_changed(session, self._snapshot(), product_ref, now=base)
+        second = insert_snapshot_if_changed(
+            session, self._snapshot(), product_ref, now=base + timedelta(minutes=5)
+        )
+
+        assert first is not None
+        assert second is None, "a verbatim repeat inside the window must not be written"
+        assert self._count(session, product_ref) == 1
+
+    def test_a_price_change_is_always_written(self, session) -> None:
+        from scraper.store import insert_snapshot_if_changed
+
+        product_ref = self._product(session)
+        base = datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc)
+
+        insert_snapshot_if_changed(session, self._snapshot(), product_ref, now=base)
+        changed = insert_snapshot_if_changed(
+            session,
+            self._snapshot(price=Decimal("49000")),
+            product_ref,
+            now=base + timedelta(minutes=1),
+        )
+
+        assert changed is not None
+        assert self._count(session, product_ref) == 2
+
+    def test_a_sold_count_change_alone_is_written(self, session) -> None:
+        """Units sold moving is the velocity signal; it must never be swallowed."""
+        from scraper.store import insert_snapshot_if_changed
+
+        product_ref = self._product(session)
+        base = datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc)
+
+        insert_snapshot_if_changed(session, self._snapshot(), product_ref, now=base)
+        changed = insert_snapshot_if_changed(
+            session, self._snapshot(sold=240), product_ref, now=base + timedelta(minutes=1)
+        )
+
+        assert changed is not None
+
+    def test_unchanged_is_written_again_past_the_window(self, session) -> None:
+        """'Still 55.000 a week later' is a real fact a gap cannot express."""
+        from scraper.store import insert_snapshot_if_changed
+
+        product_ref = self._product(session)
+        base = datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc)
+
+        insert_snapshot_if_changed(session, self._snapshot(), product_ref, now=base)
+        later = insert_snapshot_if_changed(
+            session, self._snapshot(), product_ref, now=base + timedelta(hours=25)
+        )
+
+        assert later is not None
+        assert self._count(session, product_ref) == 2
+
+    def test_numeric_forms_that_differ_only_in_scale_count_as_equal(self, session) -> None:
+        """A stored 55000.00 and an observed 55000 are the same observation.
+
+        Comparing as text instead would make every scrape look like a change and
+        nothing would ever deduplicate.
+        """
+        from scraper.store import insert_snapshot_if_changed
+
+        product_ref = self._product(session)
+        base = datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc)
+
+        insert_snapshot_if_changed(
+            session, self._snapshot(price=Decimal("55000.00")), product_ref, now=base
+        )
+        repeat = insert_snapshot_if_changed(
+            session,
+            self._snapshot(price=Decimal("55000")),
+            product_ref,
+            now=base + timedelta(minutes=1),
+        )
+
+        assert repeat is None
+
+    def test_window_none_restores_plain_append(self, session) -> None:
+        from scraper.store import insert_snapshot_if_changed
+
+        product_ref = self._product(session)
+        base = datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc)
+
+        insert_snapshot_if_changed(
+            session, self._snapshot(), product_ref, now=base, window_hours=None
+        )
+        second = insert_snapshot_if_changed(
+            session,
+            self._snapshot(),
+            product_ref,
+            now=base + timedelta(minutes=1),
+            window_hours=None,
+        )
+
+        assert second is not None
+        assert self._count(session, product_ref) == 2
+
+    def test_two_different_products_do_not_deduplicate_against_each_other(
+        self, session
+    ) -> None:
+        from scraper.store import insert_snapshot_if_changed, upsert_product, upsert_store
+
+        first_ref = self._product(session)
+        shop_ref = upsert_store(
+            session, Store(marketplace=Marketplace.SHOPEE, shop_id=902, username="other")
+        )
+        second_ref = upsert_product(
+            session,
+            Product(marketplace=Marketplace.SHOPEE, item_id=9002, shop_id=902, name="Other"),
+            shop_ref,
+        )
+        base = datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc)
+
+        a = insert_snapshot_if_changed(session, self._snapshot(), first_ref, now=base)
+        b = insert_snapshot_if_changed(
+            session, self._snapshot(item_id=9002), second_ref, now=base
+        )
+
+        assert a is not None and b is not None
+
+    @staticmethod
+    def _count(session, product_ref: int) -> int:
+        from sqlalchemy import func, select
+
+        from scraper.db import PriceSnapshotRow
+
+        return session.execute(
+            select(func.count())
+            .select_from(PriceSnapshotRow)
+            .where(PriceSnapshotRow.product_ref == product_ref)
+        ).scalar_one()
+
+    def test_a_previous_row_dated_later_still_deduplicates(self, session) -> None:
+        """The neighbour can carry a later timestamp than the observation.
+
+        A backfilled capturedAt, an out-of-order replay or clock skew all produce
+        that, and a forward-only age check silently disabled deduplication for
+        exactly those cases — observed live, where a row stamped an hour in the
+        future let three identical payloads through.
+        """
+        from scraper.store import insert_snapshot_if_changed
+
+        product_ref = self._product(session)
+        base = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+
+        insert_snapshot_if_changed(session, self._snapshot(), product_ref, now=base)
+        earlier = insert_snapshot_if_changed(
+            session, self._snapshot(), product_ref, now=base - timedelta(hours=1)
+        )
+
+        assert earlier is None
+        assert self._count(session, product_ref) == 1
+
+    def test_a_far_earlier_observation_is_still_written(self, session) -> None:
+        """Symmetry must not swallow a genuinely distant backfill."""
+        from scraper.store import insert_snapshot_if_changed
+
+        product_ref = self._product(session)
+        base = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+
+        insert_snapshot_if_changed(session, self._snapshot(), product_ref, now=base)
+        older = insert_snapshot_if_changed(
+            session, self._snapshot(), product_ref, now=base - timedelta(hours=48)
+        )
+
+        assert older is not None
