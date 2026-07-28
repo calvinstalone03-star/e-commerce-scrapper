@@ -182,16 +182,60 @@ ecom-scraper serve          # prints the ingest token
 Chrome → `chrome://extensions` → **Developer mode** → **Load unpacked** →
 `extension/`. Open the popup, click the gear, paste the token, Save.
 
-Then either open a search or shop page and press **Scrape halaman ini**, or type
-a keyword and press Enter to navigate and scrape in one go. One click, one page —
-there is no background crawl loop, which would just be the scraper wearing a
-costume and would deserve the block it got.
+Then type a keyword, set **jumlah produk**, and press **Mulai scrape**. The
+extension opens the search, waits for the grid to actually render, scrolls it so
+the lazily-rendered rows exist, files what it read, and moves to the next result
+page — repeating until it has the number of products you asked for, the results
+run out, or you press **Batal**. Leave the keyword empty to scrape only what the
+tab is currently showing (that is the mode a shop page gets, since a shop page
+has no search term to paginate); if the tab is already on a search, its keyword
+is pre-filled.
+
+Counting is by distinct product, so the repeats both sites sprinkle between
+pages do not inflate the total, and the last page is trimmed rather than
+overshot: asking for 100 files 100.
+
+Fill in **toko** as well and the run walks that shop's own product grid instead
+of the site's search results, on either marketplace. The box takes a username, a
+pasted storefront URL, or the shop's display name — a display name is only a
+guess at a slug, so each site's plausible spellings are tried in order and
+whichever storefront answers with products is the one used. A keyword alongside
+a shop becomes a filter on the product name: every word has to appear, and the
+filter runs here rather than being left to the site's in-shop search, so it
+holds whether or not that front end honours the parameter. The result line says
+how many were dropped, because "3 produk" without "412 tidak cocok" reads as a
+broken scrape. A shop grid's URL carries no search term, so shop mode states the
+keyword outright and `product_keywords` is recorded the same as for a search.
+
+| toko | kata kunci | what runs |
+|---|---|---|
+| — | `lego` | site search for "lego", paginated |
+| `tokomainanku` | — | that shop's whole grid |
+| `tokomainanku` | `lego` | that shop's grid, kept where the name matches |
+| — | — | just the page the tab is showing |
+
+Two things the page decides for you. A product name is read from the image's
+`alt` only when that alt is a name: Tokopedia labels every listing image
+`alt="product-image"`, so names there come from the card's own text instead.
+And a seller is recorded only where the page states one — Tokopedia's URL
+carries the shop slug, but a Shopee **search** card carries price, sold, rating
+and a city and no seller at all, which is why Shopee stores collected from
+search read `shop-<id>` with no name. To put real names on them, scrape the
+shop's own page (`shopee.co.id/<username>`): there the URL is the username and
+the title is the display name, and both are attached to every card on the page
+that keys on that shop. Names fill in on re-scrape, so an existing row is
+corrected rather than duplicated.
+
+The job lives in the service worker, not the popup — closing the popup does not
+stop it, and re-opening re-attaches to the run in progress. It is still
+user-triggered: nothing runs on a timer, and the only requests made to the
+marketplace are the page loads a person clicking through results would make.
 
 | File | Job |
 |---|---|
-| `extension/sites.js` | Per-marketplace config. Adding a third site is one entry plus a manifest match. |
-| `extension/dom-scraper.js` | Generic extractor: find product links, walk out to the card, read the text. |
-| `extension/background.js` | Injects the scraper on demand, POSTs the result. No queue — scraping is synchronous. |
+| `extension/sites.js` | Per-marketplace config: hosts, product-link shape, and how the site numbers result pages (Shopee from 0, Tokopedia from 1). |
+| `extension/dom-scraper.js` | Generic extractor: wait for the first card, scroll the grid, find product links, walk out to the card, read the text. |
+| `extension/background.js` | Owns the job — navigate, scrape, POST, next page — and streams progress to the popup. |
 | `scraper/ingest.py` | Turns cards into rows, reusing `models.parse_sold` rather than a second copy in JS. |
 
 The one genuinely site-specific piece is how a product link identifies itself:

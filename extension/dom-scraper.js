@@ -10,7 +10,9 @@
 // Everything marketplace-specific lives in sites.js. This file is generic: find
 // product links, walk out to the enclosing card, read the text.
 //
-// It runs only when asked. It fetches nothing.
+// It runs only when asked. It fetches nothing of its own — the only thing it
+// makes the page do is scroll, which is what a reader does anyway and is the
+// only way a lazily-rendered grid ever puts its lower half in the DOM.
 
 (() => {
   'use strict';
@@ -32,6 +34,8 @@
   // Far enough up to clear the image and title wrappers, not so far that the
   // whole results grid counts as one card.
   const MAX_CARD_DEPTH = 8;
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   function site() {
     return globalThis.ecomSiteForHost
@@ -59,22 +63,48 @@
     return node;
   }
 
+  // Alt text that names the element's role instead of the product. Tokopedia
+  // ships every listing image as alt="product-image", which walked straight
+  // through the old "an alt longer than 8 characters is the name" rule and
+  // became the stored product name for 10 of 12 Tokopedia rows. Shopee's alt
+  // really is the title, so the rule stays — it just has to be able to tell the
+  // two apart.
+  const GENERIC_LABEL =
+    /^(product[-_ ]?image|product|produk|image|img|photo|foto|gambar|thumbnail|thumb|logo|banner|icon|avatar|shop|toko|store|iklan|ad|ads|sponsored)s?$/i;
+
+  function usableTitle(text) {
+    const value = String(text || '').trim();
+    if (value.length <= 8) return null;
+    if (GENERIC_LABEL.test(value)) return null;
+    // A listing title is a phrase a seller typed. A single short token with no
+    // whitespace is a slug or a role name — "product-image", "thumb_large" —
+    // never a product.
+    if (!/\s/.test(value) && value.length < 25) return null;
+    return value;
+  }
+
   function extractName(card, anchor) {
     // An image alt or a title attribute is the product name verbatim, without
-    // the badge and promo noise the card's flattened text carries.
+    // the badge and promo noise the card's flattened text carries — when the
+    // site actually puts it there.
     const image = card.querySelector('img[alt]');
-    const alt = image && image.getAttribute('alt');
-    if (alt && alt.trim().length > 8) return alt.trim();
+    const alt = usableTitle(image && image.getAttribute('alt'));
+    if (alt) return alt;
 
-    const titled = anchor.getAttribute('title') || card.getAttribute('title');
-    if (titled && titled.trim().length > 8) return titled.trim();
+    const titled =
+      usableTitle(anchor.getAttribute('title')) || usableTitle(card.getAttribute('title'));
+    if (titled) return titled;
 
     const lines = (card.innerText || '')
       .split('\n')
       .map((line) => line.trim())
       .filter(
         (line) =>
-          line.length > 8 && !PRICE.test(line) && !SOLD.test(line) && !RATING.test(line),
+          line.length > 8 &&
+          !PRICE.test(line) &&
+          !SOLD.test(line) &&
+          !RATING.test(line) &&
+          !GENERIC_LABEL.test(line),
       );
     lines.sort((a, b) => b.length - a.length);
     return lines[0] || null;
@@ -140,12 +170,61 @@
     return null;
   }
 
-  function scrape() {
-    const config = site();
-    if (!config) {
-      return { ok: false, error: `${window.location.hostname} is not a supported marketplace` };
+  // A Shopee search card carries price, sold, rating and a city — and no seller
+  // anywhere in it. That is why every Shopee store row so far is `shop-<id>`
+  // with no name: the name was never on the page being read, so no extractor
+  // could have found it. Where Shopee *does* state the shop is its storefront
+  // page, and there the URL is the username and the title is the display name.
+  //
+  // Read from the document rather than from a card: class names are hashed and
+  // rotate, `og:title` and `<title>` do not.
+  function pageShopName() {
+    const meta = document.querySelector('meta[property="og:title"], meta[name="og:title"]');
+    const candidates = [meta && meta.getAttribute('content'), document.title];
+
+    for (const candidate of candidates) {
+      const raw = String(candidate || '').trim();
+      if (!raw) continue;
+      // "Toko Saya | Shopee Indonesia", "Toko Saya - Tokopedia".
+      const head = raw.split(/\s[|\-–—]\s/)[0].trim();
+      if (head.length < 2 || head.length > 60) continue;
+      if (/^(shopee|tokopedia)\b/i.test(head)) continue;
+      if (GENERIC_LABEL.test(head)) continue;
+      return head;
+    }
+    return null;
+  }
+
+  function shopIdentity(config, items) {
+    const page = config.shopPage ? config.shopPage(new URL(window.location.href)) : null;
+    if (!page) return null;
+
+    let shopKey = page.shopKey;
+    if (!shopKey) {
+      // Shopee's storefront URL is the username, while its cards key on the
+      // numeric shop id, so the two have to be joined through the grid itself.
+      // A storefront also renders other shops' recommendations, so only a key
+      // that dominates the page is the page's own shop.
+      const counts = new Map();
+      for (const item of items) counts.set(item.shopKey, (counts.get(item.shopKey) || 0) + 1);
+      let best = null;
+      let bestCount = 0;
+      for (const [key, count] of counts) {
+        if (count > bestCount) {
+          best = key;
+          bestCount = count;
+        }
+      }
+      if (!best || bestCount < Math.max(2, items.length * 0.6)) return null;
+      shopKey = best;
     }
 
+    const name = pageShopName();
+    if (!name && !page.username) return null;
+    return { shopKey: String(shopKey), username: page.username, name };
+  }
+
+  function collect(config) {
     const seen = new Set();
     const items = [];
     const anchors = document.querySelectorAll('a[href]');
@@ -188,24 +267,121 @@
       });
     }
 
+    return { items, anchorsSeen: anchors.length };
+  }
+
+  //: How long to keep waiting for the first card to render. Shopee's search
+  //: grid routinely takes several seconds on a cold cache, and the old fixed
+  //: delay in the service worker was the single biggest source of "no product
+  //: cards found" on a page that was merely still loading.
+  const FIRST_CARD_TIMEOUT_MS = 20_000;
+
+  //: A grid renders its lower rows only once they are near the viewport, so a
+  //: scrape without scrolling captures roughly the top third of a page.
+  const SCROLL_STEPS = 40;
+  const SCROLL_PAUSE_MS = 350;
+  //: Stop scrolling once this many consecutive steps add no new cards — the end
+  //: of the grid, rather than a slow one.
+  const SCROLL_IDLE_STEPS = 4;
+
+  async function waitForFirstCard(config, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const { items } = collect(config);
+      if (items.length) return items.length;
+      await sleep(400);
+    }
+    return 0;
+  }
+
+  async function scrollThroughGrid(config, budgetMs) {
+    // Scroll a viewport at a time rather than jumping to the bottom: lazy grids
+    // render what passes through the viewport, and a single jump skips most of
+    // it. Counting cards (not scrollHeight) is what decides when to stop, since
+    // footers and skeleton placeholders grow the page without adding listings.
+    const deadline = Date.now() + budgetMs;
+    let best = collect(config).items.length;
+    let idle = 0;
+
+    for (let step = 0; step < SCROLL_STEPS; step += 1) {
+      if (Date.now() > deadline) break;
+      window.scrollBy(0, Math.round(window.innerHeight * 0.9));
+      await sleep(SCROLL_PAUSE_MS);
+
+      const count = collect(config).items.length;
+      if (count > best) {
+        best = count;
+        idle = 0;
+      } else {
+        idle += 1;
+        if (idle >= SCROLL_IDLE_STEPS) break;
+      }
+
+      const atBottom =
+        window.innerHeight + window.scrollY >= document.body.scrollHeight - 200;
+      if (atBottom && idle >= 1) break;
+    }
+
+    window.scrollTo(0, 0);
+    await sleep(200);
+    return best;
+  }
+
+  async function scrape(options = {}) {
+    const config = site();
+    if (!config) {
+      return { ok: false, error: `${window.location.hostname} is not a supported marketplace` };
+    }
+
+    const waitMs = options.waitMs ?? FIRST_CARD_TIMEOUT_MS;
+    const found = await waitForFirstCard(config, waitMs);
+
+    // Nothing at all after the full wait: either the page is not a listing page
+    // or the grid never rendered. Either way, scrolling an empty page is a waste
+    // of the caller's time — report and let it decide.
+    if (found && options.autoScroll !== false) {
+      await scrollThroughGrid(config, options.scrollBudgetMs ?? 25_000);
+    }
+
+    const { items, anchorsSeen } = collect(config);
+
+    // On a storefront every card in the main grid belongs to that shop, so the
+    // name and username the page states apply to them — and only to them, which
+    // is what the key check is for.
+    const shop = shopIdentity(config, items);
+    if (shop) {
+      for (const item of items) {
+        if (item.shopKey !== shop.shopKey) continue;
+        if (shop.name) item.shopName = shop.name;
+        if (shop.username) item.shopUsername = shop.username;
+      }
+    }
+
     return {
       ok: true,
       marketplace: config.marketplace,
       items,
+      shop,
       pageUrl: window.location.href,
       scrapedAt: new Date().toISOString(),
       // Lets "0 items" be told apart from "the page had no links yet".
-      anchorsSeen: anchors.length,
+      anchorsSeen,
     };
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.type !== 'scrapeDom') return false;
-    try {
-      sendResponse(scrape());
-    } catch (err) {
-      sendResponse({ ok: false, error: String(err) });
+    // A ping is how the service worker learns this world is live before it
+    // starts a scrape. Cheaper and far more reliable than guessing with a timer.
+    if (message?.type === 'ping') {
+      sendResponse({ ok: true, url: window.location.href, ready: document.readyState });
+      return true;
     }
-    return true;
+
+    if (message?.type !== 'scrapeDom') return false;
+
+    scrape(message.options || {})
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true; // response arrives after the awaits above
   });
 })();

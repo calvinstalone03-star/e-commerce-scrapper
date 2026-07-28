@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ecom-scraper collector",
-  "version": "0.3.0",
-  "description": "Reads Shopee and Tokopedia listings off pages you have open and files them into your local ecom-scraper database.",
+  "version": "0.4.0",
+  "description": "Reads Shopee and Tokopedia listings off pages you have open — one page or a keyword walked across as many result pages as you ask for — and files them into your local ecom-scraper database.",
   "permissions": [
     "storage",
     "tabs",

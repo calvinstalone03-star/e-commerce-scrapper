@@ -54,6 +54,7 @@ __all__ = [
     "is_captured",
     "resolve_token",
     "keyword_from_url",
+    "resolve_keyword",
     "stable_id",
 ]
 
@@ -264,6 +265,25 @@ def keyword_from_url(page_url: str) -> str:
     return ""
 
 
+def resolve_keyword(stated: str | None, page_url: str) -> str:
+    """Decide which search term a batch of DOM items was collected under.
+
+    Two sources, in order. A shop-mode run walks a shop's own product grid and
+    filters it on a term the URL never carries, so it states the term outright.
+    Everything else — a search page from the popup, or one the user navigated to
+    by hand — carries it in the address, which stays the fallback so nothing has
+    to be stated for the ordinary case.
+
+    Args:
+        stated: Term the caller filtered on, if any.
+        page_url: URL the listings were read from.
+
+    Returns:
+        The term, or "" when neither source has one.
+    """
+    return str(stated or "").strip() or keyword_from_url(page_url)
+
+
 def is_captured(url: str) -> bool:
     """Whether a captured URL is one this endpoint stores.
 
@@ -395,6 +415,7 @@ class IngestService:
         page_url: str = "",
         scraped_at: datetime | None = None,
         marketplace: Marketplace | str = Marketplace.SHOPEE,
+        keyword: str | None = None,
     ) -> IngestResult:
         """Store listings the extension read off the rendered page.
 
@@ -414,6 +435,8 @@ class IngestService:
             page_url: Page they were read from, for the log.
             scraped_at: One timestamp shared by the whole page, so a screenful
                 forms a single point in the time series.
+            keyword: Search term the caller filtered on. Overrides the one in
+                ``page_url``, which a shop's own grid does not carry.
 
         Returns:
             An :class:`IngestResult`.
@@ -422,7 +445,7 @@ class IngestService:
             return IngestResult(seen=0, reason="no items supplied")
 
         market = Marketplace(marketplace) if not isinstance(marketplace, Marketplace) else marketplace
-        keyword = keyword_from_url(page_url)
+        keyword = resolve_keyword(keyword, page_url)
         stamp = scraped_at or datetime.now(timezone.utc)
         result = IngestResult(seen=len(items))
 
@@ -566,7 +589,9 @@ def _dom_entry_to_models(
     Args:
         entry: One item from ``dom-scraper.js``. Ids arrive as ``shopKey`` /
             ``itemKey`` strings; the older numeric ``shopId`` / ``itemId`` names
-            are still accepted.
+            are still accepted. ``shopUsername`` and ``shopName`` are present
+            only when the page stated them — a storefront does, a search page
+            does not.
         marketplace: Which site the page belonged to.
 
     Returns:
@@ -594,10 +619,16 @@ def _dom_entry_to_models(
         rating_star = None
 
     # Shopee search cards expose no shop slug, only the numeric id from the URL,
-    # so the username is a placeholder there. Tokopedia's URL *is* the slug, so
-    # it is the real thing and must not be flagged synthetic.
+    # so the username is a placeholder there. Two things can beat the
+    # placeholder: a username the page itself stated — a Shopee storefront URL
+    # is the shop's username, and the extension forwards it as ``shopUsername``
+    # — or a non-numeric key, since Tokopedia's URL *is* the slug. Either is the
+    # real thing and must not be flagged synthetic.
+    stated_username = str(entry.get("shopUsername") or "").strip()
     raw_shop_key = str(entry.get("shopKey", entry.get("shopId", ""))).strip()
-    username = raw_shop_key if raw_shop_key and not raw_shop_key.isdigit() else f"shop-{shop_id}"
+    username = stated_username or (
+        raw_shop_key if raw_shop_key and not raw_shop_key.isdigit() else f"shop-{shop_id}"
+    )
 
     store = Store(
         marketplace=marketplace,
@@ -739,7 +770,11 @@ def build_app(settings: Settings | None = None, service: IngestService | None = 
 
         entries = [entry for entry in items if isinstance(entry, dict)]
         result = service.ingest_dom(
-            entries, str(body.get("pageUrl") or ""), scraped_at, marketplace=market
+            entries,
+            str(body.get("pageUrl") or ""),
+            scraped_at,
+            marketplace=market,
+            keyword=str(body.get("keyword") or "") or None,
         )
         return result.as_dict()
 

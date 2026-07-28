@@ -57,10 +57,29 @@ class RecordingService:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, object, datetime | None]] = []
+        self.dom_calls: list[dict] = []
 
     def ingest(self, url, payload, captured_at=None) -> IngestResult:
         self.calls.append((url, payload, captured_at))
         return IngestResult(seen=1, stored=1)
+
+    def ingest_dom(
+        self,
+        items,
+        page_url="",
+        scraped_at=None,
+        marketplace=Marketplace.SHOPEE,
+        keyword=None,
+    ) -> IngestResult:
+        self.dom_calls.append(
+            {
+                "items": items,
+                "page_url": page_url,
+                "marketplace": marketplace,
+                "keyword": keyword,
+            }
+        )
+        return IngestResult(seen=len(items), stored=len(items))
 
 
 # ----------------------------------------------------------------------
@@ -547,6 +566,43 @@ def test_shopee_dom_username_is_still_synthetic() -> None:
     assert _is_synthetic(store.username, store.shop_id) is True
 
 
+def test_a_shopee_storefront_states_the_username_the_search_card_cannot() -> None:
+    """A Shopee search card carries no seller at all, which is why every store
+    from that path is "shop-<id>". Its storefront URL *is* the username, so when
+    the extension read one it is the real thing and must beat the placeholder."""
+    from scraper.ingest import _dom_entry_to_models, _is_synthetic
+
+    store, _product, _snapshot = _dom_entry_to_models(
+        {
+            "shopKey": "30203584",
+            "itemKey": "901",
+            "shopUsername": "tokomainanku",
+            "shopName": "Toko Mainanku",
+            "name": "Produk",
+            "price": 1000,
+        },
+        Marketplace.SHOPEE,
+    )
+
+    assert store.username == "tokomainanku"
+    assert store.name == "Toko Mainanku"
+    assert _is_synthetic(store.username, store.shop_id) is False
+
+
+def test_a_blank_stated_username_falls_back_to_the_placeholder() -> None:
+    """The field is absent on search pages and must not become an empty string,
+    which is NOT NULL-legal and would read as a real username."""
+    from scraper.ingest import _dom_entry_to_models, _is_synthetic
+
+    store, _product, _snapshot = _dom_entry_to_models(
+        {"shopKey": "30203584", "itemKey": "901", "shopUsername": "  ", "name": "P", "price": 1},
+        Marketplace.SHOPEE,
+    )
+
+    assert store.username == "shop-30203584"
+    assert _is_synthetic(store.username, store.shop_id) is True
+
+
 def test_the_same_slug_on_two_marketplaces_stays_separate() -> None:
     """(marketplace, item_id) is the natural key; a collision across sites would
     merge two unrelated products' price histories."""
@@ -610,3 +666,59 @@ def test_keyword_is_read_from_the_page_url(url, expected) -> None:
     from scraper.ingest import keyword_from_url
 
     assert keyword_from_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    "stated,url,expected",
+    [
+        # Shop mode: the grid's URL has no term, so the caller's wins.
+        ("lego", "https://www.tokopedia.com/tokosaya/product", "lego"),
+        # Search mode states nothing and the address carries it, as before.
+        (None, "https://shopee.co.id/search?keyword=kaos%20polos", "kaos polos"),
+        ("", "https://shopee.co.id/search?keyword=lego", "lego"),
+        ("   ", "https://shopee.co.id/search?keyword=lego", "lego"),
+        # A stated term beats the address: a shop grid reached with the site's
+        # own search parameter would otherwise record the site's spelling.
+        ("lego technic", "https://shopee.co.id/tokosaya?keyword=lego", "lego technic"),
+        # Neither: a shop scraped without a keyword records none rather than
+        # inventing one.
+        (None, "https://www.tokopedia.com/tokosaya/product", ""),
+    ],
+)
+def test_the_stated_keyword_beats_the_one_in_the_url(stated, url, expected) -> None:
+    from scraper.ingest import resolve_keyword
+
+    assert resolve_keyword(stated, url) == expected
+
+
+def test_a_shop_grid_run_states_its_keyword_over_http(client) -> None:
+    """The URL of a shop's own grid carries no search term, so shop mode sends
+    the term it filtered on and the endpoint has to forward it."""
+    http, service = client
+
+    response = http.post(
+        "/ingest-dom",
+        json={
+            "marketplace": "tokopedia",
+            "pageUrl": "https://www.tokopedia.com/tokosaya/product?page=2",
+            "keyword": "lego technic",
+            "items": [dom_item()],
+        },
+        headers={"X-Ingest-Token": "test-token"},
+    )
+
+    assert response.status_code == 200
+    assert service.dom_calls[0]["keyword"] == "lego technic"
+
+
+def test_an_absent_keyword_is_forwarded_as_none_not_an_empty_string(client) -> None:
+    http, service = client
+
+    response = http.post(
+        "/ingest-dom",
+        json={"pageUrl": "https://shopee.co.id/search?keyword=lego", "items": [dom_item()]},
+        headers={"X-Ingest-Token": "test-token"},
+    )
+
+    assert response.status_code == 200
+    assert service.dom_calls[0]["keyword"] is None
