@@ -160,6 +160,56 @@ anonymous one and every subsequent scrape would quietly run logged out. When
 Shopee starts refusing an imported jar, it has expired: log in again in your
 browser and re-import.
 
+### The collector extension — when nothing else gets through
+
+Keyword search stays closed to this project's HTTP client no matter what. Four
+hypotheses were tested and disproven: request signing (in-page requests *are*
+fully SDK-signed and still refused), being logged out, session credentials (a
+live logged-in jar behaves identically), and an automation-flagged browser (real
+Chrome over CDP hits the same gate). What is left is an anti-bot CAPTCHA, and
+this project does not solve it, work around it, or hand it to a solver service.
+
+What is *not* blocked is ordinary browsing. So the collector inverts the
+direction: a Chrome extension watches the listing JSON that Shopee pages fetch
+**while you browse them anyway**, and files it into the same Postgres tables.
+
+It issues **no requests to Shopee of its own** — it reads responses the page
+already received. The marginal load on Shopee is zero, which is the entire point
+of the design. There is deliberately no background crawl loop; that would just
+be the scraper wearing a costume, and would deserve the block it got.
+
+```bash
+ecom-scraper serve          # prints the ingest token
+```
+
+Then load the extension: Chrome → `chrome://extensions` → enable **Developer
+mode** → **Load unpacked** → select the `extension/` folder. Open its popup,
+paste the token, Save. Browse Shopee search and shop pages normally; the counters
+move as data lands.
+
+How the pieces fit:
+
+| Piece | Job |
+|---|---|
+| `extension/interceptor.js` | MAIN world; wraps `fetch`/XHR to *observe* listing responses. Never modifies a request or what the page sees. |
+| `extension/bridge.js` | ISOLATED world; origin-pinned relay to the service worker. Treats page messages as untrusted. |
+| `extension/background.js` | Buffers in `chrome.storage.local` (MV3 workers die constantly) and POSTs to the ingest server. |
+| `scraper/ingest.py` | Parses with `parse_item` — the scraper's own parser, not a second one — and persists. |
+
+The extension is deliberately dumb and the server is smart: raw payloads go over
+the wire and every bit of parsing reuses the tested Python. A second parser
+written in JavaScript would drift from this one within a week.
+
+Guards worth knowing about: the endpoint binds loopback, requires a shared token
+(`X-Ingest-Token`, compared with `compare_digest`), checks **host and path** so a
+lookalike like `shopee.co.id.evil.example` is refused, and stores only the
+listing paths in `CAPTURED_PATHS` — a Shopee front-end change cannot fill your
+database with telemetry.
+
+Its honest limit: it collects only what you actually browse. No browsing, no
+data, and nothing to schedule. Use the affiliate API for unattended collection
+and this for coverage of whatever you can see.
+
 ### Did that actually unlock anything? `ecom-scraper doctor`
 
 ```bash

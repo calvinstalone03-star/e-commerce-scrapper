@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #1a1a1a;
+        --muted: #6b6b6b;
+        --bg: #ffffff;
+        --line: #e4e4e4;
+        --ok: #17803d;
+        --bad: #b42318;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #ededed;
+          --muted: #9a9a9a;
+          --bg: #1c1c1c;
+          --line: #333333;
+          --ok: #4ade80;
+          --bad: #f87171;
+        }
+      }
+      body {
+        margin: 0;
+        padding: 14px;
+        width: 300px;
+        font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--fg);
+        background: var(--bg);
+      }
+      h1 {
+        font-size: 13px;
+        margin: 0 0 2px;
+      }
+      p.sub {
+        margin: 0 0 12px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .row {
+        display: flex;
+        justify-content: space-between;
+        padding: 5px 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .row:last-of-type {
+        border-bottom: 0;
+      }
+      .k {
+        color: var(--muted);
+      }
+      .v {
+        font-variant-numeric: tabular-nums;
+        font-weight: 600;
+      }
+      label {
+        display: block;
+        margin: 12px 0 4px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+      input[type="text"] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 6px 8px;
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        background: transparent;
+        color: var(--fg);
+        font: inherit;
+      }
+      .actions {
+        display: flex;
+        gap: 6px;
+        margin-top: 12px;
+      }
+      button {
+        flex: 1;
+        padding: 7px;
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        background: transparent;
+        color: var(--fg);
+        font: inherit;
+        cursor: pointer;
+      }
+      button:hover {
+        border-color: var(--muted);
+      }
+      #status {
+        margin-top: 10px;
+        font-size: 11px;
+        min-height: 30px;
+      }
+      .ok {
+        color: var(--ok);
+      }
+      .bad {
+        color: var(--bad);
+      }
+      .toggle {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        margin-top: 10px;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>ecom-scraper collector</h1>
+    <p class="sub">
+      Files listing data from Shopee pages you browse into your local database.
+      Sends no requests to Shopee of its own.
+    </p>
+
+    <div class="row"><span class="k">captured</span><span class="v" id="captured">–</span></div>
+    <div class="row"><span class="k">stored in Postgres</span><span class="v" id="stored">–</span></div>
+    <div class="row"><span class="k">waiting to send</span><span class="v" id="queued">–</span></div>
+    <div class="row"><span class="k">dropped (queue full)</span><span class="v" id="dropped">–</span></div>
+
+    <div class="toggle">
+      <input type="checkbox" id="enabled" />
+      <label for="enabled" style="margin: 0">collecting while I browse</label>
+    </div>
+
+    <label for="endpoint">ingest server</label>
+    <input type="text" id="endpoint" placeholder="http://127.0.0.1:8787" />
+
+    <label for="token">ingest token</label>
+    <input type="text" id="token" placeholder="paste from: ecom-scraper serve" />
+
+    <div class="actions">
+      <button id="save">Save</button>
+      <button id="flush">Send now</button>
+    </div>
+
+    <div id="status"></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

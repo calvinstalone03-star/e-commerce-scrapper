@@ -909,6 +909,67 @@ def login(
     )
 
 
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address. Keep it loopback."),
+    port: int = typer.Option(8787, "--port", min=1, max=65535, help="Port to listen on."),
+) -> None:
+    """Run the local ingest server the browser extension posts to.
+
+    The extension observes listing JSON that Shopee pages fetch while you browse
+    and forwards it here; this parses it with the same code the scraper uses and
+    files it into Postgres. Nothing here talks to Shopee.
+
+    Prints the ingest token to paste into the extension popup.
+
+    Args:
+        host: Bind address.
+        port: Port.
+
+    Raises:
+        typer.Exit: Code 2 if FastAPI/uvicorn are missing.
+    """
+    from scraper.ingest import build_app, resolve_token
+
+    settings = _settings()
+    try:
+        import uvicorn
+    except ImportError:
+        _fail(
+            "the ingest server needs fastapi and uvicorn:\n"
+            "  uv pip install --python .venv/bin/python fastapi uvicorn"
+        )
+        return
+
+    try:
+        application = build_app(settings)
+    except RuntimeError as exc:
+        _fail(str(exc))
+        return
+
+    token = resolve_token(settings)
+
+    table = Table(title="ingest server", header_style="bold")
+    table.add_column("field")
+    table.add_column("value", overflow="fold")
+    table.add_row("listening on", f"http://{host}:{port}")
+    table.add_row("database", _safe_dsn(settings.database_url))
+    table.add_row("ingest token", escape(token))
+    console.print(table)
+    console.print(
+        "Paste that token into the extension popup, then browse Shopee normally.\n"
+        "The extension sends [bold]no requests of its own[/bold] — it only files away "
+        "what the pages you visit already fetched."
+    )
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        console.print(
+            f"[yellow]Warning:[/yellow] {host} is not loopback. This endpoint writes "
+            "to your database — do not expose it on a network you do not control."
+        )
+
+    uvicorn.run(application, host=host, port=port, log_level="warning")
+
+
 @app.command("import-cookies")
 def import_cookies(
     path: Path = typer.Argument(
