@@ -4,6 +4,7 @@ Commands::
 
     ecom-scraper bootstrap [--force] [--login/--no-login] [--headful]
     ecom-scraper login [--timeout S] [--poll S]
+    ecom-scraper import-cookies [FILE] [--user-agent UA] [--allow-logged-out]
     ecom-scraper doctor [--username U] [--keyword K] [--shopid N] [--json]
     ecom-scraper run --mode keyword|store [--keywords-file P] [--stores-file P]
                      [--pages N] [--target T ...] [--marketplace shopee]
@@ -904,6 +905,139 @@ def login(
     console.print(table)
     console.print(
         "[green]Saved.[/green] Cookie values were never printed or logged. "
+        "Run [bold]ecom-scraper doctor[/bold] to see which endpoints this unlocked."
+    )
+
+
+@app.command("import-cookies")
+def import_cookies(
+    path: Path = typer.Argument(
+        None,
+        help="Cookie export to read. Omit (or pass '-') to read from stdin.",
+        exists=False,
+    ),
+    user_agent: str = typer.Option(
+        "",
+        "--user-agent",
+        "-u",
+        help="UA of the browser the cookies came from. Get it by running "
+        "`navigator.userAgent` in that browser's console. Strongly recommended.",
+    ),
+    allow_logged_out: bool = typer.Option(
+        False,
+        "--allow-logged-out",
+        help="Import even when the export carries no logged-in session cookie.",
+    ),
+) -> None:
+    """Adopt a cookie jar exported from your own browser.
+
+    Shopee's login is gated behind a CAPTCHA that an automation-controlled
+    Chromium will not clear, so ``login`` can dead-end. This is the way around
+    that: log in normally in your own browser, export the cookies, import them
+    here. The challenge still gets cleared — by you, by hand — it just does not
+    happen inside an automated browser.
+
+    Accepts Netscape ``cookies.txt``, a Cookie-Editor / EditThisCookie JSON
+    array, a Playwright ``storage_state`` file, or a raw ``Cookie:`` header line.
+    The format is sniffed from the content.
+
+    The imported jar is marked so that no later bootstrap can silently replace it
+    with an anonymous one.
+
+    Args:
+        path: File to read, or None/'-' for stdin.
+        user_agent: UA string of the source browser.
+        allow_logged_out: Accept an export with no session cookie.
+
+    Raises:
+        typer.Exit: Code 2 on an unreadable or unparseable export; code 1 when
+            the export carries no logged-in session and ``--allow-logged-out``
+            was not passed.
+    """
+    import sys
+
+    from scraper.cookie_import import CookieImportError, filter_domain, parse_cookies, summarize
+    from scraper.session import ShopeeSession
+
+    if path is None or str(path) == "-":
+        if sys.stdin.isatty():
+            _fail(
+                "no input. Pass a file path, or pipe an export in: "
+                "`ecom-scraper import-cookies cookies.txt`.",
+            )
+            return
+        raw = sys.stdin.read()
+        origin = "stdin"
+    else:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            _fail(f"could not read {path}: {exc}")
+            return
+        origin = str(path)
+
+    try:
+        parsed, source_format, embedded_ua = parse_cookies(raw)
+    except CookieImportError as exc:
+        _fail(str(exc))
+        return
+
+    kept = filter_domain(parsed)
+    if not kept:
+        _fail(
+            f"the export parsed ({len(parsed)} cookies, {source_format} format) but none "
+            "were on shopee.co.id. Export the cookies while a Shopee tab is open.",
+        )
+        return
+
+    summary = summarize(parsed, kept, source_format=source_format, user_agent=embedded_ua)
+    chosen_ua = user_agent.strip() or embedded_ua or ""
+
+    if not summary.authenticated and not allow_logged_out:
+        _fail(
+            "this export carries no logged-in session cookie "
+            f"(looked for {', '.join(sorted(_authenticated_cookie_names()))}). "
+            "You are probably exporting from a browser that is not logged into "
+            "Shopee, or exporting only the non-HttpOnly cookies — the session "
+            "cookies are HttpOnly, so a devtools copy of document.cookie will miss "
+            "them. Use a cookies.txt exporter, or pass --allow-logged-out to import "
+            "anyway.",
+            code=1,
+        )
+        return
+
+    session = ShopeeSession(_settings())
+    try:
+        stored = session.import_cookies(kept, user_agent=chosen_ua or None)
+    except ValueError as exc:
+        _fail(str(exc))
+        return
+
+    table = Table(title="cookie import", header_style="bold")
+    table.add_column("field")
+    table.add_column("value", overflow="fold")
+    table.add_row("source", escape(origin))
+    table.add_row("format", summary.source_format)
+    table.add_row("parsed / kept", f"{summary.total} / {summary.kept} (shopee.co.id only)")
+    table.add_row(
+        "authenticated",
+        "[green]yes[/green]" if session.authenticated else "[yellow]no (logged out)[/yellow]",
+    )
+    table.add_row("cookie names", escape(", ".join(summary.names)) or "-")
+    table.add_row("user agent", escape(session.user_agent))
+    table.add_row("jar path", escape(str(session.cookies_path)))
+    console.print(table)
+
+    if not chosen_ua:
+        console.print(
+            "[yellow]No --user-agent given.[/yellow] The jar records this tool's default UA, "
+            "which is not the browser that minted these cookies. Shopee compares the two, "
+            "and a mismatch reads as a hijacked session. If doctor still shows BLOCKED, "
+            "re-import with --user-agent set to that browser's `navigator.userAgent`."
+        )
+
+    console.print(
+        f"[green]Imported {len(stored)} cookies.[/green] Values were never printed or logged. "
         "Run [bold]ecom-scraper doctor[/bold] to see which endpoints this unlocked."
     )
 

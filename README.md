@@ -116,6 +116,50 @@ timed-out login never overwrites cookies you already have. Cookie **names** are
 printed, values never are. `--headless` is not an option here and `HEADLESS` is
 ignored — a login nobody can see is a contradiction.
 
+### When the CAPTCHA will not let you in: `ecom-scraper import-cookies`
+
+`login` frequently dead-ends. Playwright's Chromium is automation-flagged, so
+Shopee escalates its login to a puzzle CAPTCHA that browser may never accept, no
+matter how many times you solve it correctly. That is not a bug here and it is
+not something this project will try to defeat.
+
+The way through is to not be in that browser. Log into Shopee **normally, in
+your own everyday browser** — clearing any challenge yourself, by hand, as a
+person — then hand the resulting session over:
+
+```bash
+ecom-scraper import-cookies cookies.txt --user-agent "$(: paste navigator.userAgent )"
+ecom-scraper import-cookies storage_state.json     # Playwright shape
+pbpaste | ecom-scraper import-cookies -            # a raw "Cookie:" header
+```
+
+The challenge still gets cleared; it just gets cleared by a human in a normal
+browser instead of by code in an automated one.
+
+Four export shapes are accepted, sniffed from the content, not the extension:
+Netscape `cookies.txt` (curl/wget and the "Get cookies.txt" extensions), a
+Cookie-Editor / EditThisCookie JSON array, a Playwright `storage_state` file, or
+a raw `Cookie:` header line copied off the Network tab.
+
+Two things worth knowing before you export:
+
+- **Use a `cookies.txt` exporter, not `document.cookie`.** The session cookies
+  are `HttpOnly`, so a devtools copy of `document.cookie` silently omits exactly
+  the ones that matter. The command refuses an export with no `SPC_EC`/`SPC_ST`
+  rather than importing a jar that cannot work — pass `--allow-logged-out` if you
+  really want it anyway.
+- **Pass `--user-agent`.** Shopee compares the UA against the one that minted the
+  session, and a mismatch reads as a hijacked jar. Run `navigator.userAgent` in
+  the console of the browser you exported from and paste that.
+
+Only `shopee.co.id` cookies are kept; the analytics and ad-network entries in a
+browser export are dropped. The jar is written `0600` and marked as imported,
+which makes every later bootstrap **refuse to replace it** — otherwise the
+client's block-recovery path would swap your logged-in session for a fresh
+anonymous one and every subsequent scrape would quietly run logged out. When
+Shopee starts refusing an imported jar, it has expired: log in again in your
+browser and re-import.
+
 ### Did that actually unlock anything? `ecom-scraper doctor`
 
 ```bash

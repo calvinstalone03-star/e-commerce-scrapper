@@ -88,6 +88,8 @@ __all__ = [
     "ManualLoginTimeout",
     "SHOPEE_BASE_URL",
     "DEFAULT_USER_AGENT",
+    "SOURCE_BROWSER",
+    "SOURCE_IMPORT",
 ]
 
 log = logging.getLogger(__name__)
@@ -100,6 +102,16 @@ DEFAULT_USER_AGENT = (
 
 #: Bumped when the on-disk envelope changes shape incompatibly.
 JAR_SCHEMA_VERSION = 1
+
+#: Jar minted by this module driving Chromium. Freely re-mintable.
+SOURCE_BROWSER = "browser"
+
+#: Jar a human exported from their own browser and imported with
+#: ``ecom-scraper import-cookies``. Cannot be re-minted here — Shopee's login
+#: CAPTCHA is not clearable from an automation-controlled Chromium, so throwing
+#: this jar away to bootstrap a fresh anonymous one destroys the only
+#: authenticated session available and silently downgrades every later scrape.
+SOURCE_IMPORT = "import"
 
 #: Browser context settings. Indonesian locale + Jakarta clock, because a
 #: desktop Chrome claiming ``id-ID`` while reporting a UTC clock is a tell.
@@ -302,6 +314,10 @@ class ShopeeSession:
         )
         self.user_agent = user_agent or DEFAULT_USER_AGENT
         self.authenticated = False
+        #: Where the current jar came from. Only ``SOURCE_IMPORT`` is special:
+        #: it marks a jar a human supplied, which this class must never silently
+        #: replace with one it minted itself. See :meth:`bootstrap_cookies`.
+        self.source = SOURCE_BROWSER
         # In-memory mirror of the jar. None means "not read from disk yet";
         # an empty list means "read, and there was nothing there".
         self._cookies: list[CookieDict] | None = None
@@ -344,6 +360,20 @@ class ShopeeSession:
             RuntimeError: If Chromium cannot be launched (browser not installed)
                 or the landing page yields no cookies at all.
         """
+        protected = self._protected_import()
+        if protected is not None:
+            log.warning(
+                "Cookie jar at %s was imported from a real browser (%d cookies, "
+                "authenticated). Refusing to replace it with a bootstrapped "
+                "anonymous jar — Shopee's login CAPTCHA cannot be cleared from an "
+                "automated browser, so this jar is not re-mintable here. If Shopee "
+                "is refusing it, the session has probably expired: log in again in "
+                "your own browser and re-run 'ecom-scraper import-cookies'.",
+                self.cookies_path,
+                len(protected),
+            )
+            return protected
+
         if login is True and not self.settings.has_credentials:
             raise ValueError(
                 "bootstrap_cookies(login=True) needs SHOPEE_USERNAME and SHOPEE_PASSWORD. "
@@ -1018,6 +1048,7 @@ class ShopeeSession:
         if user_agent:
             self.user_agent = user_agent
         self.authenticated = authenticated
+        self.source = self._stored_source()
         log.debug(
             "Loaded %d cookies from %s: %s",
             len(cookies),
@@ -1048,6 +1079,7 @@ class ShopeeSession:
             "saved_at": saved_at.isoformat(),
             "authenticated": bool(self.authenticated),
             "user_agent": self.user_agent,
+            "source": self.source,
         }
 
         directory = self.cookies_path.parent
@@ -1078,6 +1110,101 @@ class ShopeeSession:
             self.cookies_path,
             ", ".join(_cookie_names(normalised)),
         )
+
+    def import_cookies(
+        self,
+        cookies: list[CookieDict] | list[dict[str, object]],
+        *,
+        user_agent: str | None = None,
+        authenticated: bool | None = None,
+    ) -> list[CookieDict]:
+        """Adopt a jar exported from a human's own browser and persist it.
+
+        The jar is marked :data:`SOURCE_IMPORT`, which makes
+        :meth:`bootstrap_cookies` refuse to overwrite it. That protection is the
+        point of this method: an imported jar is the only authenticated session
+        this project can obtain, and re-bootstrapping would swap it for an
+        anonymous one without anything visibly failing.
+
+        Args:
+            cookies: Parsed cookies, in any shape :func:`_normalise_cookies`
+                accepts.
+            user_agent: UA of the browser the cookies came from. Strongly
+                recommended: Shopee compares the UA against the one that minted
+                the session, and a mismatch reads as a hijacked jar. Defaults to
+                the current UA when omitted.
+            authenticated: Override the logged-in verdict. By default it is
+                derived from the presence of an :data:`AUTHENTICATED_COOKIES`
+                name, which is the only evidence available.
+
+        Returns:
+            The normalised jar as persisted.
+
+        Raises:
+            ValueError: If ``cookies`` normalises to nothing usable.
+        """
+        normalised = _normalise_cookies(cookies, default_domain=self._default_cookie_domain())
+        if not normalised:
+            raise ValueError("The supplied cookies contained no usable entry.")
+
+        names = set(_cookie_names(normalised))
+        if authenticated is None:
+            authenticated = any(name in names for name in AUTHENTICATED_COOKIES)
+
+        if user_agent and user_agent.strip():
+            self.user_agent = user_agent.strip()
+
+        self.authenticated = bool(authenticated)
+        self.source = SOURCE_IMPORT
+        self.save_cookies(normalised)
+        log.info(
+            "Imported %d cookies (authenticated=%s): %s",
+            len(normalised),
+            self.authenticated,
+            ", ".join(sorted(names)),
+        )
+        return normalised
+
+    def _protected_import(self) -> list[CookieDict] | None:
+        """Return the stored jar when it is an imported one that must be kept.
+
+        Only an *authenticated* import is protected. An imported jar that never
+        carried a login cookie has no value worth preserving, so bootstrapping
+        over it is fine and keeps the anonymous path working normally.
+
+        Returns:
+            The jar to return unchanged, or None to let bootstrap proceed.
+        """
+        if self._stored_source() != SOURCE_IMPORT:
+            return None
+        payload = self._read_payload()
+        if payload is None:
+            return None
+        cookies, user_agent, authenticated, _saved_at = payload
+        if not authenticated or not cookies:
+            return None
+        self._cookies = cookies
+        if user_agent:
+            self.user_agent = user_agent
+        self.authenticated = True
+        self.source = SOURCE_IMPORT
+        return cookies
+
+    def _stored_source(self) -> str:
+        """Read the ``source`` field of the jar on disk.
+
+        Returns:
+            The stored source, or :data:`SOURCE_BROWSER` when the file is
+            absent, unreadable, or predates the field.
+        """
+        try:
+            document = json.loads(self.cookies_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return SOURCE_BROWSER
+        if not isinstance(document, dict):
+            return SOURCE_BROWSER
+        source = document.get("source")
+        return source if isinstance(source, str) and source else SOURCE_BROWSER
 
     def _read_payload(
         self,
