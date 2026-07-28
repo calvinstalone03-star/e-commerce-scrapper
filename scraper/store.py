@@ -32,7 +32,13 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from scraper.db import PriceSnapshotRow, ProductRow, ScrapeRunRow, StoreRow
+from scraper.db import (
+    PriceSnapshotRow,
+    ProductKeywordRow,
+    ProductRow,
+    ScrapeRunRow,
+    StoreRow,
+)
 from scraper.models import (
     Marketplace,
     PriceSnapshot,
@@ -49,6 +55,9 @@ __all__ = [
     "upsert_product",
     "insert_snapshot",
     "insert_snapshot_if_changed",
+    "upsert_product_keyword",
+    "normalise_keyword",
+    "keyword_summary",
     "start_run",
     "finish_run",
     "get_stats",
@@ -359,6 +368,119 @@ def _snapshot_matches(row: PriceSnapshotRow, snapshot: PriceSnapshot) -> bool:
             if str(stored) != str(observed):
                 return False
     return True
+
+
+def upsert_product_keyword(
+    session: Session,
+    product_ref: int,
+    keyword: str,
+    marketplace: Marketplace | str,
+    *,
+    now: datetime | None = None,
+) -> int | None:
+    """Record that a search term surfaced a product.
+
+    Many-to-many by design: a product legitimately appears under several
+    searches, so this inserts a row per (product, keyword) pair rather than
+    overwriting a single column.
+
+    The keyword is normalised — lowercased and whitespace-collapsed — so "LEGO",
+    "lego" and " lego " are one keyword rather than three, which is the
+    difference between a usable grouping and a fragmented one.
+
+    Args:
+        session: Open session. Not committed by this function.
+        product_ref: ``products.id``.
+        keyword: Raw search term as typed.
+        marketplace: Which site the search ran on.
+        now: Timestamp to stamp.
+
+    Returns:
+        ``product_keywords.id``, or None when ``keyword`` is blank.
+    """
+    cleaned = normalise_keyword(keyword)
+    if not cleaned:
+        return None
+
+    ts = _stamp(now)
+    market = marketplace.value if isinstance(marketplace, Marketplace) else str(marketplace)
+    table = ProductKeywordRow.__table__
+
+    stmt = pg_insert(ProductKeywordRow).values(
+        product_ref=product_ref,
+        keyword=cleaned,
+        marketplace=market,
+        first_seen=ts,
+        last_seen=ts,
+    )
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_product_keywords_product_keyword",
+        # first_seen is absent on purpose: written once, never touched again.
+        set_={"last_seen": stmt.excluded.last_seen},
+    ).returning(ProductKeywordRow.id)
+    return session.execute(stmt).scalar_one()
+
+
+def normalise_keyword(keyword: str | None) -> str:
+    """Canonicalise a search term for storage and comparison.
+
+    Args:
+        keyword: Raw term.
+
+    Returns:
+        Lowercased, whitespace-collapsed term, or "" when there is nothing left.
+    """
+    if not keyword:
+        return ""
+    return " ".join(str(keyword).split()).lower()
+
+
+def keyword_summary(
+    session: Session, *, marketplace: Marketplace | None = None
+) -> list[dict[str, object]]:
+    """Aggregate every keyword with the price spread of its products.
+
+    This is the dashboard's keyword view: one row per search term, with how many
+    products and shops it covers and what the prices look like. Computed from
+    each product's *latest* snapshot — comparing a fresh price against a
+    fortnight-old one would make the spread meaningless.
+
+    Args:
+        session: Open session, read-only usage.
+        marketplace: Restrict to one marketplace, or None for all.
+
+    Returns:
+        Dicts with keyword, marketplace, products, stores, min/max/avg price.
+    """
+    latest = (
+        select(
+            PriceSnapshotRow.product_ref.label("product_ref"),
+            PriceSnapshotRow.price.label("price"),
+        )
+        .distinct(PriceSnapshotRow.product_ref)
+        .order_by(PriceSnapshotRow.product_ref, PriceSnapshotRow.scraped_at.desc())
+        .subquery("latest")
+    )
+
+    stmt = (
+        select(
+            ProductKeywordRow.keyword,
+            ProductKeywordRow.marketplace,
+            func.count(func.distinct(ProductKeywordRow.product_ref)).label("products"),
+            func.count(func.distinct(ProductRow.shop_ref)).label("stores"),
+            func.min(latest.c.price).label("min_price"),
+            func.max(latest.c.price).label("max_price"),
+            func.avg(latest.c.price).label("avg_price"),
+        )
+        .join(ProductRow, ProductRow.id == ProductKeywordRow.product_ref)
+        .outerjoin(latest, latest.c.product_ref == ProductKeywordRow.product_ref)
+        .group_by(ProductKeywordRow.keyword, ProductKeywordRow.marketplace)
+        .order_by(func.count(func.distinct(ProductKeywordRow.product_ref)).desc())
+    )
+    if marketplace is not None:
+        stmt = stmt.where(ProductKeywordRow.marketplace == marketplace.value)
+
+    return [dict(row._mapping) for row in session.execute(stmt)]
 
 
 def start_run(

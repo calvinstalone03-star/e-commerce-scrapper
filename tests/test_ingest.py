@@ -582,3 +582,31 @@ def test_unknown_marketplace_is_rejected(client) -> None:
     )
 
     assert response.status_code == 422
+
+
+# ----------------------------------------------------------------------
+# Keyword capture
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://shopee.co.id/search?keyword=kaos%20polos", "kaos polos"),
+        ("https://www.tokopedia.com/search?q=lego", "lego"),
+        ("https://shopee.co.id/search?keyword=lego&page=2", "lego"),
+        # A shop page is not a search: record no keyword rather than invent one.
+        ("https://shopee.co.id/erigostore", ""),
+        ("https://www.tokopedia.com/tokosaya", ""),
+        ("https://shopee.co.id/search?keyword=", ""),
+        ("https://shopee.co.id/search?keyword=%20%20", ""),
+        ("not a url", ""),
+    ],
+)
+def test_keyword_is_read_from_the_page_url(url, expected) -> None:
+    """The extension already sends the page URL and the term is in it, so the
+    extension does not have to track what the user typed — and a search page the
+    user navigated to by hand is captured just as well as one from the popup."""
+    from scraper.ingest import keyword_from_url
+
+    assert keyword_from_url(url) == expected

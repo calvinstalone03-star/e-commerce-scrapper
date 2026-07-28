@@ -32,13 +32,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from scraper.adapters.shopee import _extract_items, parse_item
 from scraper.config import Settings, get_settings
 from scraper.db import session_scope
 from scraper.models import Marketplace, PriceSnapshot, Product, Store, parse_sold
-from scraper.store import insert_snapshot_if_changed, upsert_product, upsert_store
+from scraper.store import (
+    insert_snapshot_if_changed,
+    upsert_product,
+    upsert_product_keyword,
+    upsert_store,
+)
 
 __all__ = [
     "CAPTURED_PATHS",
@@ -48,6 +53,7 @@ __all__ = [
     "deep_find_items",
     "is_captured",
     "resolve_token",
+    "keyword_from_url",
     "stable_id",
 ]
 
@@ -224,6 +230,40 @@ def deep_find_items(payload: Any) -> list[dict[str, Any]]:
     return list(found.values())
 
 
+
+#: Query parameters each marketplace puts the search term in.
+_SEARCH_PARAMS = ("keyword", "q", "search", "st")
+
+
+def keyword_from_url(page_url: str) -> str:
+    """Pull the search term out of the page the listings were read from.
+
+    The extension already sends the page URL, and the term is right there in it
+    — ``?keyword=lego`` on Shopee, ``?q=lego`` on Tokopedia. Reading it here
+    means the extension does not have to track what the user typed, and a scrape
+    of a search page the user navigated to by hand is captured just as well as
+    one triggered from the popup.
+
+    Shop pages have no search term; those return "" and simply record no
+    keyword rather than inventing one.
+
+    Args:
+        page_url: URL the extension scraped.
+
+    Returns:
+        The raw search term, or "" when the page is not a search.
+    """
+    try:
+        query = parse_qs(urlsplit(page_url).query)
+    except ValueError:
+        return ""
+    for param in _SEARCH_PARAMS:
+        values = query.get(param)
+        if values and values[0].strip():
+            return values[0].strip()
+    return ""
+
+
 def is_captured(url: str) -> bool:
     """Whether a captured URL is one this endpoint stores.
 
@@ -382,6 +422,7 @@ class IngestService:
             return IngestResult(seen=0, reason="no items supplied")
 
         market = Marketplace(marketplace) if not isinstance(marketplace, Marketplace) else marketplace
+        keyword = keyword_from_url(page_url)
         stamp = scraped_at or datetime.now(timezone.utc)
         result = IngestResult(seen=len(items))
 
@@ -411,6 +452,10 @@ class IngestService:
                     product_ref = upsert_product(
                         session, product, store_refs[store.shop_id], now=stamp
                     )
+                    if keyword:
+                        upsert_product_keyword(
+                            session, product_ref, keyword, market, now=stamp
+                        )
                     written = insert_snapshot_if_changed(
                         session, snapshot, product_ref, now=stamp,
                         window_hours=self._dedupe_window,
@@ -424,8 +469,9 @@ class IngestService:
                     result.skipped += 1
 
         log.info(
-            "DOM ingest from %s: %d seen, %d stored, %d skipped",
+            "DOM ingest from %s (keyword=%r): %d seen, %d stored, %d skipped",
             page_url[:120],
+            keyword,
             result.seen,
             result.stored,
             result.skipped,

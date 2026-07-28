@@ -216,13 +216,17 @@ def test_init_db_applies_the_sql_migration_and_is_idempotent(engine):
     """init_db runs 001_init.sql (not the create_all fallback) and survives a re-run."""
     Base.metadata.drop_all(engine)
 
+    # Asserted as a property, not a hardcoded list: pinning the exact filenames
+    # made every new migration fail this test for no reason.
     applied = run_migrations(engine)
-    assert applied == ["001_init.sql"], (
-        "run_migrations should report the real DDL file as applied; got %r" % (applied,)
+    assert applied[0] == "001_init.sql", (
+        "run_migrations should report the real DDL files in order; got %r" % (applied,)
     )
+    assert all(name.endswith(".sql") for name in applied)
+    assert applied == sorted(applied), "migrations must run in lexicographic order"
 
     # Idempotency is the recovery path — there is no applied-migrations ledger.
-    assert run_migrations(engine) == ["001_init.sql"]
+    assert run_migrations(engine) == applied
     init_db(TEST_DATABASE_URL)
 
     with engine.connect() as conn:
@@ -1220,3 +1224,126 @@ class TestInsertSnapshotIfChanged:
         )
 
         assert older is not None
+
+
+class TestProductKeywords:
+    """A product legitimately appears under several searches.
+
+    A single products.keyword column would overwrite all but the last and make
+    grouping by keyword quietly wrong, which is why this is a join table.
+    """
+
+    def _product(self, session, item_id: int = 7001) -> int:
+        from scraper.store import upsert_product, upsert_store
+
+        shop_ref = upsert_store(
+            session, Store(marketplace=Marketplace.SHOPEE, shop_id=701, username="kwshop")
+        )
+        return upsert_product(
+            session,
+            Product(
+                marketplace=Marketplace.SHOPEE,
+                item_id=item_id,
+                shop_id=701,
+                name=f"Produk {item_id}",
+            ),
+            shop_ref,
+        )
+
+    def test_one_product_can_carry_several_keywords(self, session) -> None:
+        from scraper.store import upsert_product_keyword
+
+        product_ref = self._product(session)
+
+        for keyword in ("lego", "mainan anak", "balok susun"):
+            upsert_product_keyword(session, product_ref, keyword, Marketplace.SHOPEE)
+
+        assert self._keywords(session, product_ref) == ["balok susun", "lego", "mainan anak"]
+
+    def test_keywords_are_normalised_so_casing_does_not_fragment_them(
+        self, session
+    ) -> None:
+        from scraper.store import upsert_product_keyword
+
+        product_ref = self._product(session)
+
+        for spelling in ("LEGO", "lego", "  Lego  ", "le go"):
+            upsert_product_keyword(session, product_ref, spelling, Marketplace.SHOPEE)
+
+        # "le go" is a genuinely different term; the other three collapse.
+        assert self._keywords(session, product_ref) == ["le go", "lego"]
+
+    def test_repeating_a_keyword_advances_last_seen_without_duplicating(
+        self, session
+    ) -> None:
+        from sqlalchemy import select
+
+        from scraper.db import ProductKeywordRow
+        from scraper.store import upsert_product_keyword
+
+        product_ref = self._product(session)
+        first = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        later = datetime(2026, 7, 20, tzinfo=timezone.utc)
+
+        upsert_product_keyword(session, product_ref, "lego", Marketplace.SHOPEE, now=first)
+        upsert_product_keyword(session, product_ref, "lego", Marketplace.SHOPEE, now=later)
+
+        rows = session.execute(
+            select(ProductKeywordRow).where(ProductKeywordRow.product_ref == product_ref)
+        ).scalars().all()
+
+        assert len(rows) == 1
+        assert rows[0].first_seen == first, "first_seen must be written once, never touched"
+        assert rows[0].last_seen == later
+
+    def test_a_blank_keyword_records_nothing(self, session) -> None:
+        """Shop pages have no search term; inventing one would be worse."""
+        from scraper.store import upsert_product_keyword
+
+        product_ref = self._product(session)
+
+        assert upsert_product_keyword(session, product_ref, "", Marketplace.SHOPEE) is None
+        assert upsert_product_keyword(session, product_ref, "   ", Marketplace.SHOPEE) is None
+        assert self._keywords(session, product_ref) == []
+
+    def test_keyword_summary_aggregates_from_the_latest_price(self, session) -> None:
+        """Comparing a fresh price against a fortnight-old one would make the
+        spread meaningless, so the summary uses each product's newest snapshot."""
+        from scraper.store import insert_snapshot, keyword_summary, upsert_product_keyword
+
+        cheap = self._product(session, 7001)
+        dear = self._product(session, 7002)
+        for ref in (cheap, dear):
+            upsert_product_keyword(session, ref, "lego", Marketplace.SHOPEE)
+
+        base = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        insert_snapshot(session, PriceSnapshot(item_id=7001, price=Decimal("50000")), cheap, now=base)
+        # A later, cheaper observation must be the one that counts.
+        insert_snapshot(
+            session,
+            PriceSnapshot(item_id=7001, price=Decimal("30000")),
+            cheap,
+            now=base + timedelta(days=2),
+        )
+        insert_snapshot(session, PriceSnapshot(item_id=7002, price=Decimal("90000")), dear, now=base)
+
+        rows = keyword_summary(session)
+        lego = next(row for row in rows if row["keyword"] == "lego")
+
+        assert lego["products"] == 2
+        assert Decimal(str(lego["min_price"])) == Decimal("30000")
+        assert Decimal(str(lego["max_price"])) == Decimal("90000")
+
+    @staticmethod
+    def _keywords(session, product_ref: int) -> list[str]:
+        from sqlalchemy import select
+
+        from scraper.db import ProductKeywordRow
+
+        return sorted(
+            session.execute(
+                select(ProductKeywordRow.keyword).where(
+                    ProductKeywordRow.product_ref == product_ref
+                )
+            ).scalars()
+        )

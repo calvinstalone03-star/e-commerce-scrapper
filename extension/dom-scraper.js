@@ -104,14 +104,38 @@
     return null;
   }
 
+  // UI chrome that sits in the same position a location does and matched the
+  // old "short line with no digits" rule. "Produk Serupa" was landing in
+  // stores.location for real rows, which then fed the dashboard's location
+  // filter — a wrong value is worse than a missing one, so this list exists.
+  const NOT_A_LOCATION = new RegExp(
+    [
+      'produk serupa', 'lihat semua', 'lainnya', 'terlaris', 'termurah',
+      'gratis ongkir', 'bebas ongkir', 'cashback', 'cicilan', 'promo',
+      'star seller', 'mall', 'official', 'preorder', 'pre-order', 'stok',
+      'beli', 'keranjang', 'wishlist', 'diskon', 'voucher', 'flash sale',
+      'ad', 'iklan', 'sponsored', 'bergaransi', 'terjual',
+    ].join('|'),
+    'i',
+  );
+
+  // Indonesian place names: letters, spaces, dots and hyphens only. Rejects
+  // anything with digits or punctuation a label would carry.
+  const LOCATION_SHAPE = /^[A-Za-zÀ-ÿ.\-' ]{3,30}$/;
+
   function extractLocation(card) {
-    const lines = (card.innerText || '').split('\n').map((line) => line.trim());
-    // Location sits last on a card: short, no digits, not a sold count.
+    const lines = (card.innerText || '')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    // Scanning from the end still makes sense — location renders last — but a
+    // candidate now has to look like a place and not be known UI text.
     for (let index = lines.length - 1; index >= 0; index -= 1) {
       const line = lines[index];
-      if (line.length >= 3 && line.length <= 30 && !/\d/.test(line) && !/terjual/i.test(line)) {
-        return line;
-      }
+      if (!LOCATION_SHAPE.test(line)) continue;
+      if (NOT_A_LOCATION.test(line)) continue;
+      return line;
     }
     return null;
   }

@@ -112,6 +112,7 @@ __all__ = [
     "Base",
     "StoreRow",
     "ProductRow",
+    "ProductKeywordRow",
     "PriceSnapshotRow",
     "ScrapeRunRow",
     "get_engine",
@@ -169,6 +170,35 @@ class ProductRow(Base):
 
     shop: Mapped["StoreRow | None"] = relationship(back_populates="products")
     snapshots: Mapped[list["PriceSnapshotRow"]] = relationship(back_populates="product")
+
+
+class ProductKeywordRow(Base):
+    """ORM mapping for ``product_keywords``.
+
+    Many-to-many between a product and the search terms that surfaced it. A
+    product legitimately appears under several searches, so a single column on
+    ``products`` would overwrite all but the last and make grouping by keyword
+    quietly wrong.
+
+    ``keyword`` is stored normalised (lowercased, trimmed) by the writer so
+    "LEGO" and "lego " collapse to one row.
+    """
+
+    __tablename__ = "product_keywords"
+    __table_args__ = (
+        UniqueConstraint(
+            "product_ref", "keyword", name="uq_product_keywords_product_keyword"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_ref: Mapped[int] = mapped_column(
+        Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False
+    )
+    keyword: Mapped[str] = mapped_column(Text, nullable=False)
+    marketplace: Mapped[str] = mapped_column(Text, nullable=False)
+    first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class PriceSnapshotRow(Base):
