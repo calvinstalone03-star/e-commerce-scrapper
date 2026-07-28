@@ -31,9 +31,16 @@ async function refresh() {
     ? new Date(diag.injectedAt).toLocaleTimeString()
     : 'never — reload the Shopee tab';
 
-  const paths = Object.entries(diag.paths || {}).sort((a, b) => b[1] - a[1]);
+  const paths = Object.entries(diag.paths || {}).sort(
+    (a, b) => (b[1].max || 0) - (a[1].max || 0),
+  );
   $('paths').textContent = paths.length
-    ? paths.map(([path, n]) => `${String(n).padStart(4)}  ${path}`).join('\n')
+    ? paths
+        .map(([path, v]) => {
+          const kb = Math.round((v.max || 0) / 1024);
+          return `${String(kb).padStart(5)}KB x${String(v.n).padEnd(3)} ${path}`;
+        })
+        .join('\n')
     : 'none seen yet';
 
   if (state.stats.lastError) {
@@ -92,8 +99,8 @@ $('copydiag').addEventListener('click', async () => {
     '',
     'paths:',
     ...Object.entries(diag.paths || {})
-      .sort((a, b) => b[1] - a[1])
-      .map(([path, n]) => `  ${n}  ${path}`),
+      .sort((a, b) => (b[1].max || 0) - (a[1].max || 0))
+      .map(([path, v]) => `  ${Math.round((v.max || 0) / 1024)}KB x${v.n}  ${path}`),
   ].join('\n');
   await navigator.clipboard.writeText(report);
   setStatus('Diagnostics copied to clipboard.', 'ok');

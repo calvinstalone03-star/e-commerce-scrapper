@@ -174,11 +174,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       const { diag } = await getState();
       const paths = { ...(diag.paths || {}) };
       const path = message.path || '';
-      if (path) paths[path] = (paths[path] || 0) + 1;
+      if (path) {
+        // Track the biggest response seen per path, not just a hit count: the
+        // endpoint carrying a page of listings is the fat one, and that is what
+        // identifies it when its name is unknown.
+        const prev = paths[path] || { n: 0, max: 0 };
+        const seen = typeof prev === 'number' ? { n: prev, max: 0 } : prev;
+        paths[path] = {
+          n: seen.n + 1,
+          max: Math.max(seen.max || 0, message.bytes || 0),
+        };
+      }
       // Bound it: a long session touches a lot of telemetry endpoints.
       const trimmed = Object.fromEntries(
         Object.entries(paths)
-          .sort((a, b) => b[1] - a[1])
+          .sort((a, b) => (b[1].max || 0) - (a[1].max || 0))
           .slice(0, 40),
       );
       await chrome.storage.local.set({ [DIAG_KEY]: { ...diag, paths: trimmed } });

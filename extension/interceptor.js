@@ -42,16 +42,62 @@
   // Diagnostics. When nothing is captured, the question is always the same:
   // did this script run at all, and what API paths did the page actually call?
   // Guessing at that from outside costs a round trip per guess, so report it.
-  function observe(url) {
-    if (typeof url !== 'string' || !url.includes('/api/')) return;
+  // Records EVERY same-origin request, not just /api/ ones — an endpoint that
+  // moved off that prefix was invisible to the previous version of this, which
+  // is exactly the blind spot that made "no items anywhere" hard to explain.
+  //
+  // Response size is the useful signal: whichever endpoint delivers a page of
+  // 60 listings is measured in hundreds of KB, so it identifies itself without
+  // anyone having to guess at names.
+  function observe(url, bytes) {
+    if (typeof url !== 'string') return;
     try {
-      const path = new URL(url, window.location.origin).pathname;
+      const parsed = new URL(url, window.location.origin);
+      if (!parsed.hostname.endsWith('shopee.co.id')) return;
       window.postMessage(
-        { source: CHANNEL, kind: 'observed', path },
+        {
+          source: CHANNEL,
+          kind: 'observed',
+          path: parsed.pathname,
+          bytes: typeof bytes === 'number' ? bytes : 0,
+        },
         window.location.origin,
       );
     } catch (err) {
       /* not a parseable URL; nothing to report */
+    }
+  }
+
+  // Any same-origin JSON response big enough to plausibly be a page of listings
+  // gets run through the item sniffer, regardless of its path. This is what
+  // catches an endpoint that was renamed out from under the WANTED list.
+  const SNIFF_MIN_BYTES = 3000;
+
+  function sniff(url, bodyText) {
+    if (!bodyText || bodyText.length < SNIFF_MIN_BYTES) return;
+    if (!bodyText.includes('itemid') && !bodyText.includes('item_basic')) return;
+    if (isWanted(url)) return; // already published through the normal path
+    let payload;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch (err) {
+      return;
+    }
+    try {
+      window.postMessage(
+        {
+          source: CHANNEL,
+          kind: 'capture',
+          // Tag it onto a captured path so the server accepts it; the real
+          // origin is kept in the fragment for the record.
+          url: `${window.location.origin}/api/v4/search/search_items#sniffed:${encodeURIComponent(url)}`,
+          payload,
+          capturedAt: new Date().toISOString(),
+        },
+        window.location.origin,
+      );
+    } catch (err) {
+      /* not structured-cloneable */
     }
   }
 
@@ -165,9 +211,7 @@
             ? request.url
             : '';
 
-      observe(url);
       const pending = nativeFetch.apply(this, args);
-      if (!isWanted(url)) return pending;
 
       return pending.then((response) => {
         // clone() so the page still gets an unread, untouched body. Reading the
@@ -176,10 +220,14 @@
           response
             .clone()
             .text()
-            .then((text) => publish(url, text))
-            .catch(() => {});
+            .then((text) => {
+              observe(url, text ? text.length : 0);
+              if (isWanted(url)) publish(url, text);
+              else sniff(url, text);
+            })
+            .catch(() => observe(url, 0));
         } catch (err) {
-          /* opaque or already-consumed responses cannot be cloned */
+          observe(url, 0); // opaque responses cannot be cloned; still record it
         }
         return response;
       });
@@ -199,20 +247,21 @@
 
   XMLHttpRequest.prototype.send = function patchedSend(...args) {
     const url = this.__ecomScraperUrl;
-    observe(url);
-    if (isWanted(url)) {
-      this.addEventListener('load', () => {
-        try {
-          if (this.responseType === '' || this.responseType === 'text') {
-            publish(url, this.responseText);
-          } else if (this.responseType === 'json' && this.response) {
-            publish(url, JSON.stringify(this.response));
-          }
-        } catch (err) {
-          /* never let observation break the page */
+    this.addEventListener('load', () => {
+      try {
+        let text = '';
+        if (this.responseType === '' || this.responseType === 'text') {
+          text = this.responseText || '';
+        } else if (this.responseType === 'json' && this.response) {
+          text = JSON.stringify(this.response);
         }
-      });
-    }
+        observe(url, text.length);
+        if (isWanted(url)) publish(url, text);
+        else sniff(url, text);
+      } catch (err) {
+        /* never let observation break the page */
+      }
+    });
     return nativeSend.apply(this, args);
   };
 })();
