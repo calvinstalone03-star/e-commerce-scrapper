@@ -2,7 +2,8 @@
 
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 
-import { Card, Input, Select } from '@/components/ui';
+import { Card, Input } from '@/components/ui';
+import { Choice } from '@/components/ui/Choice';
 import { useFilterOptions, useStoreOptions } from '@/hooks/useFilterOptions';
 import { useProductFilter } from '@/hooks/useProducts';
 import type { StoreOption } from '@/lib/client-api';
@@ -84,62 +85,53 @@ export function Filters({ initialOptions, initialStores }: FiltersProps) {
           />
         </Field>
 
-        <Field label="Marketplace" htmlFor={`${ids}-marketplace`}>
-          <Select
-            id={`${ids}-marketplace`}
-            value={filter.marketplace ?? ''}
-            onChange={(event) =>
-              setFilter({
-                marketplace: (event.target.value || undefined) as Marketplace | undefined,
-                // The selected shop may belong to the marketplace being filtered out.
-                storeId: undefined,
-              })
-            }
-          >
-            <option value="">Semua marketplace</option>
-            {options.marketplaces.map((marketplace) => (
-              <option key={marketplace} value={marketplace}>
-                {MARKETPLACE_LABELS[marketplace] ?? marketplace}
-              </option>
-            ))}
-          </Select>
-        </Field>
+        <Choice
+          label="Marketplace"
+          value={filter.marketplace ?? ''}
+          onChange={(value) =>
+            setFilter({
+              marketplace: (value || undefined) as Marketplace | undefined,
+              // The selected shop may belong to the marketplace being filtered out.
+              storeId: undefined,
+            })
+          }
+          options={[
+            { value: '', label: 'Semua marketplace' },
+            ...options.marketplaces.map((marketplace) => ({
+              value: marketplace,
+              label: MARKETPLACE_LABELS[marketplace] ?? marketplace,
+            })),
+          ]}
+        />
 
-        <Field label="Toko" htmlFor={`${ids}-store`}>
-          <Select
-            id={`${ids}-store`}
-            value={filter.storeId ?? ''}
-            onChange={(event) =>
-              setFilter({ storeId: event.target.value ? Number(event.target.value) : undefined })
-            }
-            disabled={storeChoices.length === 0}
-          >
-            <option value="">Semua toko ({storeChoices.length})</option>
-            {storeChoices.map((store) => (
-              <option key={store.id} value={store.id}>
-                {store.label} · {store.productCount} produk
-              </option>
-            ))}
-          </Select>
-        </Field>
+        <Choice
+          label="Toko"
+          value={filter.storeId === undefined ? '' : String(filter.storeId)}
+          onChange={(value) => setFilter({ storeId: value ? Number(value) : undefined })}
+          disabled={storeChoices.length === 0}
+          options={[
+            { value: '', label: `Semua toko (${storeChoices.length})` },
+            ...storeChoices.map((store) => ({
+              value: String(store.id),
+              label: store.label,
+              hint: `${store.productCount} produk`,
+            })),
+          ]}
+        />
 
-        <Field label="Lokasi toko" htmlFor={`${ids}-location`}>
-          <Select
-            id={`${ids}-location`}
-            value={filter.location ?? ''}
-            onChange={(event) => setFilter({ location: event.target.value || undefined })}
-            disabled={options.locations.length === 0}
-          >
-            <option value="">
-              {options.locations.length === 0 ? 'Lokasi belum terekam' : 'Semua lokasi'}
-            </option>
-            {options.locations.map((location) => (
-              <option key={location} value={location}>
-                {location}
-              </option>
-            ))}
-          </Select>
-        </Field>
+        <Choice
+          label="Lokasi toko"
+          value={filter.location ?? ''}
+          onChange={(value) => setFilter({ location: value || undefined })}
+          disabled={options.locations.length === 0}
+          options={[
+            {
+              value: '',
+              label: options.locations.length === 0 ? 'Lokasi belum terekam' : 'Semua lokasi',
+            },
+            ...options.locations.map((location) => ({ value: location, label: location })),
+          ]}
+        />
 
         <Field label="Harga minimum" htmlFor={`${ids}-min-price`}>
           <Input
@@ -171,37 +163,31 @@ export function Filters({ initialOptions, initialStores }: FiltersProps) {
           />
         </Field>
 
-        <Field label="Rating minimum" htmlFor={`${ids}-min-rating`}>
-          <Select
-            id={`${ids}-min-rating`}
-            value={filter.minRating ?? ''}
-            onChange={(event) =>
-              setFilter({ minRating: event.target.value ? Number(event.target.value) : undefined })
-            }
-          >
-            <option value="">Semua rating</option>
-            {RATING_STEPS.map((step) => (
-              <option key={step} value={step}>
-                {step.toLocaleString('id-ID')} ke atas
-              </option>
-            ))}
-          </Select>
-        </Field>
+        <Choice
+          label="Rating minimum"
+          value={filter.minRating === undefined ? '' : String(filter.minRating)}
+          onChange={(value) => setFilter({ minRating: value ? Number(value) : undefined })}
+          options={[
+            { value: '', label: 'Semua rating' },
+            ...RATING_STEPS.map((step) => ({
+              value: String(step),
+              label: `${step.toLocaleString('id-ID')} ke atas`,
+            })),
+          ]}
+        />
 
-        <Field label="Urutkan" htmlFor={`${ids}-sort`}>
-          <div className="flex gap-2">
-            <Select
-              id={`${ids}-sort`}
-              value={filter.sort}
-              onChange={(event) => setFilter({ sort: event.target.value as ProductFilter['sort'] })}
-            >
-              {(Object.keys(SORT_LABELS) as Array<ProductFilter['sort']>).map((field) => (
-                <option key={field} value={field}>
-                  {SORT_LABELS[field]}
-                </option>
-              ))}
-            </Select>
-            <button
+        <div className="flex items-end gap-2">
+          <Choice
+            label="Urutkan"
+            className="flex-1"
+            value={filter.sort}
+            onChange={(value) => setFilter({ sort: value as ProductFilter['sort'] })}
+            options={(Object.keys(SORT_LABELS) as Array<ProductFilter['sort']>).map((field) => ({
+              value: field,
+              label: SORT_LABELS[field],
+            }))}
+          />
+          <button
               type="button"
               onClick={() => setFilter({ dir: filter.dir === 'asc' ? 'desc' : 'asc' })}
               aria-label={
@@ -209,24 +195,16 @@ export function Filters({ initialOptions, initialStores }: FiltersProps) {
               }
               className="h-9 shrink-0 rounded-md border border-line bg-surface px-3 text-sm transition-colors hover:bg-surface-muted"
             >
-              {filter.dir === 'asc' ? '↑' : '↓'}
-            </button>
-          </div>
-        </Field>
+            {filter.dir === 'asc' ? '↑' : '↓'}
+          </button>
+        </div>
 
-        <Field label="Baris per halaman" htmlFor={`${ids}-page-size`}>
-          <Select
-            id={`${ids}-page-size`}
-            value={filter.pageSize}
-            onChange={(event) => setFilter({ pageSize: Number(event.target.value) })}
-          >
-            {PAGE_SIZES.map((size) => (
-              <option key={size} value={size}>
-                {size} baris
-              </option>
-            ))}
-          </Select>
-        </Field>
+        <Choice
+          label="Baris per halaman"
+          value={String(filter.pageSize)}
+          onChange={(value) => setFilter({ pageSize: Number(value) })}
+          options={PAGE_SIZES.map((size) => ({ value: String(size), label: `${size} baris` }))}
+        />
 
         <div className="flex items-end">
           <label className="flex h-9 w-full cursor-pointer items-center gap-2 rounded-md border border-line bg-surface px-2.5 text-sm transition-colors hover:bg-surface-muted">

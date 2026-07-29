@@ -19,3 +19,6 @@ __pycache__/
 
 # launchd logs
 logs/
+
+# Dashboard login credentials (hashed, plus the session signing key)
+.dashboard-auth.json

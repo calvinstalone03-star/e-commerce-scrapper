@@ -3,6 +3,7 @@ import Link from 'next/link';
 
 import { EmptyState } from '@/components/EmptyState';
 import { PricingSearch } from '@/components/PricingSearch';
+import { UrlChoice } from '@/components/UrlChoice';
 import { Badge, Card, CardContent, Stat, TBody, TD, TH, THead, TR, Table, cn } from '@/components/ui';
 import { MARKETPLACE_LABELS, formatDate, formatPrice, formatStoreName } from '@/lib/format';
 import { getOwnShops, getPricePositions } from '@/lib/queries';
@@ -272,117 +273,71 @@ function SearchBox({ filter }: { filter: PricePositionFilter }) {
 }
 
 /**
- * Filter chips.
+ * The filter row.
  *
- * Each is a link that keeps the rest of the filter and resets the page — a
- * filter change that left you on page 7 of a shorter result set would look like
- * an empty table.
+ * Four dropdowns and a sort, where there used to be four groups of chips. The
+ * chips were honest about their options and silent about what they did: by the
+ * time there were fifteen of them across three rows, they took more height than
+ * the table and read as decoration. A labelled control says what it filters
+ * while closed, which is most of the time.
  */
 function Filters({ filter }: { filter: PricePositionFilter }) {
-  const link = (patch: Partial<PricePositionFilter>) =>
-    `/pricing?${toSearchParams({ ...filter, ...patch, page: 1 })}`;
-
   return (
-    <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
-      <ChipGroup label="Tampilkan">
-        <Chip href={link({ stance: 'any' })} active={filter.stance === 'any'}>
-          semua
-        </Chip>
-        <Chip href={link({ stance: 'over' })} active={filter.stance === 'over'}>
-          kemahalan
-        </Chip>
-        <Chip href={link({ stance: 'under' })} active={filter.stance === 'under'}>
-          termurah
-        </Chip>
-      </ChipGroup>
-
-      <ChipGroup label="Pencocokan">
-        <Chip href={link({ matched: 'any' })} active={filter.matched === 'any'}>
-          semua
-        </Chip>
-        <Chip href={link({ matched: 'set' })} active={filter.matched === 'set'}>
-          nomor set
-        </Chip>
-        <Chip href={link({ matched: 'name' })} active={filter.matched === 'name'}>
-          via nama
-        </Chip>
-        <Chip href={link({ matched: 'none' })} active={filter.matched === 'none'}>
-          belum ada lawan
-        </Chip>
-      </ChipGroup>
-
-      <ChipGroup label="Selisih ekstrem">
-        <Chip
-          href={link({ extreme: 'hide' })}
-          active={filter.extreme === 'hide'}
-          title="sembunyikan baris yang selisihnya lebih dari 100% — biasanya beda kemasan, bukan beda harga"
-        >
-          sembunyikan
-        </Chip>
-        <Chip href={link({ extreme: 'show' })} active={filter.extreme === 'show'}>
-          tampilkan
-        </Chip>
-      </ChipGroup>
-
-      <ChipGroup label="Urut">
-        <Chip href={link({ sort: 'gap', dir: 'desc' })} active={filter.sort === 'gap'}>
-          selisih
-        </Chip>
-        <Chip href={link({ sort: 'position', dir: 'desc' })} active={filter.sort === 'position'}>
-          posisi
-        </Chip>
-        <Chip href={link({ sort: 'rivals', dir: 'desc' })} active={filter.sort === 'rivals'}>
-          jumlah lawan
-        </Chip>
-        <Chip href={link({ sort: 'price', dir: 'desc' })} active={filter.sort === 'price'}>
-          harga
-        </Chip>
-        <Chip
-          href={link({ dir: filter.dir === 'asc' ? 'desc' : 'asc' })}
-          active={false}
-          title={filter.dir === 'asc' ? 'naik' : 'turun'}
-        >
-          {filter.dir === 'asc' ? '↑' : '↓'}
-        </Chip>
-      </ChipGroup>
+    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+      <UrlChoice
+        label="Marketplace"
+        param="marketplace"
+        value={filter.marketplace ?? 'all'}
+        options={[
+          { value: 'all', label: 'Semua marketplace' },
+          { value: 'shopee', label: 'Shopee' },
+          { value: 'tokopedia', label: 'Tokopedia' },
+        ]}
+      />
+      <UrlChoice
+        label="Posisi"
+        param="stance"
+        value={filter.stance}
+        options={[
+          { value: 'any', label: 'Semua produk' },
+          { value: 'over', label: 'Kemahalan', hint: 'ada yang menjual lebih murah' },
+          { value: 'under', label: 'Termurah', hint: 'tidak ada yang di bawah kita' },
+          { value: 'equal', label: 'Sama persis' },
+        ]}
+      />
+      <UrlChoice
+        label="Pencocokan"
+        param="matched"
+        value={filter.matched}
+        options={[
+          { value: 'any', label: 'Semua' },
+          { value: 'set', label: 'Nomor set', hint: 'pasangan pasti' },
+          { value: 'name', label: 'Via nama', hint: 'kemiripan judul, lebih lemah' },
+          { value: 'none', label: 'Belum ada lawan', hint: 'daftar kerja scraping' },
+        ]}
+      />
+      <UrlChoice
+        label="Selisih ekstrem"
+        param="extreme"
+        value={filter.extreme}
+        options={[
+          { value: 'hide', label: 'Sembunyikan', hint: 'di luar ±100%, biasanya beda kemasan' },
+          { value: 'show', label: 'Tampilkan' },
+        ]}
+      />
+      <UrlChoice
+        label="Urutkan"
+        param="sort"
+        value={filter.sort}
+        options={[
+          { value: 'gap', label: 'Selisih terbesar' },
+          { value: 'position', label: 'Posisi' },
+          { value: 'rivals', label: 'Jumlah lawan' },
+          { value: 'price', label: 'Harga kita' },
+          { value: 'name', label: 'Nama produk' },
+        ]}
+      />
     </div>
-  );
-}
-
-function ChipGroup({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="flex items-center gap-2">
-      <span className="text-xs font-medium tracking-wide text-muted uppercase">{label}</span>
-      <div className="flex flex-wrap gap-1.5">{children}</div>
-    </div>
-  );
-}
-
-function Chip({
-  href,
-  active,
-  title,
-  children,
-}: {
-  href: string;
-  active: boolean;
-  title?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <Link
-      href={href}
-      title={title}
-      aria-current={active ? 'true' : undefined}
-      className={cn(
-        'rounded-md border px-2.5 py-1 text-sm transition-colors',
-        active
-          ? 'border-accent/25 bg-accent/10 font-medium text-accent'
-          : 'border-line bg-surface text-muted hover:text-foreground',
-      )}
-    >
-      {children}
-    </Link>
   );
 }
 

@@ -1,5 +1,6 @@
 export { Badge, type BadgeVariant } from './Badge';
 export { Card, CardContent, CardHeader, CardTitle } from './Card';
+export { Choice, type ChoiceOption } from './Choice';
 export { cn, type ClassValue } from './cn';
 export { Input, Select } from './Input';
 export { Pagination } from './Pagination';

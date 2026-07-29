@@ -2,8 +2,6 @@ import type { Metadata, Viewport } from 'next';
 import { Geist, Geist_Mono } from 'next/font/google';
 import type { ReactNode } from 'react';
 
-import { Nav } from '@/components/Nav';
-
 import { Providers } from './providers';
 import './globals.css';
 
@@ -21,12 +19,15 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: {
-    default: 'Ecom Scraper',
-    template: '%s · Ecom Scraper',
+    // The full name is long, so it lives in the topbar and in the tab title,
+    // while the rail wears the short mark. A sidebar entry reading "Market
+    // Competition Landscape" would wrap to three lines and crowd the links.
+    default: 'Market Competition Landscape',
+    template: '%s · MCL',
   },
   description:
     'Pantau harga, produk, dan toko kompetitor dari hasil scraping Shopee dan Tokopedia.',
-  applicationName: 'Ecom Scraper',
+  applicationName: 'Market Competition Landscape',
   // An internal tool pointed at a local database; nothing here belongs in an index.
   robots: { index: false, follow: false },
 };
@@ -48,21 +49,9 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         >
           Lewati ke konten
         </a>
-        <Providers>
-          {/* Stacked below `lg`, where `Nav` renders a bar and a drawer; a rail
-              beside the content above it. `min-w-0` on the content column stops
-              a wide product table from stretching the row and pushing the rail
-              off-screen. */}
-          <div className="flex min-h-screen flex-col lg:flex-row">
-            <Nav />
-            <main
-              id="konten"
-              className="mx-auto w-full max-w-[96rem] min-w-0 flex-1 px-4 py-6 sm:px-6"
-            >
-              {children}
-            </main>
-          </div>
-        </Providers>
+        {/* The shell — rail, topbar, and the auth gate around them — belongs to
+            the (app) route group, so the login screen can render without one. */}
+        <Providers>{children}</Providers>
       </body>
     </html>
   );
