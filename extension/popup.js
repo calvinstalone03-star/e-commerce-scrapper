@@ -101,6 +101,21 @@ async function refresh() {
     ? '•••••••• tersimpan'
     : 'dari: ecom-scraper serve';
 
+  // A run the worker lost — MV3 evicted it, or the tab went away mid-walk. The
+  // database already holds every page it filed, so this offers the rest rather
+  // than the whole thing again.
+  if (context.resume && !context.job?.running) {
+    const what = context.resume.shopInput
+      ? `toko "${context.resume.shopInput}"`
+      : `"${context.resume.keyword}"`;
+    $('rtext').textContent =
+      `Scrape ${what} berhenti di halaman ${context.resume.page} ` +
+      `(${context.resume.unique}/${context.resume.target} produk).`;
+    $('resume').classList.add('on');
+  } else {
+    $('resume').classList.remove('on');
+  }
+
   if (context.stats) {
     $('tproducts').textContent = context.stats.products ?? '–';
     $('tsnapshots').textContent = context.stats.snapshots ?? '–';
@@ -148,6 +163,13 @@ for (const id of ['keyword', 'shop', 'target']) {
     if (event.key === 'Enter' && !running) start();
   });
 }
+
+$('rgo').addEventListener('click', async () => {
+  $('resume').classList.remove('on');
+  setResult('melanjutkan scrape…');
+  const answer = await chrome.runtime.sendMessage({ type: 'resume' });
+  if (!answer?.ok) setResult(answer?.error || 'gagal melanjutkan', 'bad');
+});
 
 $('gear').addEventListener('click', () => {
   $('settings').classList.toggle('open');

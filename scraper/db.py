@@ -17,6 +17,7 @@ Canonical Postgres schema
         location       text,
         follower_count int,
         rating_star    numeric,
+        is_own         boolean      not null default false,
         first_seen     timestamptz,
         last_seen      timestamptz,
         unique (marketplace, shop_id)          -- uq_stores_marketplace_shop_id
@@ -31,6 +32,7 @@ Canonical Postgres schema
         url          text,
         image        text,
         category     text,
+        set_code     text,                     -- ix_products_set_code (partial)
         first_seen   timestamptz,
         last_seen    timestamptz,
         unique (marketplace, item_id)          -- uq_products_marketplace_item_id
@@ -89,6 +91,7 @@ from pathlib import Path
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -97,6 +100,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    text,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import (
@@ -143,6 +147,10 @@ class StoreRow(Base):
     location: Mapped[str | None] = mapped_column(Text)
     follower_count: Mapped[int | None] = mapped_column(Integer)
     rating_star: Mapped[Decimal | None] = mapped_column(Numeric)
+    #: Whether we sell from this shop. Set by ``ecom-scraper own-shop``, never by
+    #: a scrape: the marketplace has no idea which seller is us, and an ingest
+    #: that guessed would make every price comparison meaningless.
+    is_own: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -165,6 +173,9 @@ class ProductRow(Base):
     url: Mapped[str | None] = mapped_column(Text)
     image: Mapped[str | None] = mapped_column(Text)
     category: Mapped[str | None] = mapped_column(Text)
+    #: LEGO set number read out of ``name`` by :mod:`scraper.set_code`. Two rows
+    #: sharing one are the same box, which is what the price comparison joins on.
+    set_code: Mapped[str | None] = mapped_column(Text)
     first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

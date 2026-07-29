@@ -101,6 +101,81 @@ export const pricePointSchema = z.object({
 });
 export type PricePoint = z.infer<typeof pricePointSchema>;
 
+/**
+ * How a competitor listing was tied to one of ours.
+ *
+ * `set` is the LEGO set number both titles carry — the same box, whatever words
+ * surround it. `name` is trigram similarity, used only for listings with no set
+ * number in them at all, and surfaced separately in the UI because it is the
+ * weaker claim: one wrong pairing shown as confidently as a set match would put
+ * every row in doubt.
+ */
+export const matchKindSchema = z.enum(['set', 'name']);
+export type MatchKind = z.infer<typeof matchKindSchema>;
+
+/** One of our products, with where its price sits among the competition. */
+export const pricePositionRowSchema = z.object({
+  id: z.number().int(),
+  marketplace: marketplaceSchema,
+  name: z.string().nullable(),
+  url: z.string().nullable(),
+  image: z.string().nullable(),
+  setCode: z.string().nullable(),
+  price: moneySchema,
+  scrapedAt: timestampSchema,
+  matchKind: matchKindSchema.nullable(),
+  rivals: z.coerce.number().int().default(0),
+  cheapestPrice: moneySchema,
+  cheapestStore: z.string().nullable(),
+  cheapestMarketplace: marketplaceSchema.nullable(),
+  dearestPrice: moneySchema,
+  /** 1 means nobody undercuts us. Null when there is nothing to rank against. */
+  position: z.coerce.number().int().nullable(),
+  /** Our price against the cheapest rival, in percent. Positive means dearer. */
+  gapPercent: z.coerce.number().nullable(),
+});
+export type PricePositionRow = z.infer<typeof pricePositionRowSchema>;
+
+/** A competitor listing on the detail screen. */
+export const rivalRowSchema = z.object({
+  id: z.number().int(),
+  marketplace: marketplaceSchema,
+  name: z.string().nullable(),
+  url: z.string().nullable(),
+  setCode: z.string().nullable(),
+  storeId: z.number().int().nullable(),
+  storeUsername: z.string().nullable(),
+  storeName: z.string().nullable(),
+  price: moneySchema,
+  sold: z.coerce.number().int().nullable(),
+  ratingStar: moneySchema,
+  scrapedAt: timestampSchema,
+  matchKind: matchKindSchema,
+  /** Trigram score, present only for name matches — the reason to distrust one. */
+  similarity: z.coerce.number().nullable(),
+});
+export type RivalRow = z.infer<typeof rivalRowSchema>;
+
+/** A shop marked as ours by `ecom-scraper own-shop`. */
+export const ownShopSchema = z.object({
+  id: z.number().int(),
+  marketplace: marketplaceSchema,
+  username: z.string(),
+  name: z.string().nullable(),
+  products: z.coerce.number().int(),
+});
+export type OwnShop = z.infer<typeof ownShopSchema>;
+
+/** Headline counts for the price-position screen, over the whole catalogue. */
+export const pricePositionSummarySchema = z.object({
+  products: z.coerce.number().int(),
+  matched: z.coerce.number().int(),
+  cheapest: z.coerce.number().int(),
+  overpriced: z.coerce.number().int(),
+  withoutSetCode: z.coerce.number().int(),
+});
+export type PricePositionSummary = z.infer<typeof pricePositionSummarySchema>;
+
 export const overviewSchema = z.object({
   stores: z.coerce.number().int(),
   products: z.coerce.number().int(),
@@ -148,6 +223,27 @@ export const productFilterSchema = z.object({
   pageSize: intFromQuery.min(1).max(200).default(50).catch(50),
 });
 export type ProductFilter = z.infer<typeof productFilterSchema>;
+
+/**
+ * Filters for the price-position screen.
+ *
+ * `matched: 'none'` is not a nag — it is the scraping worklist. Those are the
+ * products nobody has been scraped against yet, and they are the reason to run
+ * another competitor's catalogue.
+ */
+export const pricePositionFilterSchema = z.object({
+  q: z.string().trim().max(200).optional().catch(undefined),
+  /** 'over' = we are dearer than the cheapest rival, 'under' = we undercut it. */
+  stance: z.enum(['any', 'over', 'under', 'equal']).default('any').catch('any'),
+  matched: z.enum(['any', 'set', 'name', 'none']).default('any').catch('any'),
+  minRivals: intFromQuery.nonnegative().max(50).optional().catch(undefined),
+  marketplace: marketplaceSchema.optional().catch(undefined),
+  sort: z.enum(['gap', 'position', 'rivals', 'price', 'name']).default('gap').catch('gap'),
+  dir: sortDirSchema.default('desc').catch('desc'),
+  page: intFromQuery.min(1).default(1).catch(1),
+  pageSize: intFromQuery.min(1).max(200).default(50).catch(50),
+});
+export type PricePositionFilter = z.infer<typeof pricePositionFilterSchema>;
 
 export const storeFilterSchema = z.object({
   q: z.string().trim().max(200).optional().catch(undefined),

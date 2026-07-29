@@ -1515,6 +1515,155 @@ def stats(
     console.print(changes)
 
 
+@app.command("own-shop")
+def own_shop(
+    marketplace: Marketplace | None = typer.Argument(
+        None, help="Which marketplace the shop is on."
+    ),
+    username: str | None = typer.Argument(
+        None, help="Shop slug, e.g. i_bricks. Omit both to list the shops already marked."
+    ),
+    unset: bool = typer.Option(False, "--unset", help="Clear the flag instead of setting it."),
+) -> None:
+    """Mark a shop as one of ours, so the dashboard can price against the rest.
+
+    The marketplace has no idea which seller is us, and no scrape can work it
+    out — which is exactly why this is an operator command and a stored column
+    rather than something inferred. Everything the price-position screen says
+    ("my price", "cheapest competitor") is relative to this flag.
+
+    The shop has to have been scraped at least once; there is nothing to mark
+    otherwise. Run a shop-mode scrape first, then this.
+
+    Raises:
+        typer.Exit: Code 2 if Postgres is unreachable or the shop is unknown.
+    """
+    from sqlalchemy import func, select, update
+
+    from scraper import db
+    from scraper.db import StoreRow
+
+    settings = _settings()
+    dsn = _safe_dsn(settings.database_url)
+
+    try:
+        with db.session_scope(settings.database_url) as session:
+            if username is None:
+                rows = session.execute(
+                    select(StoreRow.marketplace, StoreRow.username, StoreRow.name)
+                    .where(StoreRow.is_own.is_(True))
+                    .order_by(StoreRow.marketplace, StoreRow.username)
+                ).all()
+                table = Table(title="our shops", header_style="bold")
+                table.add_column("marketplace")
+                table.add_column("username")
+                table.add_column("name")
+                for row in rows:
+                    table.add_row(row.marketplace, row.username, row.name or "-")
+                if not rows:
+                    table.add_row("-", "-", "none marked yet")
+                console.print(table)
+                return
+
+            if marketplace is None:
+                _fail("say which marketplace the shop is on: ecom-scraper own-shop shopee <slug>")
+                return
+
+            slug = username.strip().lstrip("@")
+            result = session.execute(
+                update(StoreRow)
+                .where(
+                    StoreRow.marketplace == marketplace.value,
+                    func.lower(StoreRow.username) == slug.lower(),
+                )
+                .values(is_own=not unset)
+                .returning(StoreRow.username, StoreRow.name)
+            ).all()
+
+            if not result:
+                _fail(
+                    f"no {marketplace.value} shop called {slug!r} in {dsn} — "
+                    "scrape it once first, then mark it"
+                )
+                return
+
+            verb = "no longer ours" if unset else "ours"
+            for row in result:
+                console.print(f"[green]{row.username}[/green] ({row.name or 'no name'}) is {verb}.")
+    except typer.Exit:
+        raise
+    except Exception as exc:  # noqa: BLE001 — every failure here is operator-fixable
+        _fail(f"could not reach {dsn}: {exc}")
+
+
+@app.command("backfill-set-codes")
+def backfill_set_codes(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would change without writing."
+    ),
+) -> None:
+    """Recompute ``products.set_code`` from every stored product name.
+
+    The extraction rules in :mod:`scraper.set_code` are a running argument with
+    how sellers write titles, and they will be tuned again. This is what makes
+    tuning cheap: the names are already stored, so a rule change costs one pass
+    over the table rather than a re-scrape of every shop.
+
+    Raises:
+        typer.Exit: Code 2 if Postgres is unreachable.
+    """
+    from sqlalchemy import select
+
+    from scraper import db
+    from scraper.db import ProductRow
+    from scraper.set_code import extract_set_code
+
+    settings = _settings()
+    dsn = _safe_dsn(settings.database_url)
+
+    changed = 0
+    cleared = 0
+    filled = 0
+    total = 0
+
+    try:
+        with db.session_scope(settings.database_url) as session:
+            rows = session.execute(select(ProductRow.id, ProductRow.name, ProductRow.set_code)).all()
+            for row in rows:
+                total += 1
+                fresh = extract_set_code(row.name)
+                if fresh == row.set_code:
+                    continue
+                changed += 1
+                if fresh is None:
+                    cleared += 1
+                elif row.set_code is None:
+                    filled += 1
+                if not dry_run:
+                    session.execute(
+                        ProductRow.__table__.update()
+                        .where(ProductRow.id == row.id)
+                        .values(set_code=fresh)
+                    )
+            if dry_run:
+                session.rollback()
+    except Exception as exc:  # noqa: BLE001 — every failure here is operator-fixable
+        _fail(f"could not reach {dsn}: {exc}")
+        return
+
+    table = Table(title="set codes", header_style="bold")
+    table.add_column("products", justify="right")
+    table.add_column("changed", justify="right")
+    table.add_column("newly matched", justify="right")
+    table.add_column("cleared", justify="right")
+    table.add_row(str(total), str(changed), str(filled), str(cleared))
+    console.print(table)
+    if dry_run:
+        console.print("[yellow]dry run — nothing written.[/yellow]")
+    else:
+        console.print(f"[green]{changed} product(s) updated.[/green]")
+
+
 def main() -> None:
     """Console-script entrypoint declared in ``pyproject.toml``.
 

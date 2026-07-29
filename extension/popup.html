@@ -89,6 +89,28 @@
       }
       button.primary:disabled { opacity: 0.45; cursor: default; }
       button.primary.stop { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+      /* Offered, not urged: continuing an interrupted walk is usually right, but
+         a run left half-finished on purpose must not look like an error. */
+      #resume {
+        display: none;
+        margin-top: 9px;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+      #resume.on { display: block; }
+      #resume button {
+        margin-top: 6px;
+        padding: 5px 10px;
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        background: transparent;
+        color: var(--fg);
+        font: inherit;
+        cursor: pointer;
+      }
       #result { margin-top: 10px; min-height: 32px; font-size: 12px; }
       .ok { color: var(--ok); }
       .bad { color: var(--bad); }
@@ -161,6 +183,11 @@
     </div>
 
     <button class="primary" id="scrape">Mulai scrape</button>
+
+    <div id="resume">
+      <span id="rtext">—</span>
+      <button id="rgo">Lanjutkan</button>
+    </div>
 
     <div id="progress">
       <span id="ptext">—</span>

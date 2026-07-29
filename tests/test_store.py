@@ -429,6 +429,36 @@ def test_upsert_product_is_idempotent_and_advances_last_seen(session):
     assert row.item_id == 2698631224
 
 
+def test_upsert_product_derives_the_set_code_from_the_name(session):
+    """The set number is read on the way in, so a match needs no second pass."""
+    shop_ref = upsert_store(session, make_store(), now=T0)
+    upsert_product(
+        session,
+        make_product(name="LEGO Technic 42218 John Deere 9RX (1078 Pieces)"),
+        shop_ref,
+        now=T0,
+    )
+
+    row = row_of(session, ProductRow)
+    assert row.set_code == "42218", "the piece count must not be mistaken for the set"
+
+
+def test_upsert_product_follows_the_name_when_it_changes(session):
+    """A retitled listing gets a fresh set code, including none at all.
+
+    COALESCE semantics would be wrong here, unlike for its neighbours: a seller
+    who rewrites "LEGO 42218 John Deere" as "Mainan Balok Traktor" is no longer
+    selling that set under that listing, and a stale 42218 would go on matching
+    it against every competitor's 42218 forever.
+    """
+    shop_ref = upsert_store(session, make_store(), now=T0)
+    upsert_product(session, make_product(name="LEGO Technic 42218 John Deere"), shop_ref, now=T0)
+    upsert_product(session, make_product(name="Mainan Balok Traktor Besar"), shop_ref, now=T1)
+
+    row = row_of(session, ProductRow)
+    assert row.set_code is None
+
+
 def test_upsert_product_stores_shop_ref_not_marketplace_shop_id(session):
     """products.shop_ref is OUR stores.id, never the marketplace's shop_id."""
     shop_ref = upsert_store(session, make_store(), now=T0)

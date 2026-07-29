@@ -35,10 +35,20 @@ const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787';
 //: default behaviour close to what the button used to do.
 const DEFAULT_TARGET = 60;
 
-//: Hard ceiling on pages per job, whatever the target. Both sites stop returning
-//: fresh results long before this; it exists so a bad stop condition cannot turn
-//: a click into an unbounded crawl.
-const MAX_PAGES = 30;
+//: Hard ceiling on pages per job, whatever the target. It exists so a bad stop
+//: condition cannot turn a click into an unbounded crawl — not to decide how
+//: much a job collects, which is what a flat 30 quietly did: a catalogue run
+//: asking for 1600 products stopped at whatever 30 pages held, reported it as a
+//: finished run, and looked for all the world like the shop had nothing more.
+const MAX_PAGES_CEILING = 200;
+
+//: Pages a job may walk, from what it was asked for. Twenty per page is the
+//: pessimistic end of what both sites render, so this errs towards allowing the
+//: run to finish rather than cutting it short.
+function pageBudget(target) {
+  if (!Number.isFinite(target) || target > 1e9) return MAX_PAGES_CEILING;
+  return Math.min(MAX_PAGES_CEILING, Math.max(30, Math.ceil(target / 20)));
+}
 
 //: Pause between page loads. A person clicking through results does not do it in
 //: 200ms, and neither should this.
@@ -654,7 +664,72 @@ async function resolveShop(tabId, site, slugs) {
   return null;
 }
 
-async function runJob(tabId, site) {
+//: Where an interrupted job leaves its place. A run of 1600 products is the
+//: better part of an hour, and until this existed all of it lived in a service
+//: worker MV3 is free to tear down — one eviction and the whole walk started
+//: over. What is stored is the address of the page it had reached and the keys
+//: it had already filed, which is everything needed to carry on without
+//: re-reading a single page.
+const RESUME_KEY = 'resume';
+
+//: How long a saved place is worth offering. Prices move, and continuing a
+//: two-day-old walk would file today's page 40 next to Monday's page 1 as if
+//: they were one reading.
+const RESUME_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+
+async function saveResume(state) {
+  if (!job) return;
+  try {
+    await chrome.storage.local.set({
+      [RESUME_KEY]: {
+        keyword: job.keyword,
+        shopInput: job.shopInput,
+        mode: job.mode,
+        target: job.target,
+        slug: job.slug,
+        shop: state.shop,
+        template: state.template,
+        tokens: state.tokens,
+        // Pages finished, which is the index the next one starts at.
+        page: job.pagesDone,
+        unique: job.unique,
+        stored: job.stored,
+        unchanged: job.unchanged,
+        skipped: job.skipped,
+        filtered: job.filtered,
+        seen: [...state.seen],
+        savedAt: Date.now(),
+      },
+    });
+  } catch (err) {
+    /* storage full or unavailable: the run continues, it just cannot be resumed */
+  }
+}
+
+async function clearResume() {
+  try {
+    await chrome.storage.local.remove(RESUME_KEY);
+  } catch (err) {
+    /* nothing stored */
+  }
+}
+
+async function getResume() {
+  try {
+    const stored = await chrome.storage.local.get([RESUME_KEY]);
+    const resume = stored[RESUME_KEY];
+    if (!resume || !resume.template) return null;
+    if (Date.now() - (resume.savedAt || 0) > RESUME_MAX_AGE_MS) return null;
+    // A job that finished has nothing left to resume, and one that never got
+    // past its first page is cheaper to restart than to explain.
+    if (!resume.page || resume.unique >= resume.target) return null;
+    return resume;
+  } catch (err) {
+    return null;
+  }
+}
+
+async function runJob(tabId, site, resume = null) {
   const seen = new Set();
   // Words every product name has to contain, when this job is the one doing the
   // matching. It is not, when the site's own in-shop search answered: a search
@@ -668,7 +743,18 @@ async function runJob(tabId, site) {
   let shop = null; // { slug, shopKey, name, username } once a storefront answered
   let template = null; // the URL page 1 came from, paged through for the rest
 
-  if (job.mode === 'shop') {
+  // Carrying on where a torn-down worker stopped: the shop is already resolved
+  // and the address already known, so the storefront walk that opens a shop run
+  // is skipped entirely and the first page read is the one after the last one
+  // filed.
+  let startIndex = 0;
+  if (resume) {
+    shop = resume.shop || null;
+    template = resume.template;
+    tokens = resume.tokens || [];
+    startIndex = resume.page;
+    for (const key of resume.seen || []) seen.add(key);
+  } else if (job.mode === 'shop') {
     const slugs = globalThis.ecomShopSlugs(site, job.shopInput);
     const resolved = await resolveShop(tabId, site, slugs);
     if (!resolved) {
@@ -689,7 +775,9 @@ async function runJob(tabId, site) {
     pending = resolved.page;
   }
 
-  for (let index = 0; index < MAX_PAGES; index += 1) {
+  const maxPages = pageBudget(job.target);
+
+  for (let index = startIndex; index < startIndex + maxPages; index += 1) {
     if (job.cancelled) break;
 
     job.page = index + 1;
@@ -792,6 +880,11 @@ async function runJob(tabId, site) {
     job.pagesDone += 1;
     broadcast();
 
+    // Written after the page is filed rather than before it is read, so a saved
+    // place always points at work already in the database. Resuming can then
+    // only ever re-read a page, never skip one.
+    if (job.mode !== 'page') await saveResume({ shop, template, tokens, seen });
+
     if (job.mode === 'page') break; // a single page is the whole job
     if (job.unique >= job.target) break;
 
@@ -813,7 +906,7 @@ async function runJob(tabId, site) {
   }
 }
 
-async function startJob({ keyword, shop, target }) {
+async function startJob({ keyword, shop, target }, resume = null) {
   if (job?.running) return { ok: false, error: 'masih ada scrape yang berjalan' };
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -849,23 +942,51 @@ async function startJob({ keyword, shop, target }) {
   await chrome.storage.local.set({ [PREFS_KEY]: { target: capped, shop: shopInput } });
 
   job = newJob(term, mode === 'page' ? Number.MAX_SAFE_INTEGER : capped, mode, shopInput);
+  if (resume) {
+    // Carry the counts across so the popup keeps reporting the run, not the
+    // fragment of it that happens to be running now.
+    job.slug = resume.slug || null;
+    job.unique = resume.unique || 0;
+    job.stored = resume.stored || 0;
+    job.unchanged = resume.unchanged || 0;
+    job.skipped = resume.skipped || 0;
+    job.filtered = resume.filtered || 0;
+    job.pagesDone = resume.page || 0;
+  } else {
+    // A new run replaces any saved place: two jobs sharing one is how a resume
+    // ends up continuing the wrong walk.
+    await clearResume();
+  }
   broadcast();
   startKeepAlive();
 
   (async () => {
     try {
-      await runJob(tab.id, site);
+      await runJob(tab.id, site, resume);
     } catch (err) {
       job.error = String(err?.message || err);
     } finally {
       job.running = false;
       job.status = job.cancelled ? 'dibatalkan' : 'selesai';
+      // A run that reached its target or ran out of results has nowhere left to
+      // continue from. One that stopped on an error or a cancel does, and that
+      // is exactly when the saved place earns its keep.
+      if (!job.error && !job.cancelled) await clearResume();
       stopKeepAlive();
       broadcast();
     }
   })();
 
   return { ok: true };
+}
+
+async function resumeJob() {
+  const resume = await getResume();
+  if (!resume) return { ok: false, error: 'tidak ada scrape yang bisa dilanjutkan' };
+  return startJob(
+    { keyword: resume.keyword, shop: resume.shopInput, target: resume.target },
+    resume,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -877,6 +998,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     // Answer as soon as the job is accepted, not when it finishes. A job
     // outlives the popup; a response that waited for it would never arrive.
     startJob(message).then(sendResponse);
+    return true;
+  }
+
+  if (message?.type === 'resume') {
+    resumeJob().then(sendResponse);
     return true;
   }
 
@@ -921,6 +1047,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         /* not a shop page */
       }
 
+      // An interrupted run is offered rather than restarted: the tab it walked
+      // may be showing something else entirely by now, and continuing is the
+      // user's call, not a decision to make on their behalf while they were
+      // away.
+      const resume = job?.running ? null : await getResume();
+
       sendResponse({
         endpoint,
         hasToken: Boolean(token),
@@ -930,6 +1062,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         target: prefs.target,
         stats,
         job: snapshot(),
+        resume: resume
+          ? {
+              shopInput: resume.shopInput,
+              keyword: resume.keyword,
+              unique: resume.unique,
+              target: resume.target,
+              page: resume.page,
+            }
+          : null,
       });
     })();
     return true;

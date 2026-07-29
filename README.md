@@ -447,6 +447,54 @@ JOIN LATERAL (
 ) ps ON true;
 ```
 
+## 6. Price against the competition
+
+The dashboard's **Posisi harga** screen answers one question over a whole
+catalogue: which of our prices is somebody else beating, and by how much. Two
+things have to be true before it can.
+
+**Say which shop is ours.** The marketplace does not record it and no scrape can
+work it out, so it is an operator decision and a stored column rather than
+something inferred:
+
+```bash
+ecom-scraper own-shop shopee i_bricks   # mark it
+ecom-scraper own-shop                   # list what is marked
+ecom-scraper own-shop shopee i_bricks --unset
+```
+
+The shop has to have been scraped once first — there is nothing to mark
+otherwise.
+
+**Scrape the competition.** Any shop-mode run will do; the comparison happens in
+the database afterwards, so the cost of scraping does not grow with the number
+of products we sell.
+
+Listings are paired on the **LEGO set number** carried in the title, extracted on
+the way in by `scraper/set_code.py`. Two listings sharing one are the same box
+whatever words surround it, which is the one thing trigram similarity cannot
+manage: `42217` and `42218` score 0.86 against each other and are different
+products. Titles carrying no set number — accessories, bundles, knock-offs —
+fall back to trigram similarity at 0.45, and the dashboard marks those rows as
+the weaker match they are.
+
+The extraction rules are an argument with how sellers write titles, and they will
+be tuned again. That is cheap, because the names are already stored:
+
+```bash
+ecom-scraper backfill-set-codes --dry-run   # what would change
+ecom-scraper backfill-set-codes             # recompute the column
+```
+
+```
+                   set codes
+┏━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━┓
+┃ products ┃ changed ┃ newly matched ┃ cleared ┃
+┡━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━┩
+│       70 │      45 │            45 │       0 │
+└──────────┴─────────┴───────────────┴─────────┘
+```
+
 ## Exit codes
 
 | Code | Meaning |
@@ -587,3 +635,18 @@ local Postgres when one is reachable — set `TEST_DATABASE_URL` to point it
 somewhere (default `postgresql://calvin@127.0.0.1:5432/ecom_scraper_test`). Those
 tests skip cleanly when Postgres is unavailable, and they only ever touch rows
 they created themselves, so they are safe to run against a shared test database.
+
+The dashboard's price comparison is tested where it lives — in SQL, against the
+same scratch database:
+
+```bash
+cd dashboard && npm test
+```
+
+Those cases are built as traps rather than happy paths: a set number one digit
+away from ours, our own second shop sitting in the rival pool, a title close
+enough to be tempting and not close enough to be right. A mocked database would
+only prove the query string was assembled; what can actually go wrong here is a
+join quietly pairing the wrong listings, and only Postgres can tell us that.
+**These tests truncate their tables**, so `ECOM_SCRAPER_TEST_DATABASE_URL` must
+never point at the real database.

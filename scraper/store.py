@@ -28,7 +28,7 @@ import logging
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import func, insert, select
+from sqlalchemy import case, func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -49,6 +49,7 @@ from scraper.models import (
     Store,
     utcnow,
 )
+from scraper.set_code import extract_set_code
 
 __all__ = [
     "upsert_store",
@@ -191,6 +192,11 @@ def upsert_product(
         url=product.url,
         image=product.image,
         category=product.category,
+        # Derived from the name on the way in rather than at query time. See
+        # scraper/set_code.py for why the rules live in Python; the effect here
+        # is that a listing can be matched on its set number the moment it is
+        # stored, with no second pass required.
+        set_code=extract_set_code(product.name),
         first_seen=ts,
         last_seen=ts,
     )
@@ -205,6 +211,16 @@ def upsert_product(
             "url": func.coalesce(stmt.excluded.url, table.c.url),
             "image": func.coalesce(stmt.excluded.image, table.c.image),
             "category": func.coalesce(stmt.excluded.category, table.c.category),
+            # set_code follows the name rather than COALESCEing like its
+            # neighbours. A seller who edits "LEGO 42218 John Deere" down to
+            # "Mainan Balok Traktor" no longer sells that set under that
+            # listing, and keeping the old number would go on matching it
+            # against competitors' 42218 forever. A payload with no name at all
+            # says nothing either way, so the stored code survives that.
+            "set_code": case(
+                (stmt.excluded.name.is_(None), table.c.set_code),
+                else_=stmt.excluded.set_code,
+            ),
             # first_seen intentionally omitted — insert-only.
             "last_seen": stmt.excluded.last_seen,
         },

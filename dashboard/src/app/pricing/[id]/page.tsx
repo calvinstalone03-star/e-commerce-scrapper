@@ -1,0 +1,256 @@
+import type { Metadata } from 'next';
+import Link from 'next/link';
+import { notFound } from 'next/navigation';
+
+import { PriceChart } from '@/components/PriceChart';
+import { ProductImage } from '@/components/ProductImage';
+import { Badge, Card, CardContent, CardHeader, CardTitle, Stat, TBody, TD, TH, THead, TR, Table } from '@/components/ui';
+import {
+  MARKETPLACE_LABELS,
+  formatDateTime,
+  formatPrice,
+  formatRating,
+  formatSold,
+  formatStoreName,
+} from '@/lib/format';
+import { getPriceHistory, getPricePositionDetail } from '@/lib/queries';
+
+/**
+ * One of our products against every rival tied to it.
+ *
+ * The worklist answers "which price do I need to look at"; this answers "and
+ * what am I actually up against" — who undercuts us, by how much, and whether
+ * they are shifting stock at that price, which is what makes a lower number
+ * worth reacting to rather than ignoring.
+ */
+
+export const dynamic = 'force-dynamic';
+
+const percent = new Intl.NumberFormat('id-ID', {
+  minimumFractionDigits: 1,
+  maximumFractionDigits: 1,
+});
+
+export async function generateMetadata({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}): Promise<Metadata> {
+  const { id } = await params;
+  const detail = await getPricePositionDetail(Number(id));
+  return {
+    title: detail?.product.name ?? 'Posisi harga',
+    description: 'Harga kita dibanding penjual lain untuk produk yang sama.',
+  };
+}
+
+export default async function PricingDetailPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+  const productId = Number(id);
+  if (!Number.isInteger(productId) || productId < 1) notFound();
+
+  const detail = await getPricePositionDetail(productId);
+  if (!detail) notFound();
+
+  const { product, rivals } = detail;
+  const history = await getPriceHistory(productId);
+
+  return (
+    <div className="space-y-6">
+      <div className="text-sm">
+        <Link href="/pricing" className="text-muted underline-offset-4 hover:underline">
+          ← Semua posisi harga
+        </Link>
+      </div>
+
+      <header className="flex flex-wrap items-start gap-4">
+        {product.image ? (
+          <ProductImage src={product.image} alt={product.name} size={80} className="rounded-md" />
+        ) : null}
+        <div className="min-w-0 flex-1 space-y-1">
+          <h1 className="text-xl font-semibold tracking-tight text-foreground">
+            {product.name ?? 'Produk tanpa nama'}
+          </h1>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {product.setCode ? (
+              <Badge variant="default">set {product.setCode}</Badge>
+            ) : (
+              <Badge variant="muted">tanpa nomor set</Badge>
+            )}
+            <Badge variant={product.marketplace === 'shopee' ? 'shopee' : 'tokopedia'}>
+              {MARKETPLACE_LABELS[product.marketplace] ?? product.marketplace}
+            </Badge>
+            {product.url ? (
+              <a
+                href={product.url}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="text-sm text-accent underline-offset-4 hover:underline"
+              >
+                Buka di marketplace
+              </a>
+            ) : null}
+          </div>
+        </div>
+      </header>
+
+      <Card>
+        <CardContent className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
+          <Stat label="Harga kita" value={formatPrice(product.price)} hint={formatDateTime(product.scrapedAt)} />
+          <Stat
+            label="Termurah lawan"
+            value={rivals.length === 0 ? '–' : formatPrice(product.cheapestPrice)}
+            hint={
+              rivals.length === 0
+                ? 'belum ada pembanding'
+                : `${formatStoreName(product.cheapestStore, null)} · ${
+                    MARKETPLACE_LABELS[product.cheapestMarketplace ?? ''] ?? product.cheapestMarketplace
+                  }`
+            }
+          />
+          <Stat
+            label="Posisi"
+            value={product.position === null ? '–' : `${product.position}/${rivals.length + 1}`}
+            hint={product.position === 1 ? 'tidak ada yang lebih murah' : 'dari termurah'}
+          />
+          <Stat
+            label="Selisih"
+            value={
+              product.gapPercent === null ? (
+                '–'
+              ) : (
+                <span className={product.gapPercent > 0 ? 'text-negative' : 'text-positive'}>
+                  {product.gapPercent > 0 ? '+' : '−'}
+                  {percent.format(Math.abs(product.gapPercent))}%
+                </span>
+              )
+            }
+            hint="terhadap lawan termurah"
+          />
+        </CardContent>
+      </Card>
+
+      {product.matchKind === 'name' ? (
+        // Said outright rather than buried in a legend: every number above rests
+        // on this pairing, and a reader who does not know it was a guess cannot
+        // judge whether to trust them.
+        <p className="rounded-md border border-line bg-surface-muted px-3 py-2.5 text-sm leading-relaxed text-muted">
+          Produk ini tidak punya nomor set, jadi lawannya dicocokkan dari kemiripan nama. Periksa
+          sendiri apakah barangnya memang sama sebelum mengubah harga.
+        </p>
+      ) : null}
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Penjual lain</CardTitle>
+          <span className="text-xs text-muted">
+            {rivals.length === 0 ? 'belum ada' : `${rivals.length} produk · diurut termurah`}
+          </span>
+        </CardHeader>
+        <CardContent>
+          {rivals.length === 0 ? (
+            <p className="text-sm leading-relaxed text-muted">
+              Belum ada produk toko lain dengan {product.setCode ? `nomor set ${product.setCode}` : 'nama yang cukup mirip'}{' '}
+              di database. Scrape katalog toko kompetitor, lalu halaman ini terisi sendiri.
+            </p>
+          ) : (
+            <Table maxHeight="none">
+              <THead>
+                <TR>
+                  <TH>Toko</TH>
+                  <TH>Produk</TH>
+                  <TH className="text-right">Harga</TH>
+                  <TH className="text-right">Selisih</TH>
+                  <TH className="text-right">Terjual</TH>
+                  <TH className="text-right">Rating</TH>
+                </TR>
+              </THead>
+              <TBody>
+                {rivals.map((rival) => {
+                  const gap = gapAgainst(product.price, rival.price);
+                  return (
+                    <TR key={rival.id}>
+                      <TD>
+                        <div className="font-medium text-foreground">
+                          {formatStoreName(rival.storeUsername, rival.storeName)}
+                        </div>
+                        <Badge
+                          variant={rival.marketplace === 'shopee' ? 'shopee' : 'tokopedia'}
+                          className="mt-1"
+                        >
+                          {MARKETPLACE_LABELS[rival.marketplace] ?? rival.marketplace}
+                        </Badge>
+                      </TD>
+                      <TD>
+                        {rival.url ? (
+                          <a
+                            href={rival.url}
+                            target="_blank"
+                            rel="noreferrer noopener"
+                            className="underline-offset-4 hover:underline"
+                          >
+                            {rival.name ?? 'Produk tanpa nama'}
+                          </a>
+                        ) : (
+                          (rival.name ?? 'Produk tanpa nama')
+                        )}
+                        {rival.matchKind === 'name' ? (
+                          <Badge variant="muted" className="ml-2">
+                            ~ mirip {rival.similarity !== null ? rival.similarity : ''}
+                          </Badge>
+                        ) : null}
+                      </TD>
+                      <TD className="text-right tabular-nums">{formatPrice(rival.price)}</TD>
+                      <TD className="text-right tabular-nums">
+                        {gap === null ? (
+                          <span className="text-muted">–</span>
+                        ) : (
+                          // Framed from their side: "this seller is 12% under
+                          // us" is the sentence somebody acts on.
+                          <span className={gap < 0 ? 'text-negative' : 'text-positive'}>
+                            {gap > 0 ? '+' : '−'}
+                            {percent.format(Math.abs(gap))}%
+                          </span>
+                        )}
+                      </TD>
+                      <TD className="text-right tabular-nums">{formatSold(rival.sold)}</TD>
+                      <TD className="text-right tabular-nums">{formatRating(rival.ratingStar)}</TD>
+                    </TR>
+                  );
+                })}
+              </TBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
+      {history.length > 1 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Riwayat harga kita</CardTitle>
+            <span className="text-xs text-muted">{history.length} snapshot</span>
+          </CardHeader>
+          <CardContent>
+            <PriceChart points={history} />
+          </CardContent>
+        </Card>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * A rival's price against ours, in percent, from the rival's point of view:
+ * negative means they undercut us.
+ */
+function gapAgainst(ours: string | null, theirs: string | null): number | null {
+  if (ours === null || theirs === null) return null;
+  const mine = Number(ours);
+  const rival = Number(theirs);
+  if (!Number.isFinite(mine) || !Number.isFinite(rival) || mine === 0) return null;
+  return Math.round(((rival - mine) / mine) * 1000) / 10;
+}

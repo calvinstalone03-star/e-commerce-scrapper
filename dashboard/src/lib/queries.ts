@@ -5,15 +5,24 @@ import {
   filterOptionsSchema,
   keywordRowSchema,
   overviewSchema,
+  ownShopSchema,
   pricePointSchema,
+  pricePositionRowSchema,
+  pricePositionSummarySchema,
   productRowSchema,
+  rivalRowSchema,
   storeRowSchema,
   type FilterOptions,
   type KeywordRow,
   type Overview,
+  type OwnShop,
   type PricePoint,
+  type PricePositionFilter,
+  type PricePositionRow,
+  type PricePositionSummary,
   type ProductFilter,
   type ProductRow,
+  type RivalRow,
   type StoreFilter,
   type StoreRow,
 } from '@/lib/schemas';
@@ -334,6 +343,278 @@ export async function getKeywordComparison(keyword: string): Promise<
     maxPrice: row.maxPrice === null ? null : String(row.maxPrice),
     avgPrice: row.avgPrice === null ? null : String(row.avgPrice),
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Price position
+// ---------------------------------------------------------------------------
+
+/**
+ * How close two titles must read before they count as the same product.
+ *
+ * Only ever consulted for listings carrying no set number — accessories,
+ * bundles, the knock-offs that never print one. 0.45 is deliberately stricter
+ * than pg_trgm's own 0.3 default: at 0.3 "Mainan Balok Edukasi Anak" matches
+ * half the marketplace, and a comparison screen full of confident nonsense is
+ * worse than one that admits it has no rival to show.
+ */
+const NAME_MATCH_THRESHOLD = 0.45;
+
+/**
+ * Our products beside their rivals'.
+ *
+ * The join is on `set_code` wherever both sides have one. That is the whole
+ * design: a LEGO set number is an exact identity, so two listings sharing one
+ * are the same box no matter how differently the sellers describe it, and
+ * `42217` never matches `42218` however similar the words around them read.
+ *
+ * `%` before `similarity()` in the name fallback is not redundant — `%` is the
+ * operator the GIN trigram index answers, and it prunes the candidate set
+ * before the exact score is computed on what survives.
+ */
+const rivalMatch = sql`
+  (
+    (m.set_code IS NOT NULL AND r.set_code = m.set_code)
+    OR (
+      m.set_code IS NULL
+      AND m.name IS NOT NULL
+      AND r.name % m.name
+      AND similarity(r.name, m.name) >= ${NAME_MATCH_THRESHOLD}
+    )
+  )
+`;
+
+/** Our shops and their listings, newest price each. */
+const ourProducts = sql`
+  SELECT p.id, p.marketplace, p.name, p.url, p.image, p.set_code,
+         l.price, l.scraped_at
+  FROM products p
+  JOIN stores s ON s.id = p.shop_ref AND s.is_own
+  LEFT JOIN latest l ON l.product_ref = p.id
+`;
+
+/** Everyone else's, priced. A rival with no price cannot undercut anyone. */
+const theirProducts = sql`
+  SELECT p.id, p.marketplace, p.name, p.url, p.set_code,
+         s.id AS store_id, s.username AS store_username, s.name AS store_name,
+         l.price, l.sold, l.rating_star, l.scraped_at
+  FROM products p
+  JOIN stores s ON s.id = p.shop_ref AND NOT s.is_own
+  JOIN latest l ON l.product_ref = p.id
+  WHERE l.price IS NOT NULL
+`;
+
+/** Shops marked ours. Empty means the screen has nothing to stand on. */
+export async function getOwnShops(): Promise<OwnShop[]> {
+  const rows = await sql`
+    SELECT s.id, s.marketplace, s.username, s.name,
+           count(p.id) AS products
+    FROM stores s
+    LEFT JOIN products p ON p.shop_ref = s.id
+    WHERE s.is_own
+    GROUP BY s.id, s.marketplace, s.username, s.name
+    ORDER BY products DESC, s.username
+  `;
+  return rows.map((row) => ownShopSchema.parse(row));
+}
+
+export async function getPricePositions(
+  filter: PricePositionFilter,
+): Promise<{ rows: PricePositionRow[]; total: number }> {
+  const offset = (filter.page - 1) * filter.pageSize;
+
+  const where = sql`
+    WHERE TRUE
+    ${filter.marketplace ? sql`AND m.marketplace = ${filter.marketplace}` : sql``}
+    ${filter.q ? sql`AND (m.name ILIKE ${'%' + filter.q + '%'} OR m.set_code = ${filter.q})` : sql``}
+    ${filter.minRivals !== undefined ? sql`AND agg.rivals >= ${filter.minRivals}` : sql``}
+    ${
+      // Stated as the conditions themselves rather than against the CASE above:
+      // a SELECT alias is not visible in WHERE, and repeating the two-line rule
+      // beats wrapping the whole query in a subselect to reach the alias.
+      filter.matched === 'none'
+        ? sql`AND agg.rivals = 0`
+        : filter.matched === 'set'
+          ? sql`AND agg.rivals > 0 AND m.set_code IS NOT NULL`
+          : filter.matched === 'name'
+            ? sql`AND agg.rivals > 0 AND m.set_code IS NULL`
+            : sql``
+    }
+    ${
+      // A stance is a claim about our price against the cheapest rival, so it
+      // only means anything where both exist.
+      filter.stance === 'over'
+        ? sql`AND m.price > agg.cheapest_price`
+        : filter.stance === 'under'
+          ? sql`AND m.price < agg.cheapest_price`
+          : filter.stance === 'equal'
+            ? sql`AND m.price = agg.cheapest_price`
+            : sql``
+    }
+  `;
+
+  const direction = filter.dir === 'asc' ? sql`ASC NULLS LAST` : sql`DESC NULLS LAST`;
+  const orderBy =
+    filter.sort === 'name'
+      ? sql`ORDER BY m.name ${direction}`
+      : filter.sort === 'price'
+        ? sql`ORDER BY m.price ${direction}`
+        : filter.sort === 'rivals'
+          ? sql`ORDER BY agg.rivals ${direction}`
+          : filter.sort === 'position'
+            ? sql`ORDER BY "position" ${direction}`
+            : sql`ORDER BY "gapPercent" ${direction}`;
+
+  // `agg` is one lateral per product rather than a GROUP BY over the whole
+  // cross product: it keeps the rival scan bounded by that product's matches,
+  // and it is where the cheapest rival's identity comes from — an aggregate
+  // alone would give the price but not who charges it.
+  const body = sql`
+    WITH latest AS (${latestSnapshots}),
+    mine AS (${ourProducts}),
+    rivals AS (${theirProducts})
+    SELECT
+      m.id, m.marketplace, m.name, m.url, m.image,
+      m.set_code AS "setCode",
+      m.price,
+      m.scraped_at AS "scrapedAt",
+      -- Which rule paired this row, derived rather than aggregated: a product
+      -- with a set number was matched on it and one without it was not, so
+      -- there is nothing to count. Computing it inside the lateral made it an
+      -- aggregate over none of the lateral's own columns, which Postgres reads
+      -- as belonging to the outer query and rejects outright.
+      CASE
+        WHEN agg.rivals = 0 THEN NULL
+        WHEN m.set_code IS NOT NULL THEN 'set'
+        ELSE 'name'
+      END AS "matchKind",
+      agg.rivals,
+      agg.cheapest_price AS "cheapestPrice",
+      agg.cheapest_store AS "cheapestStore",
+      agg.cheapest_marketplace AS "cheapestMarketplace",
+      agg.dearest_price AS "dearestPrice",
+      CASE
+        WHEN m.price IS NULL OR agg.rivals = 0 THEN NULL
+        ELSE agg.cheaper_than_us + 1
+      END AS "position",
+      CASE
+        WHEN m.price IS NULL OR agg.cheapest_price IS NULL OR agg.cheapest_price = 0 THEN NULL
+        ELSE round(((m.price - agg.cheapest_price) / agg.cheapest_price) * 100, 1)
+      END AS "gapPercent"
+    FROM mine m
+    LEFT JOIN LATERAL (
+      SELECT
+        count(*)                                              AS rivals,
+        min(r.price)                                          AS cheapest_price,
+        max(r.price)                                          AS dearest_price,
+        count(*) FILTER (WHERE r.price < m.price)             AS cheaper_than_us,
+        (array_agg(r.store_username ORDER BY r.price ASC))[1] AS cheapest_store,
+        (array_agg(r.marketplace ORDER BY r.price ASC))[1]    AS cheapest_marketplace
+      FROM rivals r
+      WHERE ${rivalMatch}
+    ) agg ON TRUE
+    ${where}
+  `;
+
+  const [rows, counted] = await Promise.all([
+    sql`${body} ${orderBy} LIMIT ${filter.pageSize} OFFSET ${offset}`,
+    sql`SELECT count(*) AS total FROM (${body}) counted`,
+  ]);
+
+  return {
+    rows: rows.map((row) => pricePositionRowSchema.parse(row)),
+    total: Number(counted[0]?.total ?? 0),
+  };
+}
+
+/** Headline counts over the whole own catalogue, unfiltered. */
+export async function getPricePositionSummary(): Promise<PricePositionSummary> {
+  const rows = await sql`
+    WITH latest AS (${latestSnapshots}),
+    mine AS (${ourProducts}),
+    rivals AS (${theirProducts}),
+    scored AS (
+      SELECT
+        m.id, m.price, m.set_code,
+        agg.rivals, agg.cheapest_price
+      FROM mine m
+      LEFT JOIN LATERAL (
+        SELECT count(*) AS rivals, min(r.price) AS cheapest_price
+        FROM rivals r
+        WHERE ${rivalMatch}
+      ) agg ON TRUE
+    )
+    SELECT
+      count(*)                                                              AS products,
+      count(*) FILTER (WHERE rivals > 0)                                    AS matched,
+      count(*) FILTER (WHERE rivals > 0 AND price <= cheapest_price)        AS cheapest,
+      count(*) FILTER (WHERE rivals > 0 AND price > cheapest_price)         AS overpriced,
+      count(*) FILTER (WHERE set_code IS NULL)                              AS "withoutSetCode"
+    FROM scored
+  `;
+  return pricePositionSummarySchema.parse(rows[0]);
+}
+
+/** One of our products and every rival tied to it, dearest question first. */
+export async function getPricePositionDetail(
+  productId: number,
+): Promise<{ product: PricePositionRow; rivals: RivalRow[] } | null> {
+  const [mine] = await sql`
+    WITH latest AS (${latestSnapshots}),
+    mine AS (${ourProducts})
+    SELECT m.id, m.marketplace, m.name, m.url, m.image,
+           m.set_code AS "setCode", m.price, m.scraped_at AS "scrapedAt"
+    FROM mine m
+    WHERE m.id = ${productId}
+  `;
+  if (!mine) return null;
+
+  const rivals = await sql`
+    WITH latest AS (${latestSnapshots}),
+    mine AS (SELECT * FROM (${ourProducts}) o WHERE o.id = ${productId}),
+    rivals AS (${theirProducts})
+    SELECT r.id, r.marketplace, r.name, r.url,
+           r.set_code AS "setCode",
+           r.store_id AS "storeId",
+           r.store_username AS "storeUsername",
+           r.store_name AS "storeName",
+           r.price, r.sold, r.rating_star AS "ratingStar",
+           r.scraped_at AS "scrapedAt",
+           CASE WHEN m.set_code IS NOT NULL THEN 'set' ELSE 'name' END AS "matchKind",
+           CASE
+             WHEN m.set_code IS NOT NULL THEN NULL
+             ELSE round(similarity(r.name, m.name)::numeric, 2)
+           END AS similarity
+    FROM mine m
+    JOIN rivals r ON ${rivalMatch}
+    ORDER BY r.price ASC NULLS LAST
+  `;
+
+  const cheapest = rivals[0] ?? null;
+  const prices = rivals.map((row) => Number(row.price)).filter((value) => Number.isFinite(value));
+  const ours = mine.price === null ? null : Number(mine.price);
+  const cheapestPrice = prices.length > 0 ? Math.min(...prices) : null;
+
+  return {
+    product: pricePositionRowSchema.parse({
+      ...mine,
+      matchKind: cheapest ? cheapest.matchKind : null,
+      rivals: rivals.length,
+      cheapestPrice: cheapest?.price ?? null,
+      cheapestStore: cheapest?.storeUsername ?? null,
+      cheapestMarketplace: cheapest?.marketplace ?? null,
+      dearestPrice: prices.length > 0 ? String(Math.max(...prices)) : null,
+      position:
+        ours === null || prices.length === 0
+          ? null
+          : prices.filter((price) => price < ours).length + 1,
+      gapPercent:
+        ours === null || cheapestPrice === null || cheapestPrice === 0
+          ? null
+          : Math.round(((ours - cheapestPrice) / cheapestPrice) * 1000) / 10,
+    }),
+    rivals: rivals.map((row) => rivalRowSchema.parse(row)),
+  };
 }
 
 // ---------------------------------------------------------------------------
