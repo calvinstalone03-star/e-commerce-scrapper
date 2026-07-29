@@ -254,7 +254,15 @@ export const pricePositionFilterSchema = z.object({
   sort: z.enum(['gap', 'position', 'rivals', 'price', 'name']).default('gap').catch('gap'),
   dir: sortDirSchema.default('desc').catch('desc'),
   page: intFromQuery.min(1).default(1).catch(1),
-  pageSize: intFromQuery.min(1).max(200).default(50).catch(50),
+  /**
+   * Ten by default, not fifty.
+   *
+   * This is a worklist: the rows anyone acts on are the first few, and a
+   * catalogue of 1600 makes every extra row a row nobody reads. Larger pages
+   * stay available for scanning, capped where a single response stops being
+   * reasonable to send.
+   */
+  pageSize: intFromQuery.min(1).max(100).default(10).catch(10),
 });
 export type PricePositionFilter = z.infer<typeof pricePositionFilterSchema>;
 

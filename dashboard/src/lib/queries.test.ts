@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 
 import { sql } from '@/lib/db';
-import { getOwnShops, getPricePositionDetail, getPricePositionSummary, getPricePositions } from '@/lib/queries';
+import { getOwnShops, getPricePositionDetail, getPricePositions } from '@/lib/queries';
 import { pricePositionFilterSchema } from '@/lib/schemas';
 
 /**
@@ -257,6 +257,52 @@ describe('price position', () => {
     expect(rows.map((row) => row.setCode)).toEqual(['11024']);
   });
 
+  test('searches by name and by set number, whole or partial', async () => {
+    const mine = await addStore('i_bricks', { own: true });
+    await addProduct(mine, {
+      name: 'LEGO Technic 42218 John Deere 9RX',
+      setCode: '42218',
+      price: 1_245_000,
+    });
+    await addProduct(mine, { name: 'LEGO City 60411 Fire Rescue', setCode: '60411', price: 164_550 });
+
+    const byName = await getPricePositions(pricePositionFilterSchema.parse({ q: 'john deere' }));
+    expect(byName.rows.map((row) => row.setCode)).toEqual(['42218']);
+
+    const byCode = await getPricePositions(pricePositionFilterSchema.parse({ q: '42218' }));
+    expect(byCode.rows.map((row) => row.setCode)).toEqual(['42218']);
+
+    // Half-remembered numbers are the common case: the box is across the room.
+    const byPrefix = await getPricePositions(pricePositionFilterSchema.parse({ q: '604' }));
+    expect(byPrefix.rows.map((row) => row.setCode)).toEqual(['60411']);
+
+    const nothing = await getPricePositions(pricePositionFilterSchema.parse({ q: 'zzzz' }));
+    expect(nothing.rows).toHaveLength(0);
+    expect(nothing.total).toBe(0);
+    // The headline still describes the catalogue, not the search.
+    expect(nothing.summary.products).toBe(2);
+  });
+
+  test('pages without dropping or repeating a row', async () => {
+    const mine = await addStore('i_bricks', { own: true });
+    for (let index = 0; index < 7; index += 1) {
+      await addProduct(mine, {
+        name: `LEGO Set nomor ${index}`,
+        setCode: `1000${index}`,
+        price: 100_000 + index,
+      });
+    }
+
+    const first = await getPricePositions(pricePositionFilterSchema.parse({ pageSize: 3, page: 1 }));
+    const second = await getPricePositions(pricePositionFilterSchema.parse({ pageSize: 3, page: 2 }));
+    const third = await getPricePositions(pricePositionFilterSchema.parse({ pageSize: 3, page: 3 }));
+
+    expect(first.total).toBe(7);
+    const seen = [...first.rows, ...second.rows, ...third.rows].map((row) => row.id);
+    expect(seen).toHaveLength(7);
+    expect(new Set(seen).size).toBe(7);
+  });
+
   test('the summary counts the catalogue, not the filtered page', async () => {
     const mine = await addStore('i_bricks', { own: true });
     const rival = await addStore('brickstore');
@@ -267,7 +313,7 @@ describe('price position', () => {
     await addProduct(rival, { name: 'LEGO 60411 Fire Heli', setCode: '60411', price: 199_000 });
     await addProduct(mine, { name: 'Bundle tanpa nomor', setCode: null, price: 100_000 });
 
-    const summary = await getPricePositionSummary();
+    const { summary } = await getPricePositions(pricePositionFilterSchema.parse({}));
     expect(summary.products).toBe(3);
     expect(summary.matched).toBe(2);
     expect(summary.overpriced).toBe(1);

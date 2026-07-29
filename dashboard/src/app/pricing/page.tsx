@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { EmptyState } from '@/components/EmptyState';
 import { Badge, Card, CardContent, Stat, TBody, TD, TH, THead, TR, Table, cn } from '@/components/ui';
 import { MARKETPLACE_LABELS, formatDate, formatPrice, formatStoreName } from '@/lib/format';
-import { getOwnShops, getPricePositionSummary, getPricePositions } from '@/lib/queries';
+import { getOwnShops, getPricePositions } from '@/lib/queries';
 import { pricePositionFilterSchema, toSearchParams, type PricePositionFilter } from '@/lib/schemas';
 
 /**
@@ -70,10 +70,9 @@ export default async function PricingPage({
     );
   }
 
-  const [summary, { rows, total }] = await Promise.all([
-    getPricePositionSummary(),
-    getPricePositions(filter),
-  ]);
+  // One statement answers all three: the page, its total, and the headline
+  // counts over the whole catalogue.
+  const { rows, total, summary } = await getPricePositions(filter);
 
   const unmatched = summary.products - summary.matched;
 
@@ -110,6 +109,7 @@ export default async function PricingPage({
         </CardContent>
       </Card>
 
+      <SearchBox filter={filter} />
       <Filters filter={filter} />
 
       {rows.length === 0 ? (
@@ -245,6 +245,48 @@ function Gap({ value }: { value: number | null }) {
 }
 
 /**
+ * Search by name or set number, in one box.
+ *
+ * A plain GET form, so it works before any JavaScript runs, submits with Enter,
+ * and leaves the query in the URL where every other filter already lives. The
+ * other filters ride along as hidden fields — a search that silently cleared
+ * "hanya kemahalan" would be answering a question nobody asked.
+ */
+function SearchBox({ filter }: { filter: PricePositionFilter }) {
+  const carried = { ...filter, q: undefined, page: undefined };
+
+  return (
+    <form action="/pricing" method="get" className="flex flex-wrap items-center gap-2">
+      {[...toSearchParams(carried)].map(([key, value]) => (
+        <input key={key} type="hidden" name={key} value={value} />
+      ))}
+      <input
+        type="search"
+        name="q"
+        defaultValue={filter.q ?? ''}
+        placeholder="Cari nama produk atau nomor set — misal 42218"
+        aria-label="Cari produk"
+        className="h-9 w-full max-w-md rounded-md border border-line bg-surface px-3 text-sm text-foreground placeholder:text-muted focus:border-accent focus:outline-none"
+      />
+      <button
+        type="submit"
+        className="h-9 rounded-md border border-line bg-surface px-3 text-sm text-muted transition-colors hover:text-foreground"
+      >
+        Cari
+      </button>
+      {filter.q ? (
+        <Link
+          href={`/pricing?${toSearchParams({ ...carried })}`}
+          className="text-sm text-muted underline-offset-4 hover:underline"
+        >
+          Hapus pencarian
+        </Link>
+      ) : null}
+    </form>
+  );
+}
+
+/**
  * Filter chips.
  *
  * Each is a link that keeps the rest of the filter and resets the page — a
@@ -371,11 +413,38 @@ function PageLinks({ filter, total }: { filter: PricePositionFilter; total: numb
   const to = Math.min(filter.page * filter.pageSize, total);
 
   return (
-    <div className="flex items-center justify-between gap-4 text-sm">
-      <span className="text-muted">
-        {count.format(from)}–{count.format(to)} dari {count.format(total)} produk
-      </span>
-      <div className="flex gap-2">
+    <div className="flex flex-wrap items-center justify-between gap-4 text-sm">
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="text-muted">
+          {count.format(from)}–{count.format(to)} dari {count.format(total)} produk
+        </span>
+        {/* How many rows to a page, as links rather than a select: the page is a
+            Server Component, and a select would need a client component to do
+            what an anchor already does. */}
+        <span className="flex items-center gap-1.5 text-muted">
+          <span className="text-xs uppercase tracking-wide">baris</span>
+          {[10, 25, 50, 100].map((size) => (
+            <Link
+              key={size}
+              href={`/pricing?${toSearchParams({ ...filter, pageSize: size, page: 1 })}`}
+              aria-current={filter.pageSize === size ? 'true' : undefined}
+              className={cn(
+                'rounded px-1.5 py-0.5 tabular-nums transition-colors',
+                filter.pageSize === size
+                  ? 'bg-accent/10 font-medium text-accent'
+                  : 'hover:text-foreground',
+              )}
+            >
+              {size}
+            </Link>
+          ))}
+        </span>
+      </div>
+
+      <div className="flex items-center gap-2">
+        <span className="text-muted tabular-nums">
+          hal {count.format(filter.page)}/{count.format(pages)}
+        </span>
         {filter.page > 1 ? (
           <Link
             href={`/pricing?${toSearchParams({ ...filter, page: filter.page - 1 })}`}
