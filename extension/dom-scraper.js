@@ -224,6 +224,20 @@
     return { shopKey: String(shopKey), username: page.username, name };
   }
 
+  /**
+   * Whether a link's host is one this marketplace serves listings from.
+   *
+   * Exact match, deliberately: the site's `hosts` list matches subdomains too,
+   * because deciding "is this a Tokopedia tab" should say yes for any of them.
+   * Deciding "is this link a product" must not — the seller console and the
+   * help centre share the domain and neither sells anything.
+   */
+  function isProductHost(config, hostname) {
+    const host = String(hostname || '').toLowerCase();
+    const allowed = config.productHosts || config.hosts || [];
+    return allowed.some((candidate) => host === String(candidate).toLowerCase());
+  }
+
   function collect(config) {
     const seen = new Set();
     const items = [];
@@ -236,6 +250,16 @@
       } catch (err) {
         continue;
       }
+
+      // A link has to be to this marketplace's own storefront before its path
+      // means anything. Without this, `parseProductLink` reads the path of any
+      // absolute link on the page — and a footer link to
+      // `seller.tokopedia.com/edu/official-store/` is two segments of exactly
+      // the shape a Tokopedia product has. Two such links were filed as
+      // products, priced from whatever "Rp" the footer happened to contain,
+      // and named after a paragraph of SEO copy. They also kept the run going:
+      // a page of nothing but footer still counted as a page with new items.
+      if (!isProductHost(config, url.hostname)) continue;
 
       const keys = config.parseProductLink(url);
       if (!keys) continue;

@@ -34,6 +34,11 @@
       label: 'Shopee',
       hosts: ['shopee.co.id'],
 
+      //: Hosts a *listing* can live on, matched exactly — not `hosts`, which
+      //: matches subdomains so the extension activates on any of them.
+      //: See the Tokopedia entry for what that difference cost.
+      productHosts: ['shopee.co.id', 'www.shopee.co.id'],
+
       // Shopee numbers search pages from zero: page=0 is the first screen of
       // results, so an index maps straight through.
       searchUrl(keyword, page = 0) {
@@ -160,6 +165,13 @@
       marketplace: 'tokopedia',
       label: 'Tokopedia',
       hosts: ['tokopedia.com', 'www.tokopedia.com'],
+
+      //: Storefront hosts only, and exactly. `hosts` matches any subdomain,
+      //: which is right for deciding "is this a Tokopedia tab" and wrong for
+      //: deciding "is this link a product": `seller.tokopedia.com/edu/
+      //: official-store/` is two path segments of the right shape, and it was
+      //: stored as a product with a price scraped out of the page footer.
+      productHosts: ['tokopedia.com', 'www.tokopedia.com'],
 
       // Tokopedia numbers from one, so index 0 is page=1. Sending page=0 there
       // returns the first page anyway, but the canonical URL is what the user

@@ -580,6 +580,47 @@ def _resolve_key(value: Any) -> int | None:
     return stable_id(text)
 
 
+#: Hosts a listing can legitimately live on, per marketplace. Exact matches, not
+#: suffixes: ``seller.tokopedia.com`` and ``help.tokopedia.com`` are the same
+#: domain and neither sells anything.
+_LISTING_HOSTS: dict[Marketplace, frozenset[str]] = {
+    Marketplace.SHOPEE: frozenset({"shopee.co.id", "www.shopee.co.id"}),
+    Marketplace.TOKOPEDIA: frozenset({"tokopedia.com", "www.tokopedia.com"}),
+}
+
+
+def _is_listing_url(raw_url: object, marketplace: Marketplace) -> bool:
+    """Whether a scraped URL points at a listing on the marketplace it claims.
+
+    The extension already refuses to read a link that leaves the storefront, so
+    this is the second wall rather than the first. It exists because the first
+    one was missing for a while and the cost landed in the database: a footer
+    link to ``seller.tokopedia.com/edu/official-store/`` has the exact shape of
+    a Tokopedia product path, and it was stored as a product — with a price
+    lifted from the footer and a name lifted from a paragraph of SEO copy.
+    Cleaning that out afterwards is manual; refusing it here is not.
+
+    A missing URL is allowed through: keyword-mode entries can arrive without
+    one, and the model builds it from the ids.
+
+    Args:
+        raw_url: ``entry["url"]`` as the extension sent it, if anything.
+        marketplace: The site the page belonged to.
+
+    Returns:
+        True when the URL is absent, or on one of that marketplace's own hosts.
+    """
+    if not raw_url:
+        return True
+    try:
+        host = urlsplit(str(raw_url)).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return host.lower() in _LISTING_HOSTS.get(marketplace, frozenset())
+
+
 def _dom_entry_to_models(
     entry: dict[str, Any],
     marketplace: Marketplace = Marketplace.SHOPEE,
@@ -611,6 +652,8 @@ def _dom_entry_to_models(
         # Decimal exact instead of inheriting a float's artefacts.
         price = Decimal(str(raw_price))
         if price < 0:
+            return None
+        if not _is_listing_url(entry.get("url"), marketplace):
             return None
     except (TypeError, ValueError, InvalidOperation):
         return None

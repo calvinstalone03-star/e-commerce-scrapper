@@ -426,6 +426,58 @@ def test_dom_entry_without_a_name_or_price_is_skipped() -> None:
     assert _dom_entry_to_models(dom_item(price=-5)) is None
 
 
+@pytest.mark.parametrize(
+    ("url", "marketplace"),
+    [
+        # The two that reached the database: Tokopedia's seller console and a
+        # certification directory, both linked from the page footer, both with a
+        # path of exactly the shape a Tokopedia product has.
+        ("https://seller.tokopedia.com/edu/official-store/", Marketplace.TOKOPEDIA),
+        (
+            "https://verifeyedirectory.bsigroup.com/Profile/PT_TOK-0047786234-000",
+            Marketplace.TOKOPEDIA,
+        ),
+        ("https://help.tokopedia.com/some/article", Marketplace.TOKOPEDIA),
+        ("https://seller.shopee.co.id/portal/settings", Marketplace.SHOPEE),
+        # Right shape, wrong marketplace.
+        ("https://www.tokopedia.com/toko/produk-panjang", Marketplace.SHOPEE),
+    ],
+)
+def test_dom_entry_off_the_marketplace_is_refused(url: str, marketplace) -> None:
+    """A link that leaves the storefront is not a listing, whatever its path.
+
+    These are cheap to reject here and expensive to remove later: once stored,
+    a footer link becomes a product row, a price snapshot and a store, and it
+    takes hand-written SQL to get rid of.
+    """
+    from scraper.ingest import _dom_entry_to_models
+
+    assert _dom_entry_to_models(dom_item(url=url), marketplace) is None
+
+
+@pytest.mark.parametrize(
+    ("url", "marketplace"),
+    [
+        ("https://shopee.co.id/slug-i.30203584.111222333", Marketplace.SHOPEE),
+        ("https://www.tokopedia.com/i-bricks/lego-technic-42218", Marketplace.TOKOPEDIA),
+        ("https://tokopedia.com/i-bricks/lego-technic-42218", Marketplace.TOKOPEDIA),
+    ],
+)
+def test_dom_entry_on_the_marketplace_is_kept(url: str, marketplace) -> None:
+    from scraper.ingest import _dom_entry_to_models
+
+    assert _dom_entry_to_models(dom_item(url=url), marketplace) is not None
+
+
+def test_dom_entry_without_a_url_still_maps() -> None:
+    """Keyword-mode cards can arrive with no URL; the model builds one."""
+    from scraper.ingest import _dom_entry_to_models
+
+    entry = dom_item()
+    del entry["url"]
+    assert _dom_entry_to_models(entry) is not None
+
+
 def test_dom_entry_tolerates_missing_optional_fields() -> None:
     from scraper.ingest import _dom_entry_to_models
 
