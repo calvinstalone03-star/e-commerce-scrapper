@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 
 import { EmptyState } from '@/components/EmptyState';
+import { PricingSearch } from '@/components/PricingSearch';
 import { Badge, Card, CardContent, Stat, TBody, TD, TH, THead, TR, Table, cn } from '@/components/ui';
 import { MARKETPLACE_LABELS, formatDate, formatPrice, formatStoreName } from '@/lib/format';
 import { getOwnShops, getPricePositions } from '@/lib/queries';
@@ -247,42 +248,26 @@ function Gap({ value }: { value: number | null }) {
 /**
  * Search by name or set number, in one box.
  *
- * A plain GET form, so it works before any JavaScript runs, submits with Enter,
- * and leaves the query in the URL where every other filter already lives. The
- * other filters ride along as hidden fields — a search that silently cleared
- * "hanya kemahalan" would be answering a question nobody asked.
+ * The input is the only client component on this screen: it navigates as you
+ * type, and the server renders the results exactly as it does for a bookmark.
+ * The "clear" link stays here because it is a plain link and belongs to the
+ * server-rendered part.
  */
 function SearchBox({ filter }: { filter: PricePositionFilter }) {
   const carried = { ...filter, q: undefined, page: undefined };
 
   return (
-    <form action="/pricing" method="get" className="flex flex-wrap items-center gap-2">
-      {[...toSearchParams(carried)].map(([key, value]) => (
-        <input key={key} type="hidden" name={key} value={value} />
-      ))}
-      <input
-        type="search"
-        name="q"
-        defaultValue={filter.q ?? ''}
-        placeholder="Cari nama produk atau nomor set — misal 42218"
-        aria-label="Cari produk"
-        className="h-9 w-full max-w-md rounded-md border border-line bg-surface px-3 text-sm text-foreground placeholder:text-muted focus:border-accent focus:outline-none"
-      />
-      <button
-        type="submit"
-        className="h-9 rounded-md border border-line bg-surface px-3 text-sm text-muted transition-colors hover:text-foreground"
-      >
-        Cari
-      </button>
+    <div className="flex flex-wrap items-center gap-3">
+      <PricingSearch q={filter.q ?? ''} carried={carried} />
       {filter.q ? (
         <Link
-          href={`/pricing?${toSearchParams({ ...carried })}`}
+          href={`/pricing?${toSearchParams(carried)}`}
           className="text-sm text-muted underline-offset-4 hover:underline"
         >
           Hapus pencarian
         </Link>
       ) : null}
-    </form>
+    </div>
   );
 }
 
