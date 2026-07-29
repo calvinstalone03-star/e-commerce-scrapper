@@ -113,8 +113,10 @@ function Pager({ filter, total, shown }: { filter: StoreFilter; total: number; s
         )}
       </p>
 
-      {pages > 1 ? (
-        <nav aria-label="Navigasi halaman" className="flex items-center gap-2">
+      {/* Always rendered, even at one page: a control that appears only once a
+          list grows past 10 rows teaches nobody that the list can be paged, and
+          "1 / 1" is a complete, honest answer. */}
+      <nav aria-label="Navigasi halaman" className="flex items-center gap-2">
           {filter.page > 1 ? (
             <Link href={storesHref(filter, { page: filter.page - 1 })} className={step}>
               Sebelumnya
@@ -125,15 +127,14 @@ function Pager({ filter, total, shown }: { filter: StoreFilter; total: number; s
           <span className="whitespace-nowrap tabular-nums">
             {count.format(filter.page)} / {count.format(pages)}
           </span>
-          {filter.page < pages ? (
-            <Link href={storesHref(filter, { page: filter.page + 1 })} className={step}>
-              Berikutnya
-            </Link>
-          ) : (
-            <span className={`${step} opacity-45`}>Berikutnya</span>
-          )}
-        </nav>
-      ) : null}
+        {filter.page < pages ? (
+          <Link href={storesHref(filter, { page: filter.page + 1 })} className={step}>
+            Berikutnya
+          </Link>
+        ) : (
+          <span className={`${step} opacity-45`}>Berikutnya</span>
+        )}
+      </nav>
     </div>
   );
 }

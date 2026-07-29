@@ -307,7 +307,10 @@ export const storeFilterSchema = z.object({
   sort: z.enum(['products', 'name', 'avgPrice']).default('products').catch('products'),
   dir: sortDirSchema.default('desc').catch('desc'),
   page: intFromQuery.min(1).default(1).catch(1),
-  pageSize: intFromQuery.min(1).max(200).default(50).catch(50),
+  //: Ten, matching the price list. Fifty put every shop on one page and left the
+  //: pager permanently hidden, which read as "this table has no paging" rather
+  //: than "this table happens to fit".
+  pageSize: intFromQuery.min(1).max(100).default(10).catch(10),
 });
 export type StoreFilter = z.infer<typeof storeFilterSchema>;
 

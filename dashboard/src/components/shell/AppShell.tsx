@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 
 import { cn } from '@/components/ui/cn';
 
@@ -138,6 +138,23 @@ function Topbar({
 }) {
   return (
     <header className="sticky top-0 z-40 flex h-14 items-center gap-3 border-b border-line bg-surface/90 px-3 backdrop-blur sm:px-4">
+      {/* Name first, then the control. The brand is what the eye lands on and it
+          belongs at the corner; the toggle belongs beside the column it opens
+          and closes, which is the one to its right. */}
+      <Link href="/" className="flex min-w-0 items-center gap-2">
+        <span
+          aria-hidden
+          className="flex size-7 shrink-0 items-center justify-center rounded-md bg-accent/12 text-accent"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" className="size-4">
+            <path d="M4 18V9M10 18V5M16 18v-6M22 18H2" />
+          </svg>
+        </span>
+        <span className="truncate text-sm font-semibold tracking-tight text-foreground">
+          Market Competition Landscape
+        </span>
+      </Link>
+
       <button
         type="button"
         onClick={onOpenDrawer}
@@ -155,20 +172,6 @@ function Topbar({
       >
         <BurgerIcon />
       </button>
-
-      <Link href="/" className="flex min-w-0 items-center gap-2">
-        <span
-          aria-hidden
-          className="flex size-7 shrink-0 items-center justify-center rounded-md bg-accent/12 text-accent"
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" className="size-4">
-            <path d="M4 18V9M10 18V5M16 18v-6M22 18H2" />
-          </svg>
-        </span>
-        <span className="truncate text-sm font-semibold tracking-tight text-foreground">
-          Market Competition Landscape
-        </span>
-      </Link>
 
       {/* Which shops every number on every page is relative to. Without this the
           dashboard says "kita" everywhere and never says who that is. */}
@@ -208,16 +211,75 @@ function Topbar({
           </Link>
         ) : null}
         <span className="hidden text-xs text-muted sm:block">{username}</span>
-        <form action={signOutAction}>
-          <button
-            type="submit"
-            className="rounded-md border border-line bg-surface px-2.5 py-1.5 text-xs text-muted transition-colors hover:text-foreground"
-          >
-            Keluar
-          </button>
-        </form>
+        <SignOutButton signOutAction={signOutAction} />
       </div>
     </header>
+  );
+}
+
+/**
+ * Sign out, behind a confirmation.
+ *
+ * Not because signing out is destructive — it is one click to undo — but
+ * because the button sits in the corner every other toolbar puts a harmless
+ * icon in, and being thrown back to a password prompt mid-task is a
+ * disproportionate answer to a misplaced click.
+ *
+ * A `<dialog>` rather than `window.confirm`: the native prompt blocks the whole
+ * renderer, cannot be styled to look like it belongs to this app, and reads as
+ * a browser warning rather than a question the page is asking. This keeps the
+ * form — and therefore the Server Action — intact underneath.
+ */
+function SignOutButton({ signOutAction }: { signOutAction: () => Promise<void> }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => dialogRef.current?.showModal()}
+        className="rounded-md border border-line bg-surface px-2.5 py-1.5 text-xs text-muted transition-colors hover:text-foreground"
+      >
+        Keluar
+      </button>
+
+      <dialog
+        ref={dialogRef}
+        // Clicking the backdrop closes it: the dialog element reports those
+        // clicks as landing on itself, never on its contents.
+        onClick={(event) => {
+          if (event.target === dialogRef.current) dialogRef.current?.close();
+        }}
+        className="m-auto w-[min(24rem,calc(100vw-2rem))] rounded-lg border border-line bg-surface p-0 text-foreground backdrop:bg-black/50"
+      >
+        <div className="space-y-4 p-5">
+          <div className="space-y-1">
+            <h2 className="text-sm font-semibold">Keluar dari dashboard?</h2>
+            <p className="text-sm leading-relaxed text-muted">
+              Sesi ini berakhir dan kamu perlu memasukkan username dan password lagi untuk masuk.
+            </p>
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => dialogRef.current?.close()}
+              className="h-9 rounded-md border border-line px-3 text-sm text-muted transition-colors hover:text-foreground"
+            >
+              Batal
+            </button>
+            <form action={signOutAction}>
+              <button
+                type="submit"
+                className="h-9 rounded-md bg-negative px-3 text-sm font-medium text-white transition-opacity hover:opacity-90"
+              >
+                Keluar
+              </button>
+            </form>
+          </div>
+        </div>
+      </dialog>
+    </>
   );
 }
 

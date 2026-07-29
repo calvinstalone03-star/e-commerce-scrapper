@@ -4,7 +4,8 @@ import Link from 'next/link';
 import { redirect } from 'next/navigation';
 
 import { StoreTable } from '@/components/StoreTable';
-import { Input, Select } from '@/components/ui';
+import { UrlChoice } from '@/components/UrlChoice';
+import { Input } from '@/components/ui';
 import { storeSearchParams } from '@/lib/client-api';
 import { MARKETPLACE_LABELS } from '@/lib/format';
 import { getFilterOptions, getStores } from '@/lib/queries';
@@ -56,101 +57,95 @@ export default async function StoresPage({
       </header>
 
       {/*
-        next/form keeps filter state in the URL instead of in React state: the page
-        stays a Server Component, the back button works, and a filtered view is a
-        link someone can send. Each control is keyed by its own URL value so it
-        re-mounts when that value changes — without the key an uncontrolled input
-        keeps whatever the DOM node already held after a client-side navigation,
-        and "Reset" would leave the old text sitting in the box.
+        Search stays a `next/form` — a text box wants a submit — while every
+        choice navigates on selection through the shared dropdown. Both keep the
+        state in the URL, so the page remains a Server Component and a filtered
+        view is still a link.
       */}
-      {/*
-        Each control sits in a width-setting wrapper rather than carrying its own
-        width class: the kit's fields are `w-full` by design and `cn` does not
-        merge Tailwind classes, so a `w-auto` passed in here would not win and
-        every control would claim its own row.
-      */}
-      <Form action="/stores" className="flex flex-wrap items-center gap-2">
-        <div className="min-w-56 flex-1">
-          <Input
-            key={filter.q ?? ''}
-            type="search"
-            name="q"
-            defaultValue={filter.q ?? ''}
-            placeholder="Cari nama atau username toko"
-            aria-label="Cari toko"
+      <div className="space-y-3">
+        <Form action="/stores" className="flex flex-wrap items-center gap-2">
+          <div className="min-w-56 flex-1">
+            <Input
+              key={filter.q ?? ''}
+              type="search"
+              name="q"
+              defaultValue={filter.q ?? ''}
+              placeholder="Cari nama atau username toko"
+              aria-label="Cari toko"
+            />
+          </div>
+          {/* The rest of the filter travels with the search, or submitting would
+              silently reset it. */}
+          {filter.marketplace ? (
+            <input type="hidden" name="marketplace" value={filter.marketplace} />
+          ) : null}
+          {filter.location ? <input type="hidden" name="location" value={filter.location} /> : null}
+          <input type="hidden" name="sort" value={filter.sort} />
+          <input type="hidden" name="dir" value={filter.dir} />
+          <input type="hidden" name="pageSize" value={filter.pageSize} />
+
+          <button
+            type="submit"
+            className="h-9 rounded-md bg-accent px-3 text-sm font-medium text-white transition-opacity hover:opacity-90"
+          >
+            Cari
+          </button>
+
+          {filtered ? (
+            <Link
+              href="/stores"
+              className="inline-flex h-9 items-center rounded-md border border-line px-3 text-sm text-muted transition-colors hover:bg-surface-muted hover:text-foreground"
+            >
+              Reset
+            </Link>
+          ) : null}
+        </Form>
+
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <UrlChoice
+            label="Marketplace"
+            param="marketplace"
+            value={filter.marketplace ?? 'all'}
+            options={[
+              { value: 'all', label: 'Semua marketplace' },
+              ...options.marketplaces.map((marketplace) => ({
+                value: marketplace,
+                label: MARKETPLACE_LABELS[marketplace] ?? marketplace,
+              })),
+            ]}
+          />
+          <UrlChoice
+            label="Lokasi toko"
+            param="location"
+            value={filter.location ?? 'all'}
+            options={[
+              {
+                value: 'all',
+                label: options.locations.length === 0 ? 'Lokasi belum terekam' : 'Semua lokasi',
+              },
+              ...options.locations.map((location) => ({ value: location, label: location })),
+            ]}
+          />
+          <UrlChoice
+            label="Urutkan"
+            param="sort"
+            value={filter.sort}
+            options={(Object.keys(SORT_LABELS) as StoreSort[]).map((value) => ({
+              value,
+              label: SORT_LABELS[value],
+            }))}
+          />
+          <UrlChoice
+            label="Baris per halaman"
+            param="pageSize"
+            value={String(filter.pageSize)}
+            options={[10, 25, 50, 100].map((size) => ({
+              value: String(size),
+              label: `${size} baris`,
+            }))}
           />
         </div>
-
-        <div className="w-full sm:w-44">
-          <Select
-            key={`marketplace-${filter.marketplace ?? ''}`}
-            name="marketplace"
-            defaultValue={filter.marketplace ?? ''}
-            aria-label="Marketplace"
-          >
-            <option value="">Semua marketplace</option>
-            {options.marketplaces.map((marketplace) => (
-              <option key={marketplace} value={marketplace}>
-                {MARKETPLACE_LABELS[marketplace] ?? marketplace}
-              </option>
-            ))}
-          </Select>
-        </div>
-
-        <div className="w-full sm:w-44">
-          <Select
-            key={`location-${filter.location ?? ''}`}
-            name="location"
-            defaultValue={filter.location ?? ''}
-            aria-label="Lokasi"
-            disabled={options.locations.length === 0}
-          >
-            <option value="">
-              {options.locations.length === 0 ? 'Lokasi belum terekam' : 'Semua lokasi'}
-            </option>
-            {options.locations.map((location) => (
-              <option key={location} value={location}>
-                {location}
-              </option>
-            ))}
-          </Select>
-        </div>
-
-        <div className="w-full sm:w-52">
-          <Select
-            key={`sort-${filter.sort}`}
-            name="sort"
-            defaultValue={filter.sort}
-            aria-label="Urutkan"
-          >
-            {(Object.keys(SORT_LABELS) as StoreSort[]).map((value) => (
-              <option key={value} value={value}>
-                Urutkan: {SORT_LABELS[value]}
-              </option>
-            ))}
-          </Select>
-        </div>
-
-        {/* Direction is owned by the column headers; carry it through a submit so
-            re-filtering does not quietly flip a column back to descending. */}
-        <input key={`dir-${filter.dir}`} type="hidden" name="dir" defaultValue={filter.dir} />
-
-        <button
-          type="submit"
-          className="h-9 rounded-md bg-accent px-3 text-sm font-medium text-background transition-opacity hover:opacity-90"
-        >
-          Terapkan
-        </button>
-
-        {filtered ? (
-          <Link
-            href="/stores"
-            className="inline-flex h-9 items-center rounded-md border border-line px-3 text-sm text-muted transition-colors hover:bg-surface-muted hover:text-foreground"
-          >
-            Reset
-          </Link>
-        ) : null}
-      </Form>
+      </div>
 
       <StoreTable rows={rows} filter={filter} total={total} filtered={filtered} />
     </div>
