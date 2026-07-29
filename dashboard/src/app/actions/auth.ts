@@ -18,7 +18,7 @@ export async function signIn(_previous: FormState, formData: FormData): Promise<
   const username = String(formData.get('username') ?? '');
   const password = String(formData.get('password') ?? '');
 
-  if (!verifyPassword(username, password)) {
+  if (!(await verifyPassword(username, password))) {
     // One message for both halves: saying which was wrong tells whoever is
     // guessing that the username exists.
     return { error: 'Username atau password salah.' };
@@ -46,7 +46,7 @@ export async function changeCredentials(
     return { error: 'Konfirmasi password tidak sama.' };
   }
 
-  const result = updateCredentials({
+  const result = await updateCredentials({
     currentPassword,
     username: username || undefined,
     newPassword: newPassword || undefined,

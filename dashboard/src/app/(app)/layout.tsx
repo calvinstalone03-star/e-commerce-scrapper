@@ -23,8 +23,8 @@ export default async function AppLayout({ children }: { children: ReactNode }) {
 
   return (
     <AppShell
-      username={currentUsername()}
-      warnDefaultPassword={usingDefaultPassword()}
+      username={await currentUsername()}
+      warnDefaultPassword={await usingDefaultPassword()}
       signOutAction={signOut}
       shops={shops.map((shop) => ({
         id: shop.id,

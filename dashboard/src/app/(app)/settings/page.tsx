@@ -22,7 +22,11 @@ export const metadata: Metadata = {
 };
 
 export default async function SettingsPage() {
-  const shops = await getOwnShops();
+  const [shops, username, defaultPassword] = await Promise.all([
+    getOwnShops(),
+    currentUsername(),
+    usingDefaultPassword(),
+  ]);
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -31,7 +35,7 @@ export default async function SettingsPage() {
         <p className="text-sm text-muted">Akses masuk dan toko yang dianggap milik sendiri.</p>
       </header>
 
-      {usingDefaultPassword() ? (
+      {defaultPassword ? (
         <p className="rounded-md border border-negative/40 bg-negative/10 px-3 py-2.5 text-sm leading-relaxed text-negative">
           Password masih bawaan. Dashboard ini hanya mendengarkan di 127.0.0.1, jadi tidak terbuka
           dari jaringan — tapi siapa pun yang memakai laptop ini bisa membukanya. Ganti di bawah.
@@ -41,10 +45,10 @@ export default async function SettingsPage() {
       <Card>
         <CardHeader>
           <CardTitle>Akun masuk</CardTitle>
-          <span className="text-xs text-muted">username saat ini: {currentUsername()}</span>
+          <span className="text-xs text-muted">username saat ini: {username}</span>
         </CardHeader>
         <CardContent>
-          <CredentialsForm username={currentUsername()} />
+          <CredentialsForm username={username} />
         </CardContent>
       </Card>
 

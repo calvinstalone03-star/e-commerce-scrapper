@@ -1,10 +1,10 @@
 import 'server-only';
 
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
 
 import { cookies } from 'next/headers';
+
+import { sql } from '@/lib/db';
 
 /**
  * Who may open this dashboard.
@@ -18,14 +18,13 @@ import { cookies } from 'next/headers';
  * cost nothing here and are the difference between a lock and the appearance of
  * one.
  *
- * Credentials live in a file, not in Postgres, for the reason `db.ts` gives:
- * the Python side owns the schema and this app never writes to it. A settings
- * page that needed a migration would put two owners on one database.
+ * Credentials live in `app_credentials`, the one table this app writes to. On
+ * disk would be simpler and is what this started as, right up until the first
+ * serverless deploy: there is no writable persistent filesystem there, so a
+ * file-backed store re-seeds on every cold start, rotates the signing key and
+ * signs everyone out at intervals nobody can predict. The schema is still
+ * authored on the Python side, in migrations/004_app_credentials.sql.
  */
-
-/** Where the credential file lives. Outside the build output, beside the repo. */
-const AUTH_FILE =
-  process.env.DASHBOARD_AUTH_FILE ?? join(process.cwd(), '..', '.dashboard-auth.json');
 
 const COOKIE_NAME = 'mcl_session';
 
@@ -33,7 +32,7 @@ const COOKIE_NAME = 'mcl_session';
 //: uses, short enough that a forgotten laptop stops being logged in.
 const SESSION_MAX_AGE_S = 7 * 24 * 60 * 60;
 
-//: What the file is seeded with the first time the dashboard starts. Weak on
+//: What the row is seeded with the first time the dashboard starts. Weak on
 //: purpose — it is meant to be changed on the settings page, and a random one
 //: nobody is told is just a lockout.
 const DEFAULT_USERNAME = 'admin';
@@ -66,23 +65,38 @@ function newCredentials(username: string, password: string): Credentials {
   };
 }
 
-function readCredentials(): Credentials {
-  try {
-    const parsed = JSON.parse(readFileSync(AUTH_FILE, 'utf8')) as Credentials;
-    if (parsed?.username && parsed?.hash && parsed?.salt && parsed?.secret) return parsed;
-  } catch {
-    /* absent or unreadable — seeded below */
-  }
+async function readCredentials(): Promise<Credentials> {
+  const [row] = await sql`
+    SELECT username, hash, salt, secret, updated_at AS "updatedAt"
+    FROM app_credentials
+    WHERE id
+  `;
+  if (row?.username && row?.hash && row?.salt && row?.secret) return row as Credentials;
+
+  // First run: seed the singleton. ON CONFLICT DO NOTHING rather than a check
+  // then an insert — two cold starts can arrive at once, and the loser of that
+  // race must read the winner's row, not overwrite it with a different secret.
   const seeded = newCredentials(DEFAULT_USERNAME, DEFAULT_PASSWORD);
-  writeCredentials(seeded);
-  return seeded;
+  await sql`
+    INSERT INTO app_credentials (id, username, hash, salt, secret)
+    VALUES (true, ${seeded.username}, ${seeded.hash}, ${seeded.salt}, ${seeded.secret})
+    ON CONFLICT (id) DO NOTHING
+  `;
+  return readCredentials();
 }
 
-function writeCredentials(credentials: Credentials): void {
-  mkdirSync(dirname(AUTH_FILE), { recursive: true });
-  // 0600: the file holds a password hash and the session signing key, and the
-  // default umask would leave it world-readable.
-  writeFileSync(AUTH_FILE, `${JSON.stringify(credentials, null, 2)}\n`, { mode: 0o600 });
+async function writeCredentials(credentials: Credentials): Promise<void> {
+  await sql`
+    INSERT INTO app_credentials (id, username, hash, salt, secret, updated_at)
+    VALUES (true, ${credentials.username}, ${credentials.hash}, ${credentials.salt},
+            ${credentials.secret}, now())
+    ON CONFLICT (id) DO UPDATE SET
+      username = excluded.username,
+      hash = excluded.hash,
+      salt = excluded.salt,
+      secret = excluded.secret,
+      updated_at = excluded.updated_at
+  `;
 }
 
 /** Constant-time compare that tolerates different lengths without throwing. */
@@ -94,8 +108,8 @@ function sameString(a: string, b: string): boolean {
 }
 
 /** True when these credentials open the dashboard. */
-export function verifyPassword(username: string, password: string): boolean {
-  const stored = readCredentials();
+export async function verifyPassword(username: string, password: string): Promise<boolean> {
+  const stored = await readCredentials();
   const userOk = sameString(username.trim().toLowerCase(), stored.username.toLowerCase());
   // Hash regardless of whether the username matched: returning early on a bad
   // username makes the response time say which half was wrong.
@@ -104,13 +118,13 @@ export function verifyPassword(username: string, password: string): boolean {
 }
 
 /** The current username, for display. Never the hash. */
-export function currentUsername(): string {
-  return readCredentials().username;
+export async function currentUsername(): Promise<string> {
+  return (await readCredentials()).username;
 }
 
 /** Whether the stored password is still the seeded one, so the UI can nag. */
-export function usingDefaultPassword(): boolean {
-  const stored = readCredentials();
+export async function usingDefaultPassword(): Promise<boolean> {
+  const stored = await readCredentials();
   return sameString(hashPassword(DEFAULT_PASSWORD, stored.salt), stored.hash);
 }
 
@@ -144,7 +158,7 @@ function tokenIsValid(token: string | undefined, secret: string): boolean {
 }
 
 export async function createSession(): Promise<void> {
-  const { secret } = readCredentials();
+  const { secret } = await readCredentials();
   const expiresAt = Date.now() + SESSION_MAX_AGE_S * 1000;
   const store = await cookies();
   store.set(COOKIE_NAME, signToken(expiresAt, secret), {
@@ -152,9 +166,10 @@ export async function createSession(): Promise<void> {
     sameSite: 'lax',
     path: '/',
     maxAge: SESSION_MAX_AGE_S,
-    // Not `secure`: this is served over plain HTTP on 127.0.0.1, and a secure
-    // cookie would simply never be sent back.
-    secure: false,
+    // Secure in production, where the deployment is HTTPS; not locally, where
+    // the server is plain HTTP on 127.0.0.1 and a secure cookie would never be
+    // sent back at all.
+    secure: process.env.NODE_ENV === 'production',
   });
 }
 
@@ -165,7 +180,7 @@ export async function destroySession(): Promise<void> {
 
 /** Whether this request carries a session we issued and that has not expired. */
 export async function isSignedIn(): Promise<boolean> {
-  const { secret } = readCredentials();
+  const { secret } = await readCredentials();
   const store = await cookies();
   return tokenIsValid(store.get(COOKIE_NAME)?.value, secret);
 }
@@ -185,12 +200,12 @@ export type CredentialChange =
  * session cookie proves someone opened the dashboard, not that they are still
  * the person who logged in.
  */
-export function updateCredentials(input: {
+export async function updateCredentials(input: {
   currentPassword: string;
   username?: string;
   newPassword?: string;
-}): CredentialChange {
-  const stored = readCredentials();
+}): Promise<CredentialChange> {
+  const stored = await readCredentials();
 
   if (!sameString(hashPassword(input.currentPassword, stored.salt), stored.hash)) {
     return { ok: false, error: 'Password saat ini salah.' };
@@ -212,6 +227,6 @@ export function updateCredentials(input: {
     ? newCredentials(username, password)
     : { ...stored, username, secret: randomBytes(32).toString('hex'), updatedAt: new Date().toISOString() };
 
-  writeCredentials(next);
+  await writeCredentials(next);
   return { ok: true };
 }

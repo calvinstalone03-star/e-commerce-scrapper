@@ -495,6 +495,61 @@ ecom-scraper backfill-set-codes             # recompute the column
 └──────────┴─────────┴───────────────┴─────────┘
 ```
 
+## 7. Deploy the dashboard (Vercel + Neon)
+
+The dashboard runs anywhere Next.js does; the scraper does not, and that shapes
+the whole arrangement. Scraping happens in a browser on a machine you control —
+that is the point of the extension — so a deployment splits into three parts:
+
+    extension (your Chrome)  →  ingest server (your machine)  →  Postgres
+                                                                   ↑
+                                              dashboard (Vercel) ──┘
+
+Only the last leg moves. The ingest server keeps running locally and writes to
+whichever database `DATABASE_URL` names, so pointing it at Neon is what puts
+scraped data somewhere Vercel can read.
+
+**1. A database.** Create a Neon project, then take its **pooled** connection
+string — the one with `-pooler` in the host. A serverless deployment is many
+short-lived instances, and the direct endpoint gives each one its own
+connection.
+
+**2. The schema and the data.**
+
+```bash
+export NEON_URL='postgresql://…-pooler….neon.tech/…?sslmode=require'
+
+# Schema first: the same migrations, applied to the new database.
+DATABASE_URL="$NEON_URL" ecom-scraper initdb
+
+# Then the rows, if you want the history rather than a fresh start.
+pg_dump --data-only --no-owner postgresql://calvin@127.0.0.1:5432/ecom_scraper \
+  | psql "$NEON_URL"
+```
+
+**3. The dashboard.** Point Vercel at this repo with **Root Directory =
+`dashboard`**, and set one environment variable:
+
+```bash
+vercel env add DATABASE_URL production   # paste the pooled Neon URL
+vercel --prod
+```
+
+**4. Change the password before you tell anyone the URL.** A deployment is on
+the public internet, and the login seeds itself with `admin` / `ecom123` on
+first run. The dashboard says so in the topbar until you change it, on
+`/settings`.
+
+**5. Keep scraping into the same database.** Set `DATABASE_URL` to the Neon URL
+in the repo root `.env` and restart the ingest server, or the extension will go
+on filling the local database while the dashboard reads the hosted one and
+reports that nothing has changed since the day you deployed.
+
+What this costs: every page read crosses the network instead of a socket, so the
+price screens go from ~0.4s to whatever your latency to the Neon region is. If
+that matters more than remote access, run the dashboard locally — it is the same
+code, and `scripts/dashboard-server.sh` already does it.
+
 ## Exit codes
 
 | Code | Meaning |

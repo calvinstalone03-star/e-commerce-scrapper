@@ -18,6 +18,17 @@ import postgres from 'postgres';
 const connectionString =
   process.env.DATABASE_URL ?? 'postgresql://calvin@127.0.0.1:5432/ecom_scraper';
 
+/**
+ * How many connections one instance may hold.
+ *
+ * Eight is right for a laptop, where there is one long-lived server. It is
+ * wrong for serverless, where every concurrent invocation is its own instance:
+ * eight each against a database whose pooled endpoint allows a few hundred
+ * total is how a dashboard takes itself down under a refresh. One per instance,
+ * and let the platform's own pooler do the pooling.
+ */
+const poolMax = Number(process.env.DATABASE_POOL_MAX ?? (process.env.VERCEL ? 1 : 8));
+
 declare global {
   // eslint-disable-next-line no-var
   var __ecomSql: ReturnType<typeof postgres> | undefined;
@@ -33,9 +44,13 @@ declare global {
 export const sql =
   globalThis.__ecomSql ??
   postgres(connectionString, {
-    max: 8,
+    max: poolMax,
     idle_timeout: 20,
     connect_timeout: 10,
+    // Neon and every other hosted Postgres require TLS; a local socket does not
+    // offer it. Taken from the URL's own `sslmode` when it carries one, which is
+    // how every hosted provider hands its connection string over.
+    ssl: connectionString.includes('sslmode=') ? undefined : false,
     connection: {
       // pg_trgm's `%` operator answers to this GUC, and its 0.3 default is not
       // the threshold the price comparison uses. Left at 0.3 the GIN index

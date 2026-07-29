@@ -1,8 +1,9 @@
-import { mkdtempSync, readFileSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { beforeEach, describe, expect, test, vi } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
+
+import { sql } from '@/lib/db';
 
 /**
  * The login, tested where it actually decides things.
@@ -28,80 +29,100 @@ vi.mock('next/headers', () => ({
   }),
 }));
 
-const AUTH_FILE = join(mkdtempSync(join(tmpdir(), 'mcl-auth-')), 'auth.json');
-process.env.DASHBOARD_AUTH_FILE = AUTH_FILE;
-
-// Imported after the env var is set: the module resolves its path at load.
 const auth = await import('@/lib/auth');
+const MIGRATIONS = join(process.cwd(), '..', 'migrations');
 
-beforeEach(() => {
+beforeAll(async () => {
+  for (const file of readdirSync(MIGRATIONS).filter((name) => name.endsWith('.sql')).sort()) {
+    await sql.unsafe(readFileSync(join(MIGRATIONS, file), 'utf8'));
+  }
+});
+
+beforeEach(async () => {
   jar.clear();
+  // Each case starts from an unseeded database, so "first run seeds a default"
+  // is tested rather than assumed from whatever ran before it.
+  await sql`DELETE FROM app_credentials`;
 });
 
 describe('credentials', () => {
-  test('seeds a usable default on first run', () => {
-    expect(auth.verifyPassword(auth.DEFAULT_CREDENTIALS.username, auth.DEFAULT_CREDENTIALS.password)).toBe(
-      true,
+  test('seeds a usable default on first run', async () => {
+    expect(
+      await auth.verifyPassword(auth.DEFAULT_CREDENTIALS.username, auth.DEFAULT_CREDENTIALS.password),
+    ).toBe(true);
+    expect(await auth.usingDefaultPassword()).toBe(true);
+  });
+
+  test('stores a salted hash, never the password', async () => {
+    await auth.currentUsername(); // force the seed
+    const [row] = await sql`SELECT username, hash, salt, secret FROM app_credentials`;
+    expect(JSON.stringify(row)).not.toContain(auth.DEFAULT_CREDENTIALS.password);
+    expect(row.hash).toMatch(/^[0-9a-f]{128}$/);
+    expect(row.salt).toHaveLength(32);
+  });
+
+  test('the credential row is a singleton', async () => {
+    await auth.currentUsername();
+    // A second account nobody knows about would be a second way in.
+    await expect(
+      sql`INSERT INTO app_credentials (id, username, hash, salt, secret) VALUES (true, 'x', 'x', 'x', 'x')`,
+    ).rejects.toThrow();
+  });
+
+  test('rejects a wrong password and a wrong username alike', async () => {
+    expect(await auth.verifyPassword('admin', 'salah')).toBe(false);
+    expect(await auth.verifyPassword('bukanadmin', auth.DEFAULT_CREDENTIALS.password)).toBe(false);
+  });
+
+  test('username is compared case-insensitively, password is not', async () => {
+    expect(await auth.verifyPassword('ADMIN', auth.DEFAULT_CREDENTIALS.password)).toBe(true);
+    expect(await auth.verifyPassword('admin', auth.DEFAULT_CREDENTIALS.password.toUpperCase())).toBe(
+      false,
     );
-    expect(auth.usingDefaultPassword()).toBe(true);
-  });
-
-  test('stores a salted hash, never the password', () => {
-    const raw = readFileSync(AUTH_FILE, 'utf8');
-    expect(raw).not.toContain(auth.DEFAULT_CREDENTIALS.password);
-    const stored = JSON.parse(raw);
-    expect(stored.hash).toMatch(/^[0-9a-f]{128}$/);
-    expect(stored.salt).toHaveLength(32);
-  });
-
-  test('the credential file is not readable by anyone else', () => {
-    // It holds the password hash and the session signing key; the default umask
-    // would leave it world-readable.
-    expect(statSync(AUTH_FILE).mode & 0o077).toBe(0);
-  });
-
-  test('rejects a wrong password and a wrong username alike', () => {
-    expect(auth.verifyPassword('admin', 'salah')).toBe(false);
-    expect(auth.verifyPassword('bukanadmin', auth.DEFAULT_CREDENTIALS.password)).toBe(false);
-  });
-
-  test('username is compared case-insensitively, password is not', () => {
-    expect(auth.verifyPassword('ADMIN', auth.DEFAULT_CREDENTIALS.password)).toBe(true);
-    expect(auth.verifyPassword('admin', auth.DEFAULT_CREDENTIALS.password.toUpperCase())).toBe(false);
   });
 });
 
 describe('changing credentials', () => {
-  test('refuses without the current password', () => {
-    const result = auth.updateCredentials({ currentPassword: 'salah', newPassword: 'rahasia123' });
-    expect(result).toEqual({ ok: false, error: expect.stringContaining('Password saat ini') });
+  test('refuses without the current password', async () => {
+    await auth.currentUsername();
+    expect(await auth.updateCredentials({ currentPassword: 'salah', newPassword: 'rahasia123' })).toEqual(
+      { ok: false, error: expect.stringContaining('Password saat ini') },
+    );
   });
 
-  test('refuses a password too short to be worth having', () => {
-    const result = auth.updateCredentials({
+  test('refuses a password too short to be worth having', async () => {
+    await auth.currentUsername();
+    const result = await auth.updateCredentials({
       currentPassword: auth.DEFAULT_CREDENTIALS.password,
       newPassword: 'abc',
     });
     expect(result.ok).toBe(false);
   });
 
-  test('changes the password and stops accepting the old one', () => {
-    expect(auth.updateCredentials({
-      currentPassword: auth.DEFAULT_CREDENTIALS.password,
-      newPassword: 'rahasia123',
-    })).toEqual({ ok: true });
+  test('changes the password and stops accepting the old one', async () => {
+    await auth.currentUsername();
+    expect(
+      await auth.updateCredentials({
+        currentPassword: auth.DEFAULT_CREDENTIALS.password,
+        newPassword: 'rahasia123',
+      }),
+    ).toEqual({ ok: true });
 
-    expect(auth.verifyPassword('admin', 'rahasia123')).toBe(true);
-    expect(auth.verifyPassword('admin', auth.DEFAULT_CREDENTIALS.password)).toBe(false);
-    expect(auth.usingDefaultPassword()).toBe(false);
+    expect(await auth.verifyPassword('admin', 'rahasia123')).toBe(true);
+    expect(await auth.verifyPassword('admin', auth.DEFAULT_CREDENTIALS.password)).toBe(false);
+    expect(await auth.usingDefaultPassword()).toBe(false);
   });
 
-  test('changes the username while keeping the password', () => {
-    expect(auth.updateCredentials({ currentPassword: 'rahasia123', username: 'calvin' })).toEqual({
-      ok: true,
-    });
-    expect(auth.currentUsername()).toBe('calvin');
-    expect(auth.verifyPassword('calvin', 'rahasia123')).toBe(true);
+  test('changes the username while keeping the password', async () => {
+    await auth.currentUsername();
+    expect(
+      await auth.updateCredentials({
+        currentPassword: auth.DEFAULT_CREDENTIALS.password,
+        username: 'calvin',
+      }),
+    ).toEqual({ ok: true });
+    expect(await auth.currentUsername()).toBe('calvin');
+    expect(await auth.verifyPassword('calvin', auth.DEFAULT_CREDENTIALS.password)).toBe(true);
   });
 });
 
@@ -140,7 +161,10 @@ describe('sessions', () => {
     await auth.createSession();
     expect(await auth.isSignedIn()).toBe(true);
 
-    auth.updateCredentials({ currentPassword: 'rahasia123', newPassword: 'rahasia456' });
+    await auth.updateCredentials({
+      currentPassword: auth.DEFAULT_CREDENTIALS.password,
+      newPassword: 'rahasia456',
+    });
 
     // The cookie is untouched in the jar; it simply no longer verifies.
     expect(await auth.isSignedIn()).toBe(false);
