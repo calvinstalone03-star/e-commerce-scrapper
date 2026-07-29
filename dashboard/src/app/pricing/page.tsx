@@ -135,11 +135,17 @@ export default async function PricingPage({
             </THead>
             <TBody>
               {rows.map((row) => (
-                <TR key={row.id}>
+                // The whole row is the target. `relative` here plus the
+                // stretched link below is what makes that work without
+                // JavaScript: it stays a real anchor, so middle-click, ⌘-click
+                // and "copy link" all behave, and the row keeps its one entry in
+                // the tab order rather than gaining a handler no keyboard can
+                // reach.
+                <TR key={row.id} className="relative hover:bg-surface-muted">
                   <TD>
                     <Link
                       href={`/pricing/${row.id}`}
-                      className="font-medium text-foreground underline-offset-4 hover:underline"
+                      className="font-medium text-foreground underline-offset-4 before:absolute before:inset-0 before:content-[''] hover:underline"
                     >
                       {row.name ?? 'Produk tanpa nama'}
                     </Link>
@@ -149,6 +155,18 @@ export default async function PricingPage({
                       ) : (
                         <Badge variant="muted">tanpa nomor set</Badge>
                       )}
+                      {isExtreme(row.gapPercent) ? (
+                        // A set number is one box, but LEGO gives a whole
+                        // collectible series one number: the single blind bag,
+                        // the keychain and the box of twelve all read 71049 and
+                        // legitimately cost 52rb, 140rb and 1,25jt. The pairing
+                        // is right and the percentage is meaningless, so say so
+                        // where the number is, rather than letting someone
+                        // reprice against a different package.
+                        <Badge variant="muted" title="selisih sebesar ini biasanya beda kemasan — satuan, keychain, atau satu set penuh">
+                          periksa kemasan
+                        </Badge>
+                      ) : null}
                       {row.matchKind === 'name' ? (
                         // Named apart from a set match on purpose: this row was
                         // paired on how the titles read, which is a guess, and a
@@ -266,6 +284,19 @@ function Filters({ filter }: { filter: PricePositionFilter }) {
         </Chip>
       </ChipGroup>
 
+      <ChipGroup label="Selisih ekstrem">
+        <Chip
+          href={link({ extreme: 'hide' })}
+          active={filter.extreme === 'hide'}
+          title="sembunyikan baris yang selisihnya lebih dari 100% — biasanya beda kemasan, bukan beda harga"
+        >
+          sembunyikan
+        </Chip>
+        <Chip href={link({ extreme: 'show' })} active={filter.extreme === 'show'}>
+          tampilkan
+        </Chip>
+      </ChipGroup>
+
       <ChipGroup label="Urut">
         <Chip href={link({ sort: 'gap', dir: 'desc' })} active={filter.sort === 'gap'}>
           selisih
@@ -364,6 +395,18 @@ function PageLinks({ filter, total }: { filter: PricePositionFilter; total: numb
       </div>
     </div>
   );
+}
+
+/**
+ * A gap too large to be a pricing decision.
+ *
+ * Nobody sells the same box at four times a rival's price and keeps selling it,
+ * so a number this size is almost always two different packages of one set
+ * number rather than a real position. The threshold is deliberately blunt: this
+ * asks for a look, it does not hide the row or claim the pairing is wrong.
+ */
+function isExtreme(gapPercent: number | null): boolean {
+  return gapPercent !== null && Math.abs(gapPercent) >= 100;
 }
 
 /** `?a=1&a=2` is a bookmark oddity, not an error — take the first and move on. */

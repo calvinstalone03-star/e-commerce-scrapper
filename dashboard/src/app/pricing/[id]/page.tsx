@@ -4,6 +4,7 @@ import { notFound } from 'next/navigation';
 
 import { PriceChart } from '@/components/PriceChart';
 import { ProductImage } from '@/components/ProductImage';
+import { RivalPriceChart, type SellerDatum } from '@/components/RivalPriceChart';
 import { Badge, Card, CardContent, CardHeader, CardTitle, Stat, TBody, TD, TH, THead, TR, Table } from '@/components/ui';
 import {
   MARKETPLACE_LABELS,
@@ -58,6 +59,44 @@ export default async function PricingDetailPage({
 
   const { product, rivals } = detail;
   const history = await getPriceHistory(productId);
+
+  // One row per seller, ours among them rather than beside them — the chart's
+  // whole job is showing where we sit in that list, which needs us *in* it.
+  // Sorted cheapest first so the bar order is the ranking.
+  const sellers: SellerDatum[] = [];
+  if (product.price !== null) {
+    sellers.push({
+      id: product.id,
+      label: 'Toko kita',
+      marketplace: product.marketplace,
+      price: Number(product.price),
+      sold: null,
+      ours: true,
+    });
+  }
+  // One shop routinely lists the same set several times — a collectible series
+  // is one number across a dozen characters — so the shop name alone would
+  // label nine bars identically and identify none of them. Only the repeats pay
+  // for the longer label.
+  const perStore = new Map<string, number>();
+  for (const rival of rivals) {
+    const store = formatStoreName(rival.storeUsername, rival.storeName);
+    perStore.set(store, (perStore.get(store) ?? 0) + 1);
+  }
+
+  for (const rival of rivals) {
+    if (rival.price === null) continue;
+    const store = formatStoreName(rival.storeUsername, rival.storeName);
+    sellers.push({
+      id: rival.id,
+      label: (perStore.get(store) ?? 0) > 1 ? `${store} · ${variantOf(rival.name)}` : store,
+      marketplace: rival.marketplace,
+      price: Number(rival.price),
+      sold: rival.sold,
+      ours: false,
+    });
+  }
+  sellers.sort((a, b) => a.price - b.price);
 
   return (
     <div className="space-y-6">
@@ -134,6 +173,15 @@ export default async function PricingDetailPage({
         </CardContent>
       </Card>
 
+      {product.gapPercent !== null && Math.abs(product.gapPercent) >= 100 ? (
+        <p className="rounded-md border border-line bg-surface-muted px-3 py-2.5 text-sm leading-relaxed text-muted">
+          Selisihnya sangat besar. LEGO memakai satu nomor set untuk seluruh seri
+          minifigure, jadi blind bag satuan, varian keychain, dan satu set penuh sama-sama
+          bernomor {product.setCode ?? '—'} dan wajar berbeda harga berkali lipat. Bandingkan
+          gambar dan nama di bawah sebelum memakai angka ini.
+        </p>
+      ) : null}
+
       {product.matchKind === 'name' ? (
         // Said outright rather than buried in a legend: every number above rests
         // on this pairing, and a reader who does not know it was a guess cannot
@@ -142,6 +190,22 @@ export default async function PricingDetailPage({
           Produk ini tidak punya nomor set, jadi lawannya dicocokkan dari kemiripan nama. Periksa
           sendiri apakah barangnya memang sama sebelum mengubah harga.
         </p>
+      ) : null}
+
+      {sellers.length > 1 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Harga tiap penjual</CardTitle>
+            <span className="text-xs text-muted">
+              {sellers.length} penjual · snapshot terbaru
+            </span>
+          </CardHeader>
+          <CardContent>
+            {/* The ranking as a shape: our bar's place in the stack is our
+                position, with nothing to count. */}
+            <RivalPriceChart sellers={sellers} />
+          </CardContent>
+        </Card>
       ) : null}
 
       <Card>
@@ -186,23 +250,36 @@ export default async function PricingDetailPage({
                         </Badge>
                       </TD>
                       <TD>
-                        {rival.url ? (
-                          <a
-                            href={rival.url}
-                            target="_blank"
-                            rel="noreferrer noopener"
-                            className="underline-offset-4 hover:underline"
-                          >
-                            {rival.name ?? 'Produk tanpa nama'}
-                          </a>
-                        ) : (
-                          (rival.name ?? 'Produk tanpa nama')
-                        )}
-                        {rival.matchKind === 'name' ? (
-                          <Badge variant="muted" className="ml-2">
-                            ~ mirip {rival.similarity !== null ? rival.similarity : ''}
-                          </Badge>
-                        ) : null}
+                        <div className="flex items-start gap-2.5">
+                          {/* The picture is the check: a pairing that is plainly
+                              the wrong box is obvious here and invisible in a
+                              row of numbers. */}
+                          <ProductImage
+                            src={rival.image}
+                            alt={rival.name}
+                            size={40}
+                            className="mt-0.5 shrink-0 rounded"
+                          />
+                          <div className="min-w-0">
+                            {rival.url ? (
+                              <a
+                                href={rival.url}
+                                target="_blank"
+                                rel="noreferrer noopener"
+                                className="underline-offset-4 hover:underline"
+                              >
+                                {rival.name ?? 'Produk tanpa nama'}
+                              </a>
+                            ) : (
+                              (rival.name ?? 'Produk tanpa nama')
+                            )}
+                            {rival.matchKind === 'name' ? (
+                              <Badge variant="muted" className="ml-2">
+                                ~ mirip {rival.similarity !== null ? rival.similarity : ''}
+                              </Badge>
+                            ) : null}
+                          </div>
+                        </div>
                       </TD>
                       <TD className="text-right tabular-nums">{formatPrice(rival.price)}</TD>
                       <TD className="text-right tabular-nums">
@@ -241,6 +318,23 @@ export default async function PricingDetailPage({
       ) : null}
     </div>
   );
+}
+
+/**
+ * The part of a title that tells two listings of one set apart.
+ *
+ * Sellers put the distinguishing bit last — "… Race Cars - Kick Sauber",
+ * "… Race Cars - Alpine" — so the tail after the final dash is what a person
+ * would read to tell them apart. Without a dash there is nothing structured to
+ * take, and the tail of the title is still more distinguishing than its head,
+ * which is the shared set name.
+ */
+function variantOf(name: string | null): string {
+  const text = (name ?? '').trim();
+  if (!text) return 'varian lain';
+  const parts = text.split(/\s+[-–—]\s+/);
+  const tail = parts.length > 1 ? parts[parts.length - 1] : text.slice(-20);
+  return tail.length > 24 ? `${tail.slice(0, 23)}…` : tail;
 }
 
 /**

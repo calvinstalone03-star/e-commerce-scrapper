@@ -34,6 +34,16 @@
      (#03ac0e): the originals sit near 3:1 on white and fail as badge text. */
   --shopee: #c33d1c;
   --tokopedia: #0a7c14;
+
+  /* The two marks the price comparison draws: our listing against everyone
+     else's. Not `--accent` and a grey — a grey mark falls under the chroma
+     floor and reads as "disabled" rather than "someone else", and at 2.5:1 it
+     is not reliably visible on the surface at all. This pair was chosen by
+     running the palette validator: ΔE 30 under protanopia, 26.8 under
+     tritanopia, both above 3:1 on their surface. Colour is still never the only
+     cue — the bars carry direct labels and the legend names both. */
+  --chart-ours: #1d4ed8;
+  --chart-rival: #b45309;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -53,6 +63,12 @@
 
     --shopee: #ff7a5c;
     --tokopedia: #5bd75b;
+
+    /* Re-stepped for the dark surface rather than reused: marks on #1a1a19 need
+       to sit higher up the lightness band, and the light pair fails there. Same
+       validator, same thresholds. */
+    --chart-ours: #5b8def;
+    --chart-rival: #d97706;
   }
 }
 
@@ -72,6 +88,9 @@
 
   --color-shopee: var(--shopee);
   --color-tokopedia: var(--tokopedia);
+
+  --color-chart-ours: var(--chart-ours);
+  --color-chart-rival: var(--chart-rival);
 
   --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;

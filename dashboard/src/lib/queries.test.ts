@@ -221,6 +221,42 @@ describe('price position', () => {
     expect(unmatched.rows.map((row) => row.setCode)).toEqual(['11024']);
   });
 
+  test('hides gaps too large to be a price decision, and shows them on request', async () => {
+    const mine = await addStore('i_bricks', { own: true });
+    const rival = await addStore('brickzproject');
+
+    // One set number, two packages: our box of sixty against their single
+    // minifigure. The pairing is correct and the percentage is meaningless.
+    await addProduct(mine, {
+      name: 'lego minifigures series 14 box isi 60 pieces',
+      setCode: '71049',
+      price: 5_250_000,
+    });
+    await addProduct(rival, {
+      name: 'lego minifigures series 14 satuan',
+      setCode: '71049',
+      price: 25_000,
+    });
+    // An ordinary, actionable gap.
+    await addProduct(mine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 577_940 });
+    await addProduct(rival, { name: 'LEGO 10696 Classic Box', setCode: '10696', price: 449_300 });
+
+    const hidden = await getPricePositions(pricePositionFilterSchema.parse({}));
+    expect(hidden.rows.map((row) => row.setCode)).toEqual(['10696']);
+    expect(hidden.total).toBe(1);
+
+    const shown = await getPricePositions(pricePositionFilterSchema.parse({ extreme: 'show' }));
+    expect(shown.rows.map((row) => row.setCode).sort()).toEqual(['10696', '71049']);
+  });
+
+  test('a product with no rival is never hidden as extreme', async () => {
+    const mine = await addStore('i_bricks', { own: true });
+    await addProduct(mine, { name: 'LEGO 11024 Baseplate', setCode: '11024', price: 100_000 });
+
+    const { rows } = await getPricePositions(pricePositionFilterSchema.parse({}));
+    expect(rows.map((row) => row.setCode)).toEqual(['11024']);
+  });
+
   test('the summary counts the catalogue, not the filtered page', async () => {
     const mine = await addStore('i_bricks', { own: true });
     const rival = await addStore('brickstore');

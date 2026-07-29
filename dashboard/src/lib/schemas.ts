@@ -142,6 +142,8 @@ export const rivalRowSchema = z.object({
   marketplace: marketplaceSchema,
   name: z.string().nullable(),
   url: z.string().nullable(),
+  /** Thumbnail. The fastest way to spot a pairing that is plainly wrong. */
+  image: z.string().nullable(),
   setCode: z.string().nullable(),
   storeId: z.number().int().nullable(),
   storeUsername: z.string().nullable(),
@@ -236,6 +238,17 @@ export const pricePositionFilterSchema = z.object({
   /** 'over' = we are dearer than the cheapest rival, 'under' = we undercut it. */
   stance: z.enum(['any', 'over', 'under', 'equal']).default('any').catch('any'),
   matched: z.enum(['any', 'set', 'name', 'none']).default('any').catch('any'),
+  /**
+   * Gaps too large to be a pricing decision, hidden by default.
+   *
+   * A LEGO collectible series carries one set number across the single blind
+   * bag, the keychain and the box of sixty, so a pairing can be perfectly
+   * correct and still read as "+20.900%". Sorted by gap — the default — those
+   * rows occupy the entire first page and bury every real decision behind them.
+   * They are still one click away, because a genuinely mispriced product can
+   * also land here.
+   */
+  extreme: z.enum(['hide', 'show']).default('hide').catch('hide'),
   minRivals: intFromQuery.nonnegative().max(50).optional().catch(undefined),
   marketplace: marketplaceSchema.optional().catch(undefined),
   sort: z.enum(['gap', 'position', 'rivals', 'price', 'name']).default('gap').catch('gap'),

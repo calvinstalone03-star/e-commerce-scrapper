@@ -361,6 +361,13 @@ export async function getKeywordComparison(keyword: string): Promise<
 const NAME_MATCH_THRESHOLD = 0.45;
 
 /**
+ * A price ratio past which the pairing is a packaging difference, not a
+ * position: 1.0 means "double, or half". Expressed as a ratio rather than a
+ * percentage because that is what the SQL compares.
+ */
+const EXTREME_GAP = 1.0;
+
+/**
  * Our products beside their rivals'.
  *
  * The join is on `set_code` wherever both sides have one. That is the whole
@@ -395,7 +402,7 @@ const ourProducts = sql`
 
 /** Everyone else's, priced. A rival with no price cannot undercut anyone. */
 const theirProducts = sql`
-  SELECT p.id, p.marketplace, p.name, p.url, p.set_code,
+  SELECT p.id, p.marketplace, p.name, p.url, p.image, p.set_code,
          s.id AS store_id, s.username AS store_username, s.name AS store_name,
          l.price, l.sold, l.rating_star, l.scraped_at
   FROM products p
@@ -439,6 +446,19 @@ export async function getPricePositions(
           : filter.matched === 'name'
             ? sql`AND agg.rivals > 0 AND m.set_code IS NULL`
             : sql``
+    }
+    ${
+      // Extreme gaps are a packaging artefact far more often than a pricing
+      // mistake — one set number spans a single minifigure and a box of sixty.
+      // A row with no rival has no gap and is not extreme, so it stays.
+      filter.extreme === 'hide'
+        ? sql`AND (
+            agg.cheapest_price IS NULL
+            OR m.price IS NULL
+            OR agg.cheapest_price = 0
+            OR abs((m.price - agg.cheapest_price) / agg.cheapest_price) < ${EXTREME_GAP}
+          )`
+        : sql``
     }
     ${
       // A stance is a claim about our price against the cheapest rival, so it
@@ -573,7 +593,7 @@ export async function getPricePositionDetail(
     WITH latest AS (${latestSnapshots}),
     mine AS (SELECT * FROM (${ourProducts}) o WHERE o.id = ${productId}),
     rivals AS (${theirProducts})
-    SELECT r.id, r.marketplace, r.name, r.url,
+    SELECT r.id, r.marketplace, r.name, r.url, r.image,
            r.set_code AS "setCode",
            r.store_id AS "storeId",
            r.store_username AS "storeUsername",
