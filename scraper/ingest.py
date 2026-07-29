@@ -28,9 +28,11 @@ import hashlib
 import logging
 import os
 import secrets
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -236,6 +238,11 @@ def deep_find_items(payload: Any) -> list[dict[str, Any]]:
 #: is Shopee's in-shop search, which a storefront run navigates to and which
 #: names its term differently from the site-wide one. Same list as the
 #: extension's ``SEARCH_PARAMS`` in sites.js.
+#: When this process loaded its code, for the staleness check in /health. Taken
+#: at import rather than at server start so it reflects the code, not the socket.
+_STARTED_AT = time.time()
+
+
 _SEARCH_PARAMS = ("keyword", "q", "search", "st", "searchKeyword")
 
 
@@ -750,11 +757,31 @@ def build_app(settings: Settings | None = None, service: IngestService | None = 
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        """Liveness probe the extension popup uses to show connection state."""
+        """Liveness probe the extension popup uses to show connection state.
+
+        It also answers "is this process running the code on disk?", which is
+        not a theoretical question: this server runs under launchd and survives
+        edits, so twice now a fix landed in the source, the extension kept
+        posting to a process that predated it, and the bug went on happening in
+        a way that looked like the fix had not worked. `stale` compares the
+        newest source file against the moment this process imported it.
+        """
+        newest = 0.0
+        for path in Path(__file__).parent.glob("**/*.py"):
+            try:
+                newest = max(newest, path.stat().st_mtime)
+            except OSError:  # pragma: no cover - a file vanishing mid-glob
+                continue
+
         return {
             "ok": True,
             "marketplace": Marketplace.SHOPEE.value,
             "captured_paths": list(CAPTURED_PATHS),
+            "started_at": datetime.fromtimestamp(_STARTED_AT, tz=timezone.utc).isoformat(),
+            "source_changed_at": datetime.fromtimestamp(newest, tz=timezone.utc).isoformat(),
+            # True means: restart me. `launchctl kickstart -k
+            # gui/$UID/com.ecomscraper.ingest`
+            "stale": newest > _STARTED_AT,
         }
 
     @app.post("/ingest")

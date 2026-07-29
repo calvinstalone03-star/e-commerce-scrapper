@@ -214,7 +214,16 @@
       // same key its products carry — so items read there can be tied to it
       // without guessing. `/<shopSlug>/product` is the same shop's full grid.
       shopPage(url) {
-        const segments = url.pathname.split('/').filter(Boolean);
+        // `/<slug>`, `/<slug>/product`, and `/<slug>/product/page/2` — the last
+        // is the same grid on its second page, and reading it as "not a shop
+        // page" cost the rows there their seller name.
+        const segments = url.pathname
+          .split('/')
+          .filter(Boolean)
+          .filter((segment, index, all) => {
+            const isPageNumber = index >= 2 && all[index - 1] === 'page';
+            return segment !== 'page' && !isPageNumber;
+          });
         if (!segments.length || segments.length > 2) return null;
         const [slug, section] = segments;
         if (this.NON_SHOP_SEGMENTS.has(slug.toLowerCase())) return null;
@@ -232,18 +241,34 @@
       shopSearchNeedsShopKey: false,
       searchInsideShopPage: false,
 
-      //: Tokopedia numbers from one.
+      //: Tokopedia numbers from one, and puts the number in the *path* rather
+      //: than the query string:
+      //:
+      //:   /luxasia-lego-auth-distributor/product/page/2
+      //:
+      //: Not `?page=2`, which is what this used to build and what Shopee uses.
+      //: A shop grid asked for that way answers with page one every time, so a
+      //: catalogue walk read the same first page over and over — and the run
+      //: stopped early, since a page with nothing new twice running is how it
+      //: decides the results have run out.
+      //:
+      //: The query string is preserved because the in-shop search term lives
+      //: there (`?q=lego`), and dropped page numbers are stripped so paging is
+      //: idempotent: page 3 is built from page 2's address, not appended to it.
       pagedUrl(rawUrl, index) {
         const url = new URL(rawUrl);
-        if (index > 0) url.searchParams.set('page', String(index + 1));
-        else url.searchParams.delete('page');
+        const base = url.pathname.replace(/\/page\/\d+\/?$/, '');
+        url.pathname = index > 0 ? `${base}/page/${index + 1}` : base;
+        url.searchParams.delete('page');
         return url.href;
       },
 
       shopUrl(shop, keyword, page = 0) {
         const url = new URL(`https://www.tokopedia.com/${encodeURIComponent(shop.slug)}/product`);
         if (keyword) url.searchParams.set('q', keyword);
-        if (page > 0) url.searchParams.set('page', String(page + 1));
+        // Same path-based numbering as pagedUrl; kept in one shape so a URL
+        // built here and one paged later are the same kind of address.
+        if (page > 0) url.pathname = `${url.pathname}/page/${page + 1}`;
         return url.href;
       },
 

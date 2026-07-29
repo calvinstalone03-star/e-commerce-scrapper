@@ -116,6 +116,15 @@ async function refresh() {
     $('resume').classList.remove('on');
   }
 
+  // A server running code older than the file on disk will keep reproducing
+  // bugs that are already fixed, and nothing else in this popup would say so.
+  if (context.stale) {
+    setResult(
+      'server ingest memakai kode lama — jalankan: launchctl kickstart -k gui/$UID/com.ecomscraper.ingest',
+      'bad',
+    );
+  }
+
   if (context.stats) {
     $('tproducts').textContent = context.stats.products ?? '–';
     $('tsnapshots').textContent = context.stats.snapshots ?? '–';

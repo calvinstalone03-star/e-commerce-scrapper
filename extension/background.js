@@ -1038,6 +1038,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         /* server down; the popup renders that state */
       }
 
+      // Whether the server is running the code that is on disk. It runs under
+      // launchd and survives edits, so a fix can land in the source while the
+      // process that predates it keeps filing the rows the fix was meant to
+      // stop — twice now, and both times it looked like the fix had failed.
+      let stale = false;
+      try {
+        const response = await fetch(`${endpoint}/health`);
+        if (response.ok) stale = Boolean((await response.json()).stale);
+      } catch (err) {
+        /* server down; already reported through `stats` */
+      }
+
       // A tab already sitting on a storefront pre-fills the shop box: that is
       // the shop the user is looking at, and retyping it would be busywork.
       let shopFromTab = '';
@@ -1061,6 +1073,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         shop: shopFromTab || prefs.shop,
         target: prefs.target,
         stats,
+        stale,
         job: snapshot(),
         resume: resume
           ? {
