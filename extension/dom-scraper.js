@@ -270,6 +270,141 @@
     return { items, anchorsSeen: anchors.length };
   }
 
+  // A storefront's own search box, and why typing into it beats building the
+  // address by hand. Shopee answers an in-shop search on /search for an ordinary
+  // shop and on /mall/search for a Mall one, filtered by a numeric shop id, and
+  // nothing on the storefront says which it is. Asking for the wrong one returns
+  // no results — indistinguishable from a shop that simply does not stock the
+  // term — and paginating that emptiness is what a run did before this. The
+  // shop's own box has neither problem: whatever route the shop uses is the one
+  // the site navigates to, and the address it lands on is a template the caller
+  // can page through.
+  //
+  // Which box is the shop's is the only judgement here. A marketplace header
+  // also carries a site-wide box, and typing into that searches everything, so
+  // a placeholder naming the shop is what qualifies — "Cari di toko ini",
+  // "Search in shop". The caller checks the resulting address anyway.
+  const SHOP_SEARCH_PLACEHOLDER = /(di\s*toko|dalam\s*toko|toko\s*ini|in\s*(this\s*)?shop|in\s*store)/i;
+
+  function shopSearchInput() {
+    const inputs = document.querySelectorAll('input[type="text"], input[type="search"], input:not([type])');
+    for (const input of inputs) {
+      if (input.disabled || input.readOnly) continue;
+      const label = `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}`;
+      if (!SHOP_SEARCH_PLACEHOLDER.test(label)) continue;
+      const box = input.getBoundingClientRect();
+      if (!box.width || !box.height) continue; // rendered but hidden
+      return input;
+    }
+    return null;
+  }
+
+  function typeInto(input, text) {
+    // A React-controlled input ignores a plain `value =` assignment: the value
+    // is set on the DOM node but React's own tracker still holds the old one and
+    // reverts it on the next render. Going through the prototype's setter is
+    // what makes the framework see the change.
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    input.focus();
+    setter.call(input, text);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function submitSearch(input) {
+    // Enter is what a person presses, and on both sites the box listens for it.
+    // The form submit and the adjacent button are there for the layout where it
+    // does not — pressing Enter on a box with no handler does nothing at all,
+    // and a silent no-op here reads downstream as "the shop has no results".
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      input.dispatchEvent(
+        new KeyboardEvent(type, {
+          key: 'Enter',
+          code: 'Enter',
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    }
+
+    const form = input.closest('form');
+    if (form) {
+      if (typeof form.requestSubmit === 'function') form.requestSubmit();
+      else form.submit();
+      return true;
+    }
+
+    const button = input.parentElement?.querySelector('button, [role="button"]');
+    if (button) button.click();
+    return true;
+  }
+
+  // Shopee runs two storefront layouts. A Mall shop wears the "Shopee Mall"
+  // wordmark and a `Mall | ORI` badge; an ordinary one wears plain "Shopee" and
+  // whatever seller badge it has earned. The two answer in-shop search on
+  // different routes — /mall/search and /search — so which layout this is
+  // decides which route to try first when the search box cannot be used.
+  //
+  // Only the order. Nothing here is trusted to be right: the caller checks the
+  // shop ids that come back either way, so a misread costs one extra page load
+  // rather than a wrong shop's products.
+  const MALL_MARKER = /shopee\s*mall/i;
+
+  function isMallShop() {
+    if (MALL_MARKER.test(document.title)) return true;
+
+    const meta = document.querySelector('meta[property="og:title"], meta[name="og:title"]');
+    if (meta && MALL_MARKER.test(meta.getAttribute('content') || '')) return true;
+
+    for (const image of document.querySelectorAll('img[alt]')) {
+      const alt = (image.getAttribute('alt') || '').trim();
+      if (MALL_MARKER.test(alt)) return true;
+      // The badge on the shop card is its own image, labelled just "Mall".
+      if (/^mall(\s*[|·-]\s*ori)?$/i.test(alt)) return true;
+    }
+
+    return false;
+  }
+
+  // The tab a storefront opens on is its home page — vouchers, banners and a
+  // "kamu mungkin suka" strip — not the shop's catalogue. The catalogue is one
+  // tab over, under "Produk", and reading the home page instead is how a
+  // keyword-less shop run ended up filing recommendations.
+  const PRODUCTS_TAB = /^(produk|semua\s*produk|all\s*products|products)$/i;
+
+  function productsTab() {
+    for (const node of document.querySelectorAll('a, [role="tab"], [role="button"], button, div')) {
+      if (node.children.length) continue; // the leaf holding the label
+      if (!PRODUCTS_TAB.test((node.textContent || '').trim())) continue;
+      const box = node.getBoundingClientRect();
+      if (!box.width || !box.height) continue;
+      return node;
+    }
+    return null;
+  }
+
+  function openProducts() {
+    const tab = productsTab();
+    if (!tab) return { ok: false, error: 'tab Produk tidak ditemukan' };
+    // The label is usually a span inside the real control, so the click is aimed
+    // at the nearest thing that looks clickable and allowed to bubble.
+    const target = tab.closest('a, button, [role="tab"], [role="button"]') || tab;
+    target.click();
+    return { ok: true };
+  }
+
+  function searchInShop(keyword) {
+    const input = shopSearchInput();
+    if (!input) return { ok: false, error: 'kotak cari di toko tidak ditemukan' };
+    typeInto(input, keyword);
+    submitSearch(input);
+    // The navigation this starts is watched from the service worker: it owns the
+    // tab, and this world is about to be replaced by the one the search lands on.
+    return { ok: true, placeholder: input.placeholder || null };
+  }
+
   //: How long to keep waiting for the first card to render. Shopee's search
   //: grid routinely takes several seconds on a cold cache, and the old fixed
   //: delay in the service worker was the single biggest source of "no product
@@ -294,7 +429,7 @@
     return 0;
   }
 
-  async function scrollThroughGrid(config, budgetMs) {
+  async function scrollThroughGrid(config, budgetMs, enough) {
     // Scroll a viewport at a time rather than jumping to the bottom: lazy grids
     // render what passes through the viewport, and a single jump skips most of
     // it. Counting cards (not scrollHeight) is what decides when to stop, since
@@ -305,6 +440,10 @@
 
     for (let step = 0; step < SCROLL_STEPS; step += 1) {
       if (Date.now() > deadline) break;
+      // The caller asked for a number of products, and this page already holds
+      // it. Scrolling out the rest of a 60-card grid to file five of them is
+      // the longest part of a short run.
+      if (enough && best >= enough) break;
       window.scrollBy(0, Math.round(window.innerHeight * 0.9));
       await sleep(SCROLL_PAUSE_MS);
 
@@ -339,8 +478,9 @@
     // Nothing at all after the full wait: either the page is not a listing page
     // or the grid never rendered. Either way, scrolling an empty page is a waste
     // of the caller's time — report and let it decide.
-    if (found && options.autoScroll !== false) {
-      await scrollThroughGrid(config, options.scrollBudgetMs ?? 25_000);
+    const enough = Number(options.enough) > 0 ? Number(options.enough) : 0;
+    if (found && options.autoScroll !== false && !(enough && found >= enough)) {
+      await scrollThroughGrid(config, options.scrollBudgetMs ?? 25_000, enough);
     }
 
     const { items, anchorsSeen } = collect(config);
@@ -362,6 +502,8 @@
       marketplace: config.marketplace,
       items,
       shop,
+      // Which storefront layout this is, for the caller's route ordering.
+      mall: config.marketplace === 'shopee' ? isMallShop() : false,
       pageUrl: window.location.href,
       scrapedAt: new Date().toISOString(),
       // Lets "0 items" be told apart from "the page had no links yet".
@@ -374,6 +516,19 @@
     // starts a scrape. Cheaper and far more reliable than guessing with a timer.
     if (message?.type === 'ping') {
       sendResponse({ ok: true, url: window.location.href, ready: document.readyState });
+      return true;
+    }
+
+    if (message?.type === 'shopSearch' || message?.type === 'openProducts') {
+      try {
+        sendResponse(
+          message.type === 'shopSearch'
+            ? searchInShop(String(message.keyword || ''))
+            : openProducts(),
+        );
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message || err) });
+      }
       return true;
     }
 

@@ -75,22 +75,84 @@
         return { shopKey: null, username: slug };
       },
 
-      // A shop's own product grid. `keyword` rides along in the site's own
-      // parameter name — if this front end ignores it the run is merely longer,
-      // because the caller filters on the product name regardless.
-      shopUrl(slug, keyword, page = 0) {
-        const url = new URL(`https://shopee.co.id/${encodeURIComponent(slug)}`);
+      // Searching inside a Shopee shop is not a storefront route at all: it is
+      // the ordinary search page filtered by shop id.
+      //
+      //   /search?keyword=dinosaurus&shop=312618972
+      //   /mall/search?keyword=dinosaurus&shop=312618972
+      //
+      // Which of the two answers depends on the shop, so both are listed and
+      // the resolver keeps whichever returns that shop's products. Getting it
+      // wrong is not a visible error — an ignored `shop` filter returns the
+      // whole marketplace, which reads as a successful scrape of the wrong
+      // shop — so the caller checks the ids come back right.
+      //
+      // The filter wants the numeric id and a person types a name, which is
+      // why the storefront is opened first: its product links carry the id.
+      SHOP_SEARCH_PATHS: ['/search', '/mall/search'],
+
+      //: The filter takes the numeric id, which exists nowhere but inside the
+      //: shop's own product links — so the storefront has to be read before the
+      //: search can be asked for.
+      shopSearchNeedsShopKey: true,
+
+      //: Which of the two routes a shop answers on depends on whether it is a
+      //: Mall shop, and the storefront does not say. Rather than guess, the
+      //: storefront's own "cari di toko ini" box is typed into and Shopee builds
+      //: the address itself. The guessing stays as a fallback for a storefront
+      //: whose search box cannot be found.
+      searchInsideShopPage: true,
+
+      //: Shopee numbers every paginated list from zero, so a URL the site itself
+      //: produced becomes page N by setting one parameter.
+      pagedUrl(rawUrl, index) {
+        const url = new URL(rawUrl);
+        if (index > 0) url.searchParams.set('page', String(index));
+        else url.searchParams.delete('page');
+        return url.href;
+      },
+
+      // `shop` is `{ slug, shopKey }` — the storefront's own grid when there is
+      // no term or no id to filter on, the shop-filtered search when there is.
+      // `variant` indexes SHOP_SEARCH_PATHS, and a job pins the one that
+      // answered so pages 2..N stay on the route page 1 came from.
+      shopUrl(shop, keyword, page = 0, variant = 0) {
+        if (keyword && shop.shopKey) {
+          const path = this.SHOP_SEARCH_PATHS[variant] || this.SHOP_SEARCH_PATHS[0];
+          const url = new URL(`https://shopee.co.id${path}`);
+          url.searchParams.set('keyword', keyword);
+          url.searchParams.set('shop', String(shop.shopKey));
+          if (page > 0) url.searchParams.set('page', String(page));
+          return url.href;
+        }
+
+        const url = new URL(`https://shopee.co.id/${encodeURIComponent(shop.slug)}`);
         url.searchParams.set('sortBy', 'pop');
-        if (keyword) url.searchParams.set('keyword', keyword);
         if (page > 0) url.searchParams.set('page', String(page));
         return url.href;
       },
 
-      // Shopee usernames are one token: "Toko Mainanku" is `tokomainanku` far
-      // more often than `toko-mainanku`, but both get a try before giving up.
+      // Which hand-built routes to try, in order. A Mall storefront answers on
+      // /mall/search and an ordinary one on /search, so the layout read off the
+      // page puts the likely one first; the other still follows, because the
+      // detection is a heuristic and the ids are what actually decide.
+      shopUrlVariants(shop, keyword) {
+        if (!keyword || !shop.shopKey) return [];
+        return shop.mall ? [1, 0] : [0, 1];
+      },
+
+      // Shopee usernames are one token more often than not: "Toko Mainanku" is
+      // usually `tokomainanku`. Brand storefronts split on a dot (`lego.indonesia`)
+      // and a few use a hyphen, so all three get a try before giving up — each
+      // costs a page load, so they are ordered by how common they are.
       slugCandidates(text) {
         const lower = text.toLowerCase();
-        return [lower.replace(/\s+/g, ''), lower.replace(/\s+/g, '-')];
+        return [...new Set([
+          lower.replace(/\s+/g, ''),
+          lower.replace(/\s+/g, '.'),
+          lower.replace(/\s+/g, '-'),
+          lower.replace(/\s+/g, '_'),
+        ])];
       },
     },
 
@@ -149,12 +211,32 @@
       },
 
       // The shop's full product grid, which is paginated and searchable in a way
-      // the storefront landing page is not.
-      shopUrl(slug, keyword, page = 0) {
-        const url = new URL(`https://www.tokopedia.com/${encodeURIComponent(slug)}/product`);
+      // the storefront landing page is not. Tokopedia keys everything on the
+      // slug, so `shop.shopKey` — Shopee's numeric id — has no counterpart here
+      // and the one route serves both the plain grid and the in-shop search.
+      //: The slug in the address is the same key the products carry, so a shop
+      //: search can be asked for straight away — no storefront visit, no search
+      //: box to type into.
+      shopSearchNeedsShopKey: false,
+      searchInsideShopPage: false,
+
+      //: Tokopedia numbers from one.
+      pagedUrl(rawUrl, index) {
+        const url = new URL(rawUrl);
+        if (index > 0) url.searchParams.set('page', String(index + 1));
+        else url.searchParams.delete('page');
+        return url.href;
+      },
+
+      shopUrl(shop, keyword, page = 0) {
+        const url = new URL(`https://www.tokopedia.com/${encodeURIComponent(shop.slug)}/product`);
         if (keyword) url.searchParams.set('q', keyword);
         if (page > 0) url.searchParams.set('page', String(page + 1));
         return url.href;
+      },
+
+      shopUrlVariants(shop, keyword) {
+        return keyword ? [0] : [];
       },
 
       // Tokopedia slugs are hyphenated far more often than not.
@@ -176,7 +258,12 @@
   //: scraper/ingest.py's `_SEARCH_PARAMS` — the server is still the one that
   //: records the keyword, this copy only lets the popup pre-fill and lets a
   //: paginated run continue a search the user started by hand.
-  const SEARCH_PARAMS = ['keyword', 'q', 'search', 'st'];
+  //: `searchKeyword` is Shopee's, on the storefront URL a search-suggestion
+  //: click lands on (`?entryPoint=ShopBySearch&searchKeyword=lego`). Nothing
+  //: here builds that address — the shop-filtered search is what this
+  //: paginates — but a tab already sitting on one should still pre-fill the
+  //: keyword box rather than look termless.
+  const SEARCH_PARAMS = ['keyword', 'q', 'search', 'st', 'searchKeyword'];
 
   function keywordFromUrl(rawUrl) {
     let url;

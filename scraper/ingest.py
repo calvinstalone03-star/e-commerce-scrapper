@@ -232,8 +232,11 @@ def deep_find_items(payload: Any) -> list[dict[str, Any]]:
 
 
 
-#: Query parameters each marketplace puts the search term in.
-_SEARCH_PARAMS = ("keyword", "q", "search", "st")
+#: Query parameters each marketplace puts the search term in. ``searchKeyword``
+#: is Shopee's in-shop search, which a storefront run navigates to and which
+#: names its term differently from the site-wide one. Same list as the
+#: extension's ``SEARCH_PARAMS`` in sites.js.
+_SEARCH_PARAMS = ("keyword", "q", "search", "st", "searchKeyword")
 
 
 def keyword_from_url(page_url: str) -> str:

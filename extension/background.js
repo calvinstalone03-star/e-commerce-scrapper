@@ -165,7 +165,17 @@ function sameSearch(a, b) {
     if (left.hostname !== right.hostname || left.pathname !== right.pathname) return false;
     const term = (url) =>
       (globalThis.ecomKeywordFromUrl(url.href) || '').toLowerCase();
-    if (term(left) !== term(right)) return false;
+    // Two terms that disagree are two different pages. A tab that states no
+    // term at all is not: both sites rewrite their own query string as the app
+    // boots, and treating that as "wrong page" is what made shop-mode runs sit
+    // out the 25-second readiness loop and then report the shop as missing.
+    const [here, wanted] = [term(left), term(right)];
+    if (here && wanted && here !== wanted) return false;
+    // Two shops' results share a path and a term on Shopee and differ only in
+    // `shop`, so a page of one must never pass for a page of the other.
+    if ((left.searchParams.get('shop') || '') !== (right.searchParams.get('shop') || '')) {
+      return false;
+    }
     return (left.searchParams.get('page') || '0') === (right.searchParams.get('page') || '0');
   } catch (err) {
     return false;
@@ -207,8 +217,15 @@ async function navigateAndWait(tabId, url) {
   const deadline = Date.now() + 25_000;
   while (Date.now() < deadline) {
     if (job?.cancelled) return { ok: false, error: 'dibatalkan' };
-    await ensureScraper(tabId);
-    const pong = await ping(tabId);
+    // Ask before injecting. The manifest already put the content script in most
+    // tabs, so an injection per half-second was two round-trips to learn what
+    // one answers — and the injection is only ever needed for a tab that
+    // predates the extension being loaded.
+    let pong = await ping(tabId);
+    if (!pong?.ok) {
+      await ensureScraper(tabId);
+      pong = await ping(tabId);
+    }
     if (pong?.ok && sameSearch(pong.url, url)) return { ok: true };
     await sleep(500);
   }
@@ -244,12 +261,23 @@ function keywordTokens(keyword) {
 }
 
 function matchesKeyword(name, tokens) {
-  // Every word has to appear somewhere in the product name. A shop grid is not
-  // a search engine — "lego technic" must not match every LEGO in the shop —
-  // and the site's own in-shop search parameter is not something this can
-  // depend on, so the filter runs here either way.
+  // Every word has to appear somewhere in the product name. A shop's catalogue
+  // is not a search engine — "lego technic" must not match every LEGO in the
+  // shop — so when this job is the one walking the catalogue, it does the
+  // matching itself.
+  //
+  // Loosely at the end of a word, though. Indonesian borrows English nouns and
+  // keeps both spellings in circulation: a shopper types "dinosaurus" and the
+  // seller wrote "Dinosaur". Requiring the whole word matched neither, so a
+  // shortened stem is accepted too — enough of the word to still be that word,
+  // never fewer than five characters, which keeps "lego" exact and stops short
+  // tokens from matching everything.
   const haystack = String(name || '').toLowerCase();
-  return tokens.every((token) => haystack.includes(token));
+  return tokens.every((token) => {
+    if (haystack.includes(token)) return true;
+    if (token.length <= 5) return false;
+    return haystack.includes(token.slice(0, Math.max(5, token.length - 2)));
+  });
 }
 
 async function postItems(page, items) {
@@ -292,28 +320,353 @@ async function postItems(page, items) {
 // The job itself
 // ---------------------------------------------------------------------------
 
+//: How much of a page has to belong to one shop before the page counts as that
+//: shop's. A storefront renders other shops' recommendations alongside its own
+//: grid, so a clear majority is the test rather than unanimity.
+const SHOP_MAJORITY = 0.6;
+
+//: How long to wait for cards while *probing* a shop-search route, as opposed
+//: to reading a page the job has already committed to. Shopee serves one of two
+//: search routes depending on whether the shop is a Mall shop, and there is
+//: nothing on the storefront that reliably says which — so one of the two is
+//: usually a wasted load, and the full 20-second card wait is spent finding out
+//: what an empty grid already showed in a few seconds. A page slow enough to
+//: miss this is not lost: the run falls back to the shop's full grid.
+const PROBE_WAIT_MS = 9_000;
+
+//: Products read beyond the number asked for. Both sites repeat listings
+//: between pages and sprinkle sponsored rows, so a page that holds exactly the
+//: remaining count usually yields slightly fewer once deduplicated.
+const SCROLL_SPARE = 6;
+
+function dominantShopKey(items) {
+  const counts = new Map();
+  for (const item of items) counts.set(item.shopKey, (counts.get(item.shopKey) || 0) + 1);
+  let best = null;
+  let bestCount = 0;
+  for (const [key, count] of counts) {
+    if (count > bestCount) {
+      best = key;
+      bestCount = count;
+    }
+  }
+  return best && bestCount >= Math.max(2, items.length * SHOP_MAJORITY) ? best : null;
+}
+
+function belongsToShop(items, shopKey) {
+  if (!items.length) return false;
+  const mine = items.filter((item) => item.shopKey === shopKey).length;
+  return mine >= Math.max(1, items.length * SHOP_MAJORITY);
+}
+
+async function openShopGrid(tabId, site, slug) {
+  // Read, but do not walk. This visit exists to answer three questions — is
+  // this slug a shop, what is its numeric id, what is it called — and all three
+  // are settled by the first handful of cards and the page's own title. Every
+  // row past that is scrolled into existence for nothing, and on a storefront
+  // home tab those rows are recommendations that no run ever files.
+  let url = site.shopUrl({ slug, shopKey: null }, null, 0);
+
+  // The tab is often already on this shop — the popup pre-fills its box from
+  // whatever storefront is open, so the usual flow is "look at a shop, press
+  // scrape". Reloading the page the user is looking at buys nothing.
+  let current = '';
+  try {
+    current = (await chrome.tabs.get(tabId)).url || '';
+  } catch (err) {
+    /* tab gone; the navigation below reports it */
+  }
+  let alreadyHere = false;
+  try {
+    alreadyHere = (site.shopPage(new URL(current)) || {}).username === slug;
+  } catch (err) {
+    /* not a URL, or not a storefront */
+  }
+
+  if (alreadyHere) {
+    url = current;
+  } else {
+    const navigated = await navigateAndWait(tabId, url);
+    if (!navigated.ok) return null;
+  }
+
+  const page = await scrapeTab(tabId, { autoScroll: false });
+  return page?.ok && page.items.length ? { page, url } : null;
+}
+
+async function shopCatalogue(tabId, grid) {
+  // The shop's catalogue, from the storefront page already visited. Used both
+  // when there is no keyword at all and when no search route answered one — in
+  // either case what the job walks is the full product list, filtered here on
+  // the product name. Falls back to the storefront page as read: worse (it is
+  // the home tab's recommendations) but never nothing.
+  let current = '';
+  try {
+    current = (await chrome.tabs.get(tabId)).url || '';
+  } catch (err) {
+    return { page: grid.page, template: grid.url };
+  }
+
+  // A failed search left the tab elsewhere; the tab has to be back on the
+  // storefront for its tabs to be there to click.
+  if (!sameSearch(current, grid.url)) {
+    const navigated = await navigateAndWait(tabId, grid.url);
+    if (!navigated.ok) return { page: grid.page, template: grid.url };
+  }
+
+  const productsUrl = await openShopProducts(tabId);
+  if (!productsUrl) return { page: grid.page, template: grid.url };
+
+  // A catalogue read with a keyword still has to be filtered, and a filter needs
+  // the whole page to filter; without one, the count asked for is the stopping
+  // point.
+  const products = await scrapeTab(tabId, {
+    autoScroll: true,
+    ...(job.keyword ? {} : { enough: job.target + SCROLL_SPARE }),
+  });
+  if (!products?.ok || !products.items.length) return { page: grid.page, template: grid.url };
+  return { page: products, template: products.pageUrl || productsUrl };
+}
+
+async function openShopProducts(tabId) {
+  // A storefront opens on its home tab: vouchers, banners, and a "kamu mungkin
+  // suka" strip that is recommendations rather than the shop's catalogue. The
+  // catalogue is the "Produk" tab, and clicking it is how the site itself gets
+  // there — its address is not something to guess at, and once clicked it is the
+  // address the rest of the run pages through.
+  let before = '';
+  try {
+    before = (await chrome.tabs.get(tabId)).url || '';
+  } catch (err) {
+    return null;
+  }
+
+  await ensureScraper(tabId);
+  let asked;
+  try {
+    asked = await chrome.tabs.sendMessage(tabId, { type: 'openProducts' });
+  } catch (err) {
+    return null;
+  }
+  if (!asked?.ok) return null;
+
+  const deadline = Date.now() + SEARCH_NAV_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (job?.cancelled) return null;
+    await sleep(500);
+    let current = '';
+    try {
+      current = (await chrome.tabs.get(tabId)).url || '';
+    } catch (err) {
+      return null;
+    }
+    if (current !== before) return current;
+  }
+  // Clicked, but the tab is rendered in place. The grid on screen is still the
+  // catalogue — it just cannot be paged through by address.
+  return before;
+}
+
+//: How long to give the site to act on a search typed into a shop's own box.
+//: This is a click's worth of work, not a page load — if nothing has moved by
+//: now the box was not the shop's, or nothing was listening to it.
+const SEARCH_NAV_TIMEOUT_MS = 12_000;
+
+async function searchInsideShop(tabId, keyword) {
+  // Type the term into the storefront's own search box and let the site decide
+  // where that goes. Shopee's answer depends on whether the shop is a Mall shop
+  // — /mall/search for one, /search for the other, both filtered by a numeric
+  // id — and building either by hand means guessing, then paginating the empty
+  // results of a wrong guess. The address the site itself lands on is the right
+  // one by construction, and it is also the template for pages 2..N.
+  let before = '';
+  try {
+    before = (await chrome.tabs.get(tabId)).url || '';
+  } catch (err) {
+    return null;
+  }
+
+  await ensureScraper(tabId);
+  let asked;
+  try {
+    asked = await chrome.tabs.sendMessage(tabId, { type: 'shopSearch', keyword });
+  } catch (err) {
+    return null;
+  }
+  if (!asked?.ok) return null;
+
+  // The search is a navigation on Shopee and a route change on some layouts, so
+  // the tab's own URL is what says it happened — not the load event, which a
+  // client-side route change never fires.
+  const deadline = Date.now() + SEARCH_NAV_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (job?.cancelled) return null;
+    await sleep(500);
+    let current = '';
+    try {
+      current = (await chrome.tabs.get(tabId)).url || '';
+    } catch (err) {
+      return null;
+    }
+    if (current === before) continue;
+    const term = (globalThis.ecomKeywordFromUrl(current) || '').toLowerCase();
+    if (term !== keyword.toLowerCase()) continue; // still settling
+    return current;
+  }
+  return null;
+}
+
 async function resolveShop(tabId, site, slugs) {
-  // A display name is a guess at a slug, so the storefront itself is the test:
-  // whichever candidate answers with products is the shop. Its first page is
-  // handed back rather than thrown away — it is exactly the page the job wants
-  // to read next.
+  // Two questions, in order: which storefront is this, and does that shop have
+  // a searchable route.
+  //
+  // A display name is a guess at a slug, so the storefront itself is the test —
+  // whichever candidate answers with products is the shop. It is also the only
+  // place the shop states its own name, and on Shopee the only place its
+  // numeric id can be read, since the id exists nowhere but in the product
+  // links of its own grid. That id is what the in-shop search filters on.
+  //
+  // With the shop known and a keyword to apply, the search comes from the shop's
+  // own box wherever the site has one: whatever address that lands on is a real
+  // in-shop search, Mall or not, and it doubles as the template for pages 2..N.
+  // Building the address by hand is the fallback, and it is a guess — asking the
+  // wrong route returns nothing, which is indistinguishable from a shop that
+  // does not stock the term, and paginating that emptiness is exactly what a run
+  // used to do.
+  //
+  // Either way a result only counts when the ids come back matching. A route
+  // that answers with *other* shops' products is worse than one that answers
+  // with none, because it looks like success.
+  //
+  // When nothing answers, the storefront grid already in hand is the answer: the
+  // shop is plainly there, and the keyword filter this job applies to every
+  // product name works over the full grid just the same, only across more pages.
+  // Reporting "shop not found" for a shop that is visibly open was the more
+  // confusing of the two failures.
   for (const slug of slugs) {
     if (job.cancelled) return null;
-    setStatus(`membuka toko ${slug}…`);
-    const navigated = await navigateAndWait(tabId, site.shopUrl(slug, job.keyword, 0));
-    if (!navigated.ok) continue;
 
-    const page = await scrapeTab(tabId, { autoScroll: true });
-    if (page?.ok && page.items.length) return { slug, page };
+    // Tokopedia keys its shop search on the slug the user already gave, so the
+    // storefront visit is skipped there and the search is asked for directly —
+    // and since that route *is* a shop page, the name and username come back
+    // with it anyway. Only Shopee has to pay for the extra load.
+    let shop = { slug, shopKey: null, name: null, username: slug };
+    let grid = null;
+
+    if (!job.keyword || site.shopSearchNeedsShopKey || site.searchInsideShopPage) {
+      setStatus(`membuka toko ${slug}…`);
+      grid = await openShopGrid(tabId, site, slug);
+      if (!grid) continue;
+      shop = {
+        slug,
+        shopKey: grid.page.shop?.shopKey || dominantShopKey(grid.page.items),
+        name: grid.page.shop?.name || null,
+        username: grid.page.shop?.username || slug,
+        mall: Boolean(grid.page.mall),
+      };
+
+      if (!job.keyword) {
+        // Without a term, the whole catalogue is the job — so leave the home
+        // tab the storefront opened on and go to the one that lists it.
+        setStatus(`membuka daftar produk ${slug}…`);
+        const catalogue = await shopCatalogue(tabId, grid);
+        return {
+          shop: { ...shop, name: shop.name || catalogue.page.shop?.name || null },
+          searched: false,
+          ...catalogue,
+        };
+      }
+    }
+
+    const attempts = [
+      ...(site.searchInsideShopPage ? ['in-page'] : []),
+      ...site.shopUrlVariants(shop, job.keyword),
+    ];
+    if (!attempts.length) continue;
+
+    for (const attempt of attempts) {
+      if (job.cancelled) return null;
+      setStatus(`mencari "${job.keyword}" di ${slug}…`);
+
+      let url;
+      if (attempt === 'in-page') {
+        url = await searchInsideShop(tabId, job.keyword);
+        if (!url) continue;
+      } else {
+        url = site.shopUrl(shop, job.keyword, 0, attempt);
+        const navigated = await navigateAndWait(tabId, url);
+        if (!navigated.ok) continue;
+      }
+
+      // Everything but the last attempt is a probe: an empty grid says the
+      // answer already, and waiting the full card timeout for it is the bulk of
+      // what a wrong guess costs.
+      //
+      // A search page needs no filtering afterwards, so the run can stop
+      // scrolling as soon as the page holds what was asked for — with a few
+      // spare, since repeats between pages are deduplicated away.
+      const probing = attempt !== attempts[attempts.length - 1];
+      const page = await scrapeTab(tabId, {
+        autoScroll: true,
+        enough: job.target + SCROLL_SPARE,
+        ...(probing ? { waitMs: PROBE_WAIT_MS } : {}),
+      });
+      if (!page?.ok || !page.items.length) continue;
+      if (shop.shopKey && !belongsToShop(page.items, shop.shopKey)) continue;
+
+      // A search route that is itself a shop page — Tokopedia's — states the
+      // shop, and that is better than the slug this started from.
+      return {
+        shop: {
+          ...shop,
+          shopKey: shop.shopKey || page.shop?.shopKey || dominantShopKey(page.items),
+          name: shop.name || page.shop?.name || null,
+          username: shop.username || page.shop?.username || slug,
+        },
+        page,
+        template: page.pageUrl || url,
+        searched: true,
+      };
+    }
+
+    // No search answered. The shop's own catalogue is the fallback — read the
+    // storefront now if this site let the search be tried without it.
+    if (!grid) {
+      setStatus(`membuka toko ${slug}…`);
+      grid = await openShopGrid(tabId, site, slug);
+      if (!grid) continue;
+      shop = {
+        slug,
+        shopKey: grid.page.shop?.shopKey || dominantShopKey(grid.page.items),
+        name: grid.page.shop?.name || null,
+        username: grid.page.shop?.username || slug,
+        mall: Boolean(grid.page.mall),
+      };
+    }
+    setStatus(`membuka daftar produk ${slug}…`);
+    const catalogue = await shopCatalogue(tabId, grid);
+    return {
+      shop: { ...shop, name: shop.name || catalogue.page.shop?.name || null },
+      searched: false,
+      ...catalogue,
+    };
   }
   return null;
 }
 
 async function runJob(tabId, site) {
   const seen = new Set();
-  const tokens = job.mode === 'shop' ? keywordTokens(job.keyword) : [];
+  // Words every product name has to contain, when this job is the one doing the
+  // matching. It is not, when the site's own in-shop search answered: a search
+  // for "dinosaurus" returns "LEGO Creator Fierce Dinosaur" and "Jurassic World
+  // 76950 Triceratops", neither of which contains the word typed. Re-checking
+  // the site's results against the literal term threw away every row and left
+  // the run paging for more of what it had already discarded.
+  let tokens = [];
   let barrenPages = 0;
   let pending = null; // a page already read during shop resolution
+  let shop = null; // { slug, shopKey, name, username } once a storefront answered
+  let template = null; // the URL page 1 came from, paged through for the rest
 
   if (job.mode === 'shop') {
     const slugs = globalThis.ecomShopSlugs(site, job.shopInput);
@@ -324,7 +677,15 @@ async function runJob(tabId, site) {
         : `toko "${job.shopInput}" tidak ditemukan atau tidak punya produk — tempel URL tokonya`;
       return;
     }
-    job.slug = resolved.slug;
+    shop = resolved.shop;
+    job.slug = resolved.shop.slug;
+    // The catalogue is the whole shop, so a keyword there is this job's filter.
+    // A search the site ran already did the matching, and better.
+    tokens = resolved.searched ? [] : keywordTokens(job.keyword);
+    // The address page 1 actually came from. Pages 2..N are that same address
+    // with the page number changed, so a run always walks the list it read
+    // rather than one rebuilt from what it hoped the site would answer.
+    template = resolved.template;
     pending = resolved.page;
   }
 
@@ -338,7 +699,7 @@ async function runJob(tabId, site) {
     if (!page && job.mode !== 'page') {
       const wanted =
         job.mode === 'shop'
-          ? site.shopUrl(job.slug, job.keyword, index)
+          ? site.pagedUrl(template, index)
           : site.searchUrl(job.keyword, index);
       let current = '';
       try {
@@ -362,7 +723,15 @@ async function runJob(tabId, site) {
 
     if (!page) {
       setStatus(`membaca halaman ${job.page}…`);
-      page = await scrapeTab(tabId, { autoScroll: true });
+      // Only what is still missing, plus a few for the repeats. Filtering pages
+      // is the exception: what survives the filter is not known until the whole
+      // page has been read.
+      const missing = Math.max(0, job.target - job.unique);
+      const bounded = !tokens.length && job.target < 1e9;
+      page = await scrapeTab(tabId, {
+        autoScroll: true,
+        ...(bounded ? { enough: missing + SCROLL_SPARE } : {}),
+      });
     }
 
     if (!page?.ok) {
@@ -386,6 +755,21 @@ async function runJob(tabId, site) {
     // difference between a working filter and a wrong one.
     const matching = tokens.length ? fresh.filter((item) => matchesKeyword(item.name, tokens)) : fresh;
     job.filtered += fresh.length - matching.length;
+
+    // Shopee's in-shop search runs on /search, which is not a storefront and so
+    // states no seller anywhere — the same reason a keyword scrape stores
+    // `shop-<id>` with no name. The storefront that resolved this job did state
+    // it, and every row here is that shop by construction, so it is carried
+    // over. Only onto rows whose id matches: a search page can still slip a
+    // sponsored listing from elsewhere into the grid, and naming it after this
+    // shop would be worse than leaving it unnamed.
+    if (shop && (shop.name || shop.username)) {
+      for (const item of matching) {
+        if (shop.shopKey && item.shopKey !== shop.shopKey) continue;
+        if (shop.name && !item.shopName) item.shopName = shop.name;
+        if (shop.username && !item.shopUsername) item.shopUsername = shop.username;
+      }
+    }
 
     // Never overshoot the requested count — "ambil 100" should file 100 rows,
     // not 120 because the last page happened to be full.

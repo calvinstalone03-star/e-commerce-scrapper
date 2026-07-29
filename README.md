@@ -195,23 +195,62 @@ Counting is by distinct product, so the repeats both sites sprinkle between
 pages do not inflate the total, and the last page is trimmed rather than
 overshot: asking for 100 files 100.
 
-Fill in **toko** as well and the run walks that shop's own product grid instead
-of the site's search results, on either marketplace. The box takes a username, a
-pasted storefront URL, or the shop's display name — a display name is only a
-guess at a slug, so each site's plausible spellings are tried in order and
-whichever storefront answers with products is the one used. A keyword alongside
-a shop becomes a filter on the product name: every word has to appear, and the
-filter runs here rather than being left to the site's in-shop search, so it
-holds whether or not that front end honours the parameter. The result line says
-how many were dropped, because "3 produk" without "412 tidak cocok" reads as a
-broken scrape. A shop grid's URL carries no search term, so shop mode states the
-keyword outright and `product_keywords` is recorded the same as for a search.
+Fill in **toko** as well and the run walks that shop's products instead of the
+site's search results, on either marketplace. The box takes a username, a pasted
+storefront URL, or the shop's display name — a display name is only a guess at a
+slug, so each site's plausible spellings are tried in order (`lego indonesia` →
+`legoindonesia`, `lego.indonesia`, `lego-indonesia`, `lego_indonesia`) and
+whichever storefront answers with products is the one used.
+
+With a keyword, the two sites are asked for their in-shop search in quite
+different ways. Tokopedia keys everything on the slug already typed, so
+`/<toko>/product?q=lego` is one page load.
+
+Shopee's in-shop search is not a storefront route at all — it is the search page
+filtered by numeric shop id, `/search?keyword=lego&shop=490338801` for an
+ordinary shop and `/mall/search?…` for a Mall one — and the storefront does not
+say which kind it is. So the term is typed into the shop's own "cari di toko
+ini" box and Shopee navigates wherever it navigates; the address it lands on is
+a real in-shop search by construction, and it becomes the template every later
+page is built from. Building that address by hand is only the fallback, ordered
+by whether the page wears Mall branding, because a wrong guess returns no
+results — indistinguishable from a shop that does not stock the term, and
+walking that emptiness page by page is what a run did before.
+
+Either way a page counts only when the shop ids come back matching: a `shop`
+filter that was ignored returns the whole marketplace, which would otherwise
+look like a successful scrape of the wrong shop. If nothing answers, the shop's
+catalogue is walked instead and the keyword filter below does the work — over
+more pages, but over the right products.
+
+A storefront opens on its home tab, which is vouchers, banners and a "kamu
+mungkin suka" strip rather than the shop's catalogue, so a keyword-less run
+clicks through to **Produk** first and pages that. The numeric shop id and the
+shop's display name are read from the storefront either way.
+
+That filter is a filter on the product name: every word has to appear, give or
+take a couple of letters at the end of longer words, since a shopper types
+"dinosaurus" and the seller wrote "Dinosaur". It runs only where this side is
+the one matching — walking a catalogue. Results the site's own search returned
+are kept as they came: a search for "dinosaurus" answers with "Jurassic World
+76950 Triceratops", and re-checking that against the literal word discards the
+row the shopper was looking for. The result line says how many were dropped,
+because "3 produk" without "412 tidak cocok" reads as a broken scrape. Neither
+shop route carries a search term the server can read back, so shop mode states
+the keyword outright and `product_keywords` is recorded the same as for a
+search.
+
+Shop mode is also how a Shopee row gets a seller name. The storefront states the
+shop's name and username; the shop-filtered search page does not state a seller
+at all, so the job carries what the storefront said onto the rows whose shop id
+matches — and only those, since a sponsored card from elsewhere must not be
+filed under this shop.
 
 | toko | kata kunci | what runs |
 |---|---|---|
 | — | `lego` | site search for "lego", paginated |
-| `tokomainanku` | — | that shop's whole grid |
-| `tokomainanku` | `lego` | that shop's grid, kept where the name matches |
+| `tokomainanku` | — | that shop's **Produk** tab, paginated |
+| `tokomainanku` | `lego` | that shop's in-shop search, kept where the name matches |
 | — | — | just the page the tab is showing |
 
 Two things the page decides for you. A product name is read from the image's
