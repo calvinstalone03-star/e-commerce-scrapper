@@ -10,9 +10,8 @@ const LINKS = [
   { href: '/', label: 'Ringkasan' },
   { href: '/stores', label: 'Toko' },
   { href: '/products', label: 'Produk' },
-  { href: '/keywords', label: 'Keyword' },
-  { href: '/compare', label: 'Perbandingan' },
   { href: '/pricing', label: 'Posisi harga' },
+  { href: '/analytics', label: 'Analitik' },
 ] as const;
 
 const SIDEBAR_WIDTH = 'w-60';

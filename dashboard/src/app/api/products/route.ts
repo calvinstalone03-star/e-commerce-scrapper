@@ -26,7 +26,7 @@ const CACHE_CONTROL = 'private, max-age=30, stale-while-revalidate=300';
 export async function GET(request: NextRequest) {
   try {
     // Cannot throw. Every field in the schema carries `.catch()`, so a stale
-    // bookmarked filter — a keyword that no longer exists, a sort key that was
+    // bookmarked filter — a store that no longer exists, a sort key that was
     // renamed — degrades to that field's default and still renders a page.
     const filter = productFilterSchema.parse(
       Object.fromEntries(request.nextUrl.searchParams),

@@ -76,22 +76,10 @@ export const productRowSchema = z.object({
   sold: z.coerce.number().int().nullable(),
   ratingStar: moneySchema,
   scrapedAt: timestampSchema,
-  keywords: z.array(z.string()).default([]),
   /** How many snapshots exist — a product with 1 has no history to chart yet. */
   snapshotCount: z.coerce.number().int().default(0),
 });
 export type ProductRow = z.infer<typeof productRowSchema>;
-
-export const keywordRowSchema = z.object({
-  keyword: z.string(),
-  marketplace: marketplaceSchema,
-  products: z.coerce.number().int(),
-  stores: z.coerce.number().int(),
-  minPrice: moneySchema,
-  maxPrice: moneySchema,
-  avgPrice: moneySchema,
-});
-export type KeywordRow = z.infer<typeof keywordRowSchema>;
 
 export const pricePointSchema = z.object({
   scrapedAt: timestampSchema,
@@ -178,11 +166,58 @@ export const pricePositionSummarySchema = z.object({
 });
 export type PricePositionSummary = z.infer<typeof pricePositionSummarySchema>;
 
+/** One competitor's pressure on our catalogue. */
+export const rivalPressureSchema = z.object({
+  username: z.string(),
+  marketplace: marketplaceSchema,
+  /** Our products this shop sells cheaper than we do. */
+  beats: z.coerce.number().int(),
+  /** Our products they also stock but do not undercut. */
+  meets: z.coerce.number().int(),
+  /** Average depth of the undercut, in percent, negative. */
+  averageGap: z.coerce.number().nullable(),
+});
+export type RivalPressure = z.infer<typeof rivalPressureSchema>;
+
+/** What being overpriced costs, per price bracket. */
+export const priceBandSchema = z.object({
+  band: z.string(),
+  /** Sort key, since "Rp 100–500rb" does not sort as a number. */
+  floor: z.coerce.number(),
+  products: z.coerce.number().int(),
+  overpriced: z.coerce.number().int(),
+  /** Sum of (our price − cheapest rival) across the overpriced ones. */
+  atStake: moneySchema,
+});
+export type PriceBand = z.infer<typeof priceBandSchema>;
+
+/** One point: how far off the cheapest rival we are, against how much we sell. */
+export const gapVolumePointSchema = z.object({
+  id: z.number().int(),
+  name: z.string().nullable(),
+  gapPercent: z.coerce.number(),
+  sold: z.coerce.number().int(),
+  price: moneySchema,
+});
+export type GapVolumePoint = z.infer<typeof gapVolumePointSchema>;
+
+export const pricingAnalyticsSchema = z.object({
+  position: z.object({
+    cheapest: z.coerce.number().int(),
+    middle: z.coerce.number().int(),
+    dearest: z.coerce.number().int(),
+    unmatched: z.coerce.number().int(),
+  }),
+  rivals: z.array(rivalPressureSchema),
+  bands: z.array(priceBandSchema),
+  gapVolume: z.array(gapVolumePointSchema),
+});
+export type PricingAnalytics = z.infer<typeof pricingAnalyticsSchema>;
+
 export const overviewSchema = z.object({
   stores: z.coerce.number().int(),
   products: z.coerce.number().int(),
   snapshots: z.coerce.number().int(),
-  keywords: z.coerce.number().int(),
   marketplaces: z.array(
     z.object({
       marketplace: marketplaceSchema,
@@ -212,7 +247,6 @@ export const productFilterSchema = z.object({
   q: z.string().trim().max(200).optional().catch(undefined),
   marketplace: marketplaceSchema.optional().catch(undefined),
   storeId: intFromQuery.positive().optional().catch(undefined),
-  keyword: z.string().trim().max(200).optional().catch(undefined),
   location: z.string().trim().max(120).optional().catch(undefined),
   minPrice: intFromQuery.nonnegative().optional().catch(undefined),
   maxPrice: intFromQuery.nonnegative().optional().catch(undefined),
@@ -301,7 +335,6 @@ export type PagedStores = z.infer<typeof pagedStoresSchema>;
 export const filterOptionsSchema = z.object({
   marketplaces: z.array(marketplaceSchema),
   locations: z.array(z.string()),
-  keywords: z.array(z.string()),
   priceRange: z.object({ min: moneySchema, max: moneySchema }),
 });
 export type FilterOptions = z.infer<typeof filterOptionsSchema>;

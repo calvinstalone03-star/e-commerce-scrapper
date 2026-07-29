@@ -74,15 +74,6 @@ function ProductTile({ product }: { product: ProductRow }) {
             {formatSold(product.sold)} terjual
             {product.ratingStar !== null ? ` · ★ ${formatRating(product.ratingStar)}` : null}
           </p>
-          {product.keywords.length > 0 ? (
-            <p className="mt-1.5 flex flex-wrap gap-1">
-              {product.keywords.map((keyword) => (
-                <Link key={keyword} href={`/products?keyword=${encodeURIComponent(keyword)}`}>
-                  <Badge variant="muted">{keyword}</Badge>
-                </Link>
-              ))}
-            </p>
-          ) : null}
         </div>
       </Card>
     </li>

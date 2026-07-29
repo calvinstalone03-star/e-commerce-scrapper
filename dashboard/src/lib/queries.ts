@@ -3,23 +3,23 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import {
   filterOptionsSchema,
-  keywordRowSchema,
   overviewSchema,
   ownShopSchema,
   pricePointSchema,
   pricePositionRowSchema,
   pricePositionSummarySchema,
+  pricingAnalyticsSchema,
   productRowSchema,
   rivalRowSchema,
   storeRowSchema,
   type FilterOptions,
-  type KeywordRow,
   type Overview,
   type OwnShop,
   type PricePoint,
   type PricePositionFilter,
   type PricePositionRow,
   type PricePositionSummary,
+  type PricingAnalytics,
   type ProductFilter,
   type ProductRow,
   type RivalRow,
@@ -62,8 +62,7 @@ export async function getOverview(): Promise<Overview> {
       SELECT
         (SELECT count(*) FROM stores)                        AS stores,
         (SELECT count(*) FROM products)                      AS products,
-        (SELECT count(*) FROM price_snapshots)               AS snapshots,
-        (SELECT count(DISTINCT keyword) FROM product_keywords) AS keywords
+        (SELECT count(*) FROM price_snapshots)               AS snapshots
     `,
     sql`
       SELECT s.marketplace,
@@ -190,14 +189,6 @@ export async function getProducts(
     ${filter.minSold !== undefined ? sql`AND l.sold >= ${filter.minSold}` : sql``}
     ${filter.minRating !== undefined ? sql`AND l.rating_star >= ${filter.minRating}` : sql``}
     ${filter.hasImage ? sql`AND p.image IS NOT NULL AND p.image <> ''` : sql``}
-    ${
-      filter.keyword
-        ? sql`AND EXISTS (
-            SELECT 1 FROM product_keywords pk
-            WHERE pk.product_ref = p.id AND pk.keyword = ${filter.keyword}
-          )`
-        : sql``
-    }
   `;
 
   const direction = filter.dir === 'asc' ? sql`ASC NULLS LAST` : sql`DESC NULLS LAST`;
@@ -221,13 +212,6 @@ export async function getProducts(
         s.username AS "storeUsername",
         s.location AS "storeLocation",
         l.price, l.sold, l.rating_star AS "ratingStar", l.scraped_at AS "scrapedAt",
-        -- Aggregated in the same round trip. Fetching keywords per row would be
-        -- N+1, and on a 50-row page that is 50 extra queries per keystroke.
-        coalesce(
-          (SELECT array_agg(pk.keyword ORDER BY pk.keyword)
-           FROM product_keywords pk WHERE pk.product_ref = p.id),
-          '{}'
-        ) AS keywords,
         (SELECT count(*) FROM price_snapshots ps WHERE ps.product_ref = p.id)
           AS "snapshotCount"
       FROM products p
@@ -256,7 +240,9 @@ export async function getProducts(
   };
 }
 
-/** Full snapshot history for one product — the price chart's source. */
+
+
+/** Every observation of one product, oldest first, for the history chart. */
 export async function getPriceHistory(productId: number): Promise<PricePoint[]> {
   const rows = await sql`
     SELECT scraped_at AS "scrapedAt", price, sold, rating_star AS "ratingStar"
@@ -267,82 +253,6 @@ export async function getPriceHistory(productId: number): Promise<PricePoint[]> 
     ORDER BY scraped_at ASC, id ASC
   `;
   return rows.map((row) => pricePointSchema.parse(row));
-}
-
-// ---------------------------------------------------------------------------
-// Keywords
-// ---------------------------------------------------------------------------
-
-export async function getKeywords(marketplace?: string): Promise<KeywordRow[]> {
-  const rows = await sql`
-    WITH latest AS (${latestSnapshots})
-    SELECT
-      pk.keyword, pk.marketplace,
-      count(DISTINCT pk.product_ref) AS products,
-      count(DISTINCT p.shop_ref)     AS stores,
-      min(l.price)                   AS "minPrice",
-      max(l.price)                   AS "maxPrice",
-      round(avg(l.price))            AS "avgPrice"
-    FROM product_keywords pk
-    JOIN products p ON p.id = pk.product_ref
-    LEFT JOIN latest l ON l.product_ref = pk.product_ref
-    ${marketplace ? sql`WHERE pk.marketplace = ${marketplace}` : sql``}
-    GROUP BY pk.keyword, pk.marketplace
-    -- The group is (keyword, marketplace), so keyword alone does not break a
-    -- tie: one term scraped on both marketplaces is two rows that can hold the
-    -- same product count.
-    ORDER BY products DESC, pk.keyword ASC, pk.marketplace ASC
-  `;
-  return rows.map((row) => keywordRowSchema.parse(row));
-}
-
-/**
- * Per-store price summary within one keyword — the competitor comparison chart.
- *
- * This is the question the whole project exists to answer: for this search term,
- * what does each shop charge?
- */
-export async function getKeywordComparison(keyword: string): Promise<
-  Array<{
-    storeId: number | null;
-    storeUsername: string | null;
-    products: number;
-    minPrice: string | null;
-    maxPrice: string | null;
-    avgPrice: string | null;
-  }>
-> {
-  const rows = await sql`
-    WITH latest AS (${latestSnapshots})
-    SELECT
-      s.id       AS "storeId",
-      s.username AS "storeUsername",
-      count(DISTINCT p.id) AS products,
-      min(l.price)         AS "minPrice",
-      max(l.price)         AS "maxPrice",
-      round(avg(l.price))  AS "avgPrice"
-    FROM product_keywords pk
-    JOIN products p ON p.id = pk.product_ref
-    LEFT JOIN stores s ON s.id = p.shop_ref
-    LEFT JOIN latest l ON l.product_ref = p.id
-    WHERE pk.keyword = ${keyword}
-    GROUP BY s.id, s.username
-    HAVING count(DISTINCT p.id) > 0
-    -- Shops that price a keyword identically are common, and without a tiebreak
-    -- they swap places between requests — which reorders the bars in the
-    -- comparison chart, and with them which shop the page calls "termurah".
-    -- s.id is NULL for the one synthetic row of shopless products, so it sorts
-    -- last rather than jumping to the front of its tie group.
-    ORDER BY avg(l.price) ASC NULLS LAST, s.id ASC NULLS LAST
-  `;
-  return rows.map((row) => ({
-    storeId: row.storeId ?? null,
-    storeUsername: row.storeUsername ?? null,
-    products: Number(row.products),
-    minPrice: row.minPrice === null ? null : String(row.minPrice),
-    maxPrice: row.maxPrice === null ? null : String(row.maxPrice),
-    avgPrice: row.avgPrice === null ? null : String(row.avgPrice),
-  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +519,123 @@ export async function getPricePositions(
   };
 }
 
+/**
+ * The four questions the analytics screen answers, in one statement.
+ *
+ * All four rest on the same pairing as the worklist, so they share its CTE
+ * rather than recomputing it — the same reason that page went from three round
+ * trips to one. Every figure here is a snapshot of one moment: with 38 products
+ * carrying more than one observation, there is no trend to draw yet, and a
+ * time-series chart would be an empty promise.
+ */
+export async function getPricingAnalytics(): Promise<PricingAnalytics> {
+  const [row] = await sql`
+    WITH latest AS (${latestSnapshots}),
+    mine AS MATERIALIZED (
+      SELECT p.id, p.name, p.set_code, l.price, l.sold
+      FROM products p
+      JOIN stores s ON s.id = p.shop_ref AND s.is_own
+      JOIN latest l ON l.product_ref = p.id
+      WHERE l.price IS NOT NULL
+    ),
+    pairs AS MATERIALIZED (
+      SELECT m.id AS mine_id, m.price AS my_price, l.price AS their_price,
+             s.id AS store_id, s.username, s.marketplace
+      FROM mine m
+      JOIN products p ON p.set_code = m.set_code
+      JOIN stores s ON s.id = p.shop_ref AND NOT s.is_own
+      JOIN latest l ON l.product_ref = p.id AND l.price IS NOT NULL
+      WHERE m.set_code IS NOT NULL
+      UNION ALL
+      SELECT m.id, m.price, l.price, s.id, s.username, s.marketplace
+      FROM mine m
+      JOIN products p ON p.name % m.name AND similarity(p.name, m.name) >= ${NAME_MATCH_THRESHOLD}
+      JOIN stores s ON s.id = p.shop_ref AND NOT s.is_own
+      JOIN latest l ON l.product_ref = p.id AND l.price IS NOT NULL
+      WHERE m.set_code IS NULL AND m.name IS NOT NULL
+    ),
+    -- One row per (our product, rival shop): a shop that lists the same set
+    -- five times is one competitor with one best offer, not five.
+    best AS (
+      SELECT mine_id, my_price, store_id, username, marketplace,
+             min(their_price) AS their_price
+      FROM pairs
+      GROUP BY mine_id, my_price, store_id, username, marketplace
+    ),
+    scored AS (
+      SELECT m.id, m.price, m.sold,
+             count(b.*) AS rivals,
+             min(b.their_price) AS cheapest,
+             count(*) FILTER (WHERE b.their_price < m.price) AS beaten_by
+      FROM mine m
+      LEFT JOIN best b ON b.mine_id = m.id
+      GROUP BY m.id, m.price, m.sold
+    )
+    SELECT
+      (
+        SELECT json_build_object(
+          'cheapest',  count(*) FILTER (WHERE rivals > 0 AND beaten_by = 0),
+          'middle',    count(*) FILTER (WHERE rivals > 0 AND beaten_by > 0 AND beaten_by < rivals),
+          'dearest',   count(*) FILTER (WHERE rivals > 0 AND beaten_by = rivals),
+          'unmatched', count(*) FILTER (WHERE rivals = 0)
+        ) FROM scored
+      ) AS position,
+      (
+        SELECT coalesce(json_agg(r ORDER BY r.beats DESC), '[]'::json) FROM (
+          SELECT username, marketplace,
+                 count(*) FILTER (WHERE their_price < my_price)  AS beats,
+                 count(*) FILTER (WHERE their_price >= my_price) AS meets,
+                 round(
+                   avg((their_price - my_price) / my_price * 100)
+                     FILTER (WHERE their_price < my_price), 1
+                 ) AS "averageGap"
+          FROM best
+          GROUP BY username, marketplace
+          HAVING count(*) FILTER (WHERE their_price < my_price) > 0
+        ) r
+      ) AS rivals,
+      (
+        SELECT coalesce(json_agg(b ORDER BY b.floor DESC), '[]'::json) FROM (
+          -- Brackets rather than a continuous axis: the question is "where is
+          -- the money", and money clusters by order of magnitude here.
+          SELECT
+            CASE
+              WHEN price >= 2000000 THEN '> Rp 2jt'
+              WHEN price >= 500000  THEN 'Rp 500rb–2jt'
+              WHEN price >= 100000  THEN 'Rp 100–500rb'
+              ELSE '< Rp 100rb'
+            END AS band,
+            CASE
+              WHEN price >= 2000000 THEN 2000000
+              WHEN price >= 500000  THEN 500000
+              WHEN price >= 100000  THEN 100000
+              ELSE 0
+            END AS floor,
+            count(*) AS products,
+            count(*) FILTER (WHERE price > cheapest) AS overpriced,
+            coalesce(sum(price - cheapest) FILTER (WHERE price > cheapest), 0) AS "atStake"
+          FROM scored
+          WHERE rivals > 0
+          GROUP BY band, floor
+        ) b
+      ) AS bands,
+      (
+        SELECT coalesce(json_agg(g), '[]'::json) FROM (
+          SELECT s.id, m.name, s.sold, s.price,
+                 round((s.price - s.cheapest) / s.cheapest * 100, 1) AS "gapPercent"
+          FROM scored s
+          JOIN mine m ON m.id = s.id
+          WHERE s.rivals > 0 AND s.sold IS NOT NULL AND s.cheapest > 0
+            -- Beyond this the pairing is a packaging difference rather than a
+            -- price, the same reason the worklist hides those rows by default.
+            AND abs((s.price - s.cheapest) / s.cheapest) < ${EXTREME_GAP}
+        ) g
+      ) AS "gapVolume"
+  `;
+
+  return pricingAnalyticsSchema.parse(row);
+}
+
 /** One of our products and every rival tied to it, dearest question first. */
 export async function getPricePositionDetail(
   productId: number,
@@ -683,7 +710,7 @@ export async function getPricePositionDetail(
  * a bug.
  */
 export async function getFilterOptions(): Promise<FilterOptions> {
-  const [marketplaces, locations, keywords, range] = await Promise.all([
+  const [marketplaces, locations, range] = await Promise.all([
     sql`SELECT DISTINCT marketplace FROM products ORDER BY marketplace`,
     sql`
       SELECT DISTINCT location FROM stores
@@ -691,17 +718,12 @@ export async function getFilterOptions(): Promise<FilterOptions> {
       ORDER BY location
       LIMIT 200
     `,
-    sql`
-      SELECT keyword, count(*) AS n FROM product_keywords
-      GROUP BY keyword ORDER BY n DESC, keyword ASC LIMIT 200
-    `,
     sql`SELECT min(price) AS min, max(price) AS max FROM price_snapshots`,
   ]);
 
   return filterOptionsSchema.parse({
     marketplaces: marketplaces.map((row) => row.marketplace),
     locations: locations.map((row) => row.location),
-    keywords: keywords.map((row) => row.keyword),
     priceRange: { min: range[0]?.min ?? null, max: range[0]?.max ?? null },
   });
 }

@@ -21,7 +21,6 @@ const NARROWING_FIELDS = [
   'q',
   'marketplace',
   'storeId',
-  'keyword',
   'location',
   'minPrice',
   'maxPrice',

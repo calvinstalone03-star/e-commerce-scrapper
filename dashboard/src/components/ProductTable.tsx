@@ -380,32 +380,6 @@ function buildColumns(openHistory: (product: ProductRow) => void): ColumnDef<Pro
       },
     },
     {
-      id: 'keywords',
-      header: 'Keyword',
-      cell: ({ row }) => {
-        const { keywords } = row.original;
-        if (keywords.length === 0) {
-          return (
-            <span
-              className="text-muted"
-              title="Keyword hanya tercatat untuk produk yang di-scrape setelah fitur ini ada"
-            >
-              –
-            </span>
-          );
-        }
-        return (
-          <div className="flex flex-wrap gap-1">
-            {keywords.map((keyword) => (
-              <Badge key={keyword} variant="muted">
-                {keyword}
-              </Badge>
-            ))}
-          </div>
-        );
-      },
-    },
-    {
       id: 'scrapedAt',
       accessorKey: 'scrapedAt',
       header: 'Terakhir discrape',
@@ -525,7 +499,7 @@ function PriceHistoryPanel({
               title="Belum ada riwayat harga"
               description={`Produk ini baru punya satu snapshot, diambil ${formatDateTime(
                 product.scrapedAt,
-              )}. Grafik butuh minimal dua titik, jadi scrape halaman ini lagi di hari lain dan riwayatnya akan terbentuk sendiri. Untuk sekarang, perbandingan yang sudah bisa dipakai adalah antar toko pada keyword yang sama.`}
+              )}. Grafik butuh minimal dua titik, jadi scrape halaman ini lagi di hari lain dan riwayatnya akan terbentuk sendiri.`}
             />
           ) : isError ? (
             <p className="rounded-md border border-negative/30 bg-negative/10 px-3 py-2 text-sm text-negative">
@@ -537,18 +511,6 @@ function PriceHistoryPanel({
             <PriceChart points={points} />
           )}
 
-          {product.keywords.length > 0 ? (
-            <div className="space-y-2 border-t border-line pt-4">
-              <h3 className="text-xs font-medium text-muted">Keyword yang memunculkan produk ini</h3>
-              <div className="flex flex-wrap gap-1">
-                {product.keywords.map((keyword) => (
-                  <Badge key={keyword} variant="muted">
-                    {keyword}
-                  </Badge>
-                ))}
-              </div>
-            </div>
-          ) : null}
         </div>
       </div>
     </dialog>

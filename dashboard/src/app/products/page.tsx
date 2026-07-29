@@ -63,7 +63,7 @@ export default async function ProductsPage({
         <h1 className="text-2xl font-semibold tracking-tight text-foreground">Produk</h1>
         <p className="max-w-2xl text-sm text-muted">
           Setiap listing yang pernah muncul di hasil scrape, dengan harga dari snapshot terbarunya.
-          Saring lalu urutkan untuk membandingkan harga antar toko pada keyword yang sama — itu
+          Saring lalu urutkan untuk melihat apa saja yang sudah terkumpul — itu
           perbandingan yang sudah bisa dijawab hari ini, sementara riwayat harga per produk baru
           terbentuk setelah scrape kedua.
         </p>

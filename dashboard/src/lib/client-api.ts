@@ -134,7 +134,7 @@ export function fetchPriceHistory(productId: number, signal?: AbortSignal): Prom
 /**
  * One entry in the store dropdown.
  *
- * `getFilterOptions` covers marketplaces, keywords, locations and the price
+ * `getFilterOptions` covers marketplaces, locations and the price
  * range but not stores — there are as many stores as rows in the table, so the
  * store list is the store list. It is fetched once, sorted by product count so
  * the shops worth comparing are at the top of the dropdown.

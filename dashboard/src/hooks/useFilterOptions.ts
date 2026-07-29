@@ -14,7 +14,7 @@ import type { FilterOptions } from '@/lib/schemas';
 /**
  * The lists behind the filter controls.
  *
- * A new marketplace, keyword or location only appears when a scrape runs, which
+ * A new marketplace or location only appears when a scrape runs, which
  * is minutes of work by hand — nothing like the cadence of a user changing
  * filters. Half an hour of trust means the dropdowns cost one request per
  * session instead of one per mount, and the server hands both lists over as

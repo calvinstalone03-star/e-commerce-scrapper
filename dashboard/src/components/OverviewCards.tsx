@@ -63,12 +63,6 @@ function buildCards(overview: Overview): StatCard[] {
           : `rata-rata ${perProduct.toFixed(1)} per produk`,
       href: '/products?sort=scrapedAt&dir=desc',
     },
-    {
-      label: 'Kata kunci',
-      value: count.format(overview.keywords),
-      hint: 'dipakai sebagai kategori produk',
-      href: '/keywords',
-    },
   ];
 }
 

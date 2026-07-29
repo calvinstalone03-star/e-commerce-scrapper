@@ -12,7 +12,7 @@ import type { FilterOptions, Marketplace, ProductFilter } from '@/lib/schemas';
 /**
  * Every filter the product query understands, offered only where the data can
  * answer it: the dropdowns are built from `getFilterOptions`, so picking a
- * keyword or a location that returns nothing is not a state the UI can reach.
+ * location or a store that returns nothing is not a state the UI can reach.
  *
  * Text and number fields are debounced, selects are not — they differ in kind.
  * A half-typed word is not a filter anyone meant; a chosen option always is.
@@ -118,24 +118,6 @@ export function Filters({ initialOptions, initialStores }: FiltersProps) {
             {storeChoices.map((store) => (
               <option key={store.id} value={store.id}>
                 {store.label} · {store.productCount} produk
-              </option>
-            ))}
-          </Select>
-        </Field>
-
-        <Field label="Keyword" htmlFor={`${ids}-keyword`}>
-          <Select
-            id={`${ids}-keyword`}
-            value={filter.keyword ?? ''}
-            onChange={(event) => setFilter({ keyword: event.target.value || undefined })}
-            disabled={options.keywords.length === 0}
-          >
-            <option value="">
-              {options.keywords.length === 0 ? 'Keyword belum terekam' : 'Semua keyword'}
-            </option>
-            {options.keywords.map((keyword) => (
-              <option key={keyword} value={keyword}>
-                {keyword}
               </option>
             ))}
           </Select>
@@ -393,7 +375,6 @@ function activeChips(
     const store = stores.find((candidate) => candidate.id === filter.storeId);
     add('storeId', `Toko: ${store?.label ?? `#${filter.storeId}`}`, { storeId: undefined });
   }
-  if (filter.keyword) add('keyword', `Keyword: ${filter.keyword}`, { keyword: undefined });
   if (filter.location) add('location', `Lokasi: ${filter.location}`, { location: undefined });
   if (filter.minPrice !== undefined) {
     add('minPrice', `Harga ≥ ${formatPrice(filter.minPrice)}`, { minPrice: undefined });
