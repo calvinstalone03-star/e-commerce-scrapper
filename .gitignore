@@ -16,3 +16,6 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 .ingest-token
+
+# launchd logs
+logs/
