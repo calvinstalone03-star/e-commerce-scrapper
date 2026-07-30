@@ -13,9 +13,33 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from 'vit
  * wrapped function is called directly. This is that fallback, applied to this
  * process instead — the tests below prove the pairing is correct, not that
  * caching works, so a no-op cache is exactly what they need.
+ *
+ * A silent passthrough would erase the one thing worth checking about this
+ * stub, though: whether `getPairingSnapshot` really is the wrapped function
+ * and `computePairingSnapshot` really is not — the inversion that would let
+ * the cache boundary end up around the wrong export. So the stub marks
+ * whatever it wraps and records the key parts and options it was called
+ * with; `describe('cache boundary', ...)` below asserts on both, which is
+ * also how it pins the exact revalidate window and tag against a silent
+ * change to either.
  */
+const cacheStub = vi.hoisted(() => {
+  const calls: Array<{ keyParts: unknown; options: unknown }> = [];
+  const WRAPPED = Symbol('wrapped by the unstable_cache stub');
+  return { calls, WRAPPED };
+});
+
 vi.mock('next/cache', () => ({
-  unstable_cache: <Fn extends (...args: readonly unknown[]) => unknown>(fn: Fn): Fn => fn,
+  unstable_cache: <Fn extends (...args: readonly unknown[]) => unknown>(
+    fn: Fn,
+    keyParts: unknown,
+    options: unknown,
+  ): Fn => {
+    cacheStub.calls.push({ keyParts, options });
+    const wrapped = ((...args: Parameters<Fn>) => fn(...args)) as Fn;
+    Reflect.set(wrapped, cacheStub.WRAPPED, true);
+    return wrapped;
+  },
 }));
 
 import { sql } from '@/lib/db';
@@ -24,6 +48,7 @@ import {
   computePairingSnapshot,
   getOwnShopScorecard,
   getOwnShops,
+  getPairingSnapshot,
   getPricePositionDetail,
   getPricePositions,
   getPricingAnalytics,
@@ -587,5 +612,30 @@ describe('pairing snapshot', () => {
     expect(snapshot.position).toEqual({ cheapest: 0, middle: 0, dearest: 0, unmatched: 0 });
     expect(Number(snapshot.atStake ?? 0)).toBe(0);
     expect(snapshot.rivals).toEqual([]);
+  });
+});
+
+/**
+ * The `unstable_cache` stub above is a no-op, on purpose — but a no-op cache
+ * cannot tell "wrapped from outside, correctly" apart from "wrapped from
+ * inside, by mistake" unless something marks what passed through it. These
+ * two tests are that something: the brief's one hard requirement is that
+ * `computePairingSnapshot` stays plain and directly callable — what every
+ * test above calls — while `getPairingSnapshot` is the wrapped entry point
+ * every page calls instead. Collapse that distinction (wrap
+ * `computePairingSnapshot` itself, or make `getPairingSnapshot` an alias for
+ * it) and every test above would keep passing, silently, for the wrong
+ * reason — these are what would actually catch it.
+ */
+describe('cache boundary', () => {
+  test('getPairingSnapshot is the wrapped export; computePairingSnapshot is not', () => {
+    expect(Reflect.get(getPairingSnapshot, cacheStub.WRAPPED)).toBe(true);
+    expect(Reflect.get(computePairingSnapshot, cacheStub.WRAPPED)).toBeUndefined();
+  });
+
+  test('the cache is keyed, windowed and tagged the way both screens depend on', () => {
+    expect(cacheStub.calls).toHaveLength(1);
+    expect(cacheStub.calls[0].keyParts).toEqual(['pairing']);
+    expect(cacheStub.calls[0].options).toEqual({ revalidate: 300, tags: ['pairing'] });
   });
 });
