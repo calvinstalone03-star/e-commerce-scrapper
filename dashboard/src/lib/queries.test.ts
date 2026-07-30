@@ -406,6 +406,13 @@ describe('price position', () => {
 
     const { rows } = await getPricePositions('shopee', anyFilter);
 
+    // Only the Shopee listing is ours in this channel. Asserting the count,
+    // not just rows[0]'s shape, is what makes this fail if `ourListings` ever
+    // reverted to unscoped `is_own`: the Tokopedia row would leak into `mine`
+    // as a second row, and — because `pairs` already excludes any `is_own`
+    // store from rivals regardless of channel — it too would show `rivals: 0`
+    // and pass the checks below without a length assertion to catch it.
+    expect(rows).toHaveLength(1);
     // Cheaper, same set, but it is us. Our own shelf is not competition.
     expect(rows[0].rivals).toBe(0);
     expect(rows[0].cheapestPrice).toBeNull();

@@ -245,9 +245,20 @@ function PageHeader({
     <header className="space-y-1">
       <h1 className="text-2xl font-semibold tracking-tight text-foreground">Posisi harga</h1>
       <p className="max-w-2xl text-sm text-muted">
-        Produk <span className="font-medium text-foreground">{shop?.username}</span> di{' '}
-        {MARKETPLACE_LABELS[channel!]} dibanding produk toko lain dengan nomor set LEGO yang sama,
-        lintas marketplace.
+        {shop && channel ? (
+          <>
+            Produk <span className="font-medium text-foreground">{shop.username}</span> di{' '}
+            {MARKETPLACE_LABELS[channel]} dibanding produk toko lain dengan nomor set LEGO yang
+            sama, lintas marketplace.
+          </>
+        ) : (
+          // No shop resolved yet — the zero-own-shops branch above renders this
+          // header before any channel exists to name. A complete, generic
+          // sentence here rather than interpolating missing pieces: the
+          // EmptyState right below already explains why there is nothing to
+          // name, so this line only has to stay grammatical, not specific.
+          'Produk kita dibanding produk toko lain dengan nomor set LEGO yang sama, lintas marketplace.'
+        )}
       </p>
     </header>
   );
