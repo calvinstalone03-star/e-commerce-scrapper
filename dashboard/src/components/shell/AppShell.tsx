@@ -204,23 +204,10 @@ function Topbar({
               // `channel.ts` itself is untouched.
               href={withChannel(pathname, resolveChannel(shop.marketplace, shops))}
               aria-current={shop.marketplace === channel ? 'true' : undefined}
-              className={cn(
-                'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs whitespace-nowrap transition-colors',
-                shop.marketplace === channel
-                  ? 'border-accent/40 bg-accent/10 text-foreground'
-                  : 'border-line bg-surface-muted text-muted hover:text-foreground',
-              )}
+              className={chipClassName(shop.marketplace === channel)}
               title={`${shop.products} produk ter-scrape`}
             >
-              <span
-                aria-hidden
-                className={cn(
-                  'size-1.5 rounded-full',
-                  shop.marketplace === 'shopee' ? 'bg-shopee' : 'bg-tokopedia',
-                )}
-              />
-              <span className="font-medium">{shop.username}</span>
-              <span className="tabular-nums">{shop.products.toLocaleString('id-ID')}</span>
+              <ShopBadgeContent shop={shop} />
             </Link>
           ))
         )}
@@ -229,7 +216,7 @@ function Topbar({
       <div className="ml-auto flex items-center gap-2">
         {warnDefaultPassword ? (
           <Link
-            href="/settings"
+            href={withChannel('/settings', channel)}
             className="hidden rounded-md border border-negative/40 bg-negative/10 px-2 py-1 text-xs text-negative sm:block"
           >
             password masih bawaan
@@ -243,22 +230,32 @@ function Topbar({
 }
 
 /**
- * The one-shop case: nothing to switch to, so a static chip rather than a
- * `Link` that would only ever point at the page already on screen. Its markup
- * mirrors the lit state of the two-shop switcher above so neither rendering
- * can drift from the other.
+ * The border/background/text classes for an own-shop chip, active or not.
+ * Both the two-shop switcher's `Link` above and the one-shop static
+ * `ShopBadgeChip` below call this rather than each carrying its own copy, so
+ * restyling a chip cannot update one rendering and silently miss the other.
  */
-function ShopBadgeChip({ shop, active }: { shop: ShopBadge; active?: boolean }) {
+function chipClassName(active: boolean): string {
+  return cn(
+    'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs whitespace-nowrap transition-colors',
+    active
+      ? 'border-accent/40 bg-accent/10 text-foreground'
+      : 'border-line bg-surface-muted text-muted hover:text-foreground',
+  );
+}
+
+/**
+ * The dot, username and product count inside an own-shop chip — shared by the
+ * switcher and `ShopBadgeChip` for the same reason as `chipClassName`. Neither
+ * span sets its own text color; both inherit active/inactive from whichever
+ * `chipClassName`-styled element wraps this, so the username can never end up
+ * a different shade than the count beside it. (It used to: `ShopBadgeChip`
+ * hardcoded `text-foreground` on the username, invisible only because it was
+ * always called with `active`.)
+ */
+function ShopBadgeContent({ shop }: { shop: ShopBadge }) {
   return (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs whitespace-nowrap',
-        active
-          ? 'border-accent/40 bg-accent/10 text-foreground'
-          : 'border-line bg-surface-muted text-muted',
-      )}
-      title={`${shop.products} produk ter-scrape`}
-    >
+    <>
       <span
         aria-hidden
         className={cn(
@@ -266,8 +263,23 @@ function ShopBadgeChip({ shop, active }: { shop: ShopBadge; active?: boolean }) 
           shop.marketplace === 'shopee' ? 'bg-shopee' : 'bg-tokopedia',
         )}
       />
-      <span className="font-medium text-foreground">{shop.username}</span>
+      <span className="font-medium">{shop.username}</span>
       <span className="tabular-nums">{shop.products.toLocaleString('id-ID')}</span>
+    </>
+  );
+}
+
+/**
+ * The one-shop case: nothing to switch to, so a static chip rather than a
+ * `Link` that would only ever point at the page already on screen. Built from
+ * the same `chipClassName` and `ShopBadgeContent` the two-shop switcher uses,
+ * so the two renderings share one definition instead of two
+ * independently-maintained copies that can silently drift apart.
+ */
+function ShopBadgeChip({ shop, active }: { shop: ShopBadge; active?: boolean }) {
+  return (
+    <span className={chipClassName(Boolean(active))} title={`${shop.products} produk ter-scrape`}>
+      <ShopBadgeContent shop={shop} />
     </span>
   );
 }
