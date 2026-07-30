@@ -1,5 +1,6 @@
 import type { NextRequest } from 'next/server';
 
+import { withSession } from '@/lib/api-session';
 import { getStores } from '@/lib/queries';
 import { storeFilterSchema } from '@/lib/schemas';
 
@@ -9,7 +10,8 @@ export const dynamic = 'force-dynamic';
 
 const CACHE_CONTROL = 'private, max-age=30, stale-while-revalidate=300';
 
-export async function GET(request: NextRequest) {
+/** Behind the login — see `lib/api-session.ts`. */
+export const GET = withSession(async (request: NextRequest) => {
   try {
     // `.catch()` per field, so an unknown sort or a negative page renders the
     // default view instead of returning 400 to a bookmarked URL.
@@ -33,4 +35,4 @@ export async function GET(request: NextRequest) {
       { status: 503 },
     );
   }
-}
+});

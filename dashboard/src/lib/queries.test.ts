@@ -4,7 +4,12 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 
 import { sql } from '@/lib/db';
-import { getOwnShops, getPricePositionDetail, getPricePositions } from '@/lib/queries';
+import {
+  getOwnShops,
+  getPricePositionDetail,
+  getPricePositions,
+  withNameMatching,
+} from '@/lib/queries';
 import { pricePositionFilterSchema } from '@/lib/schemas';
 
 /**
@@ -360,5 +365,47 @@ describe('price position', () => {
     const shops = await getOwnShops();
     expect(shops.map((shop) => shop.username)).toEqual(['i_bricks']);
     expect(shops[0].products).toBe(1);
+  });
+});
+
+/**
+ * Where the trigram threshold comes from.
+ *
+ * It used to be a startup parameter on the connection, which a pooled Neon
+ * endpoint rejects outright — the connection never opens. Setting it per
+ * transaction is what survives a pooler, and the two things worth pinning are
+ * that it is actually in force where the matching happens, and that it does not
+ * outlive the transaction: a pooled connection is handed to somebody else next,
+ * and a leaked 0.45 would silently retighten their query.
+ */
+describe('name matching', () => {
+  test('runs at this app’s threshold rather than pg_trgm’s default', async () => {
+    const [row] = await withNameMatching((tx) => tx`SHOW pg_trgm.similarity_threshold`);
+    expect(row['pg_trgm.similarity_threshold']).toBe('0.45');
+  });
+
+  test('leaves the connection it borrowed exactly as it found it', async () => {
+    // The GUC is only recognised once pg_trgm's library is loaded in the
+    // session, which any trigram call does.
+    await sql`SELECT similarity('a', 'b')`;
+    const [before] = await sql`SHOW pg_trgm.similarity_threshold`;
+
+    await withNameMatching((tx) => tx`SELECT 1`);
+
+    const [after] = await sql`SHOW pg_trgm.similarity_threshold`;
+    expect(after).toEqual(before);
+  });
+
+  test('composes the shared query fragments, which belong to the outer handle', async () => {
+    // `rivalMatch`, `ourProducts` and `latestSnapshots` are built from `sql`, and
+    // every wrapped query embeds them while running on a transaction handle.
+    const mine = await addStore('i_bricks', { own: true });
+    const theirs = await addStore('brickstore');
+    await addProduct(mine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 500_000 });
+    await addProduct(theirs, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 400_000 });
+
+    const { rows } = await getPricePositions(anyFilter);
+    expect(rows).toHaveLength(1);
+    expect(Number(rows[0].cheapestPrice)).toBe(400_000);
   });
 });

@@ -1,5 +1,6 @@
 import type { NextRequest } from 'next/server';
 
+import { withSession } from '@/lib/api-session';
 import { getProducts } from '@/lib/queries';
 import { productFilterSchema } from '@/lib/schemas';
 
@@ -23,7 +24,12 @@ export const dynamic = 'force-dynamic';
  */
 const CACHE_CONTROL = 'private, max-age=30, stale-while-revalidate=300';
 
-export async function GET(request: NextRequest) {
+/**
+ * Behind the login, like every handler here. The `(app)` layout guards the
+ * pages; nothing guards a route handler unless it says so — see
+ * `lib/api-session.ts`.
+ */
+export const GET = withSession(async (request: NextRequest) => {
   try {
     // Cannot throw. Every field in the schema carries `.catch()`, so a stale
     // bookmarked filter — a store that no longer exists, a sort key that was
@@ -51,4 +57,4 @@ export async function GET(request: NextRequest) {
       { status: 503 },
     );
   }
-}
+});

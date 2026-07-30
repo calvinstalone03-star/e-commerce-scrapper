@@ -32,11 +32,33 @@ const COOKIE_NAME = 'mcl_session';
 //: uses, short enough that a forgotten laptop stops being logged in.
 const SESSION_MAX_AGE_S = 7 * 24 * 60 * 60;
 
-//: What the row is seeded with the first time the dashboard starts. Weak on
-//: purpose — it is meant to be changed on the settings page, and a random one
-//: nobody is told is just a lockout.
+//: What the row is seeded with the first time the dashboard starts, when the
+//: environment says nothing. Weak on purpose — it is meant to be changed on the
+//: settings page, and a random one nobody is told is just a lockout.
 const DEFAULT_USERNAME = 'admin';
 const DEFAULT_PASSWORD = 'ecom123';
+
+/**
+ * What the first run seeds.
+ *
+ * The published default above is fine on a laptop and is a hole on a
+ * deployment: the app is reachable the moment it answers its first request, and
+ * `admin` / `ecom123` is written in the README. `DASHBOARD_PASSWORD` closes the
+ * window between the deploy finishing and someone reaching /settings — set it
+ * with the database URL and the dashboard is never briefly open.
+ *
+ * Read at seed time, not per request: once the row exists the environment is
+ * ignored, so changing the password in the UI is not undone by the next cold
+ * start, and clearing the variable does not lock anyone out.
+ */
+function seedCredentials(): { username: string; password: string } {
+  return {
+    username: process.env.DASHBOARD_USERNAME?.trim() || DEFAULT_USERNAME,
+    // Trimmed because these are usually pasted, and a trailing newline in a
+    // password is a lockout nobody would think to look for.
+    password: process.env.DASHBOARD_PASSWORD?.trim() || DEFAULT_PASSWORD,
+  };
+}
 
 type Credentials = {
   username: string;
@@ -76,7 +98,8 @@ async function readCredentials(): Promise<Credentials> {
   // First run: seed the singleton. ON CONFLICT DO NOTHING rather than a check
   // then an insert — two cold starts can arrive at once, and the loser of that
   // race must read the winner's row, not overwrite it with a different secret.
-  const seeded = newCredentials(DEFAULT_USERNAME, DEFAULT_PASSWORD);
+  const seed = seedCredentials();
+  const seeded = newCredentials(seed.username, seed.password);
   await sql`
     INSERT INTO app_credentials (id, username, hash, salt, secret)
     VALUES (true, ${seeded.username}, ${seeded.hash}, ${seeded.salt}, ${seeded.secret})

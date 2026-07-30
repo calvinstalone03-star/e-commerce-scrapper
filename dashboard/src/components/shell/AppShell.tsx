@@ -2,8 +2,14 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 
+import {
+  readRail,
+  readRailOnServer,
+  subscribeRail,
+  writeRail,
+} from '@/components/shell/rail-store';
 import { cn } from '@/components/ui/cn';
 
 /**
@@ -30,7 +36,6 @@ export type ShopBadge = {
 
 type NavItem = { href: string; label: string; icon: ReactNode };
 
-const STORAGE_KEY = 'mcl:sidebar-collapsed';
 
 export function AppShell({
   shops,
@@ -46,26 +51,10 @@ export function AppShell({
   children: ReactNode;
 }) {
   const pathname = usePathname();
-  const [collapsed, setCollapsed] = useState(false);
+  const collapsed = useSyncExternalStore(subscribeRail, readRail, readRailOnServer);
   const [drawer, setDrawer] = useState(false);
 
-  // Read after mount rather than during render: the server has no localStorage,
-  // and guessing here would mean an expanded rail that snaps shut on hydration.
-  useEffect(() => {
-    setCollapsed(window.localStorage.getItem(STORAGE_KEY) === '1');
-  }, []);
-
-  const toggle = () => {
-    setCollapsed((current) => {
-      const next = !current;
-      window.localStorage.setItem(STORAGE_KEY, next ? '1' : '0');
-      return next;
-    });
-  };
-
-  // Any navigation closes the drawer; leaving it open would cover the page it
-  // just opened.
-  useEffect(() => setDrawer(false), [pathname]);
+  const toggle = () => writeRail(!collapsed);
 
   return (
     <div className="flex min-h-screen flex-col">
@@ -103,7 +92,15 @@ export function AppShell({
               aria-label="Navigasi utama"
               className="relative h-full w-60 border-r border-line bg-surface px-2 py-3"
             >
-              <NavLinks pathname={pathname} collapsed={false} />
+              {/* Closed by the tap that navigates, rather than by watching the
+                  pathname: the drawer would otherwise stay open over the page it
+                  just opened, and every way out of it is a tap we already own —
+                  a link, the backdrop, or the page underneath. */}
+              <NavLinks
+                pathname={pathname}
+                collapsed={false}
+                onNavigate={() => setDrawer(false)}
+              />
             </nav>
           </div>
         ) : null}
@@ -283,7 +280,15 @@ function SignOutButton({ signOutAction }: { signOutAction: () => Promise<void> }
   );
 }
 
-function NavLinks({ pathname, collapsed }: { pathname: string; collapsed: boolean }) {
+function NavLinks({
+  pathname,
+  collapsed,
+  onNavigate,
+}: {
+  pathname: string;
+  collapsed: boolean;
+  onNavigate?: () => void;
+}) {
   return (
     <ul className="flex flex-col gap-0.5">
       {NAV.map((item) => {
@@ -292,6 +297,7 @@ function NavLinks({ pathname, collapsed }: { pathname: string; collapsed: boolea
           <li key={item.href}>
             <Link
               href={item.href}
+              onClick={onNavigate}
               aria-current={active ? 'page' : undefined}
               title={collapsed ? item.label : undefined}
               className={cn(
