@@ -15,22 +15,90 @@ import postgres from 'postgres';
  * are mostly aggregations an ORM would obscure anyway.
  */
 
-const connectionString =
-  process.env.DATABASE_URL ?? 'postgresql://calvin@127.0.0.1:5432/ecom_scraper';
+/** The scraper's own database, on the machine that scrapes. */
+export const LOCAL_DATABASE_URL = 'postgresql://calvin@127.0.0.1:5432/ecom_scraper';
+
+type Env = {
+  DATABASE_URL?: string;
+  DATABASE_POOL_MAX?: string;
+  VERCEL?: string;
+  NODE_ENV?: string;
+};
 
 /**
- * How many connections one instance may hold.
+ * Which database to open.
  *
- * Eight is right for a laptop, where there is one long-lived server. It is
- * wrong for serverless, where every concurrent invocation is its own instance:
- * eight each against a database whose pooled endpoint allows a few hundred
- * total is how a dashboard takes itself down under a refresh. One per instance,
- * and let the platform's own pooler do the pooling.
+ * The localhost fallback is a convenience for the machine the scraper runs on,
+ * where the dashboard and the database are the same laptop. On a deployment it
+ * is a trap: there is no Postgres on localhost there, so a `DATABASE_URL` that
+ * was never set — or was set for Preview but not Production — surfaces as a
+ * refused connection, and every error string in this app then blames a Postgres
+ * that is running perfectly well on a machine 10,000km away. Refusing to start
+ * names the actual problem once instead.
  */
-const poolMax = Number(process.env.DATABASE_POOL_MAX ?? (process.env.VERCEL ? 1 : 8));
+export function resolveConnectionString(env: Env = process.env): string {
+  const url = env.DATABASE_URL?.trim();
+  if (url) return url;
+
+  if (env.VERCEL || env.NODE_ENV === 'production') {
+    throw new Error(
+      'DATABASE_URL is not set. The dashboard has no database to read. Set it to the ' +
+        'pooled Neon connection string (the host with `-pooler` in it, ending in ' +
+        '`?sslmode=require`) for this environment — see README section 7.',
+    );
+  }
+
+  return LOCAL_DATABASE_URL;
+}
+
+const connectionString = resolveConnectionString();
+
+type Options = Parameters<typeof postgres>[1] & { ssl?: unknown };
+
+/**
+ * How the driver is configured, and the two hosted-Postgres traps in it.
+ *
+ * **TLS.** postgres.js reads `sslmode` from the URL, but only when the option is
+ * absent — it resolves each option with `'ssl' in options`, so a key that is
+ * present and `undefined` means "no TLS", not "let the URL decide". This used to
+ * pass `undefined` on purpose and Neon answered "connection is insecure (try
+ * using `sslmode=require`)" to a URL that said exactly that. The key has to be
+ * missing, so it is built conditionally.
+ *
+ * **No startup parameters.** The trigram threshold used to travel here as
+ * `options: '-c pg_trgm.similarity_threshold=0.45'`, which a pooled Neon
+ * endpoint rejects outright — not the statement, the whole connection:
+ * "unsupported startup parameter in options". It is set per transaction now, in
+ * `queries.ts`, which is the only form a pooler in transaction mode honours.
+ *
+ * **Pool size.** Eight is right for a laptop, where there is one long-lived
+ * server. It is wrong for serverless, where every concurrent invocation is its
+ * own instance: eight each against a database whose pooled endpoint allows a few
+ * hundred total is how a dashboard takes itself down under a refresh. One per
+ * instance, and let the platform's own pooler do the pooling.
+ */
+export function postgresOptions(url: string, env: Env = process.env): Options {
+  const options: Options = {
+    max: Number(env.DATABASE_POOL_MAX ?? (env.VERCEL ? 1 : 8)),
+    idle_timeout: 20,
+    connect_timeout: 10,
+    // The scraper writes NUMERIC prices. Postgres.js hands those over as
+    // strings, which is correct — parsing to a float here would reintroduce the
+    // rounding the Python side went out of its way to avoid. Formatting happens
+    // at the edge, in `format.ts`.
+    transform: { undefined: null },
+  };
+
+  // A local socket offers no TLS, so there the answer is a flat no. Anything
+  // carrying `sslmode` is a hosted database describing its own requirement —
+  // including `verify-full`, which is why this defers to the URL rather than
+  // flattening every case to `require`.
+  if (!url.includes('sslmode=')) options.ssl = false;
+
+  return options;
+}
 
 declare global {
-  // eslint-disable-next-line no-var
   var __ecomSql: ReturnType<typeof postgres> | undefined;
 }
 
@@ -42,30 +110,7 @@ declare global {
  * one until Postgres refused new connections.
  */
 export const sql =
-  globalThis.__ecomSql ??
-  postgres(connectionString, {
-    max: poolMax,
-    idle_timeout: 20,
-    connect_timeout: 10,
-    // Neon and every other hosted Postgres require TLS; a local socket does not
-    // offer it. Taken from the URL's own `sslmode` when it carries one, which is
-    // how every hosted provider hands its connection string over.
-    ssl: connectionString.includes('sslmode=') ? undefined : false,
-    connection: {
-      // pg_trgm's `%` operator answers to this GUC, and its 0.3 default is not
-      // the threshold the price comparison uses. Left at 0.3 the GIN index
-      // returned every loosely-similar title and `similarity() >= 0.45` threw
-      // most of them away afterwards — the same answer, 1.2s of it. Setting the
-      // operator's own threshold moves that work into the index, where it is
-      // 0.4s. Keep in step with NAME_MATCH_THRESHOLD in queries.ts.
-      options: '-c pg_trgm.similarity_threshold=0.45',
-    },
-    // The scraper writes NUMERIC prices. Postgres.js hands those over as
-    // strings, which is correct — parsing to a float here would reintroduce the
-    // rounding the Python side went out of its way to avoid. Formatting happens
-    // at the edge, in `format.ts`.
-    transform: { undefined: null },
-  });
+  globalThis.__ecomSql ?? postgres(connectionString, postgresOptions(connectionString));
 
 if (process.env.NODE_ENV !== 'production') {
   globalThis.__ecomSql = sql;

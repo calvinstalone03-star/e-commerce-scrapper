@@ -1,5 +1,7 @@
 import 'server-only';
 
+import type { PendingQuery, Row, TransactionSql } from 'postgres';
+
 import { sql } from '@/lib/db';
 import {
   filterOptionsSchema,
@@ -289,6 +291,39 @@ const EXTREME_GAP = 1.0;
  * operator the GIN trigram index answers, and it prunes the candidate set
  * before the exact score is computed on what survives.
  */
+/**
+ * Runs one query with the trigram threshold the name matching compares on.
+ *
+ * `%` is the operator the GIN index answers, and it answers it at whatever
+ * `pg_trgm.similarity_threshold` says — 0.3 by default, which is not what
+ * `NAME_MATCH_THRESHOLD` means. The answer is the same either way, because every
+ * pairing is also filtered by an explicit `similarity() >= 0.45`; what changes is
+ * who does the work. At 0.3 the index hands over every loosely-similar title and
+ * the filter throws most of them away: measured on 12k listings, 22s instead of
+ * 7s for the same rows.
+ *
+ * This used to be a connection-level startup parameter, which is both cheaper
+ * and unusable: Neon's pooled endpoint refuses the connection over it
+ * ("unsupported startup parameter in options"), and a pooled connection is the
+ * only kind a serverless deployment should hold. `SET LOCAL` inside a
+ * transaction is the form a pooler in transaction mode honours — it is scoped to
+ * the transaction, so the connection goes back to the pool exactly as it came
+ * out, and the next client to borrow it is unaffected.
+ *
+ * Exported so a test can pin both halves of that: the threshold in force where
+ * the matching happens, and nothing left behind afterwards.
+ */
+export function withNameMatching<T>(
+  run: (tx: TransactionSql) => Promise<T> | PendingQuery<Row[]>,
+): Promise<T> {
+  return sql.begin(async (tx) => {
+    // `SET` takes no bind parameters, so the value is interpolated — it is a
+    // numeric constant in this file, never anything from a request.
+    await tx.unsafe(`SET LOCAL pg_trgm.similarity_threshold = ${NAME_MATCH_THRESHOLD}`);
+    return run(tx);
+  }) as Promise<T>;
+}
+
 const rivalMatch = sql`
   (
     (m.set_code IS NOT NULL AND r.set_code = m.set_code)
@@ -412,7 +447,7 @@ export async function getPricePositions(
   // row: measured, that one clause took the query from 9ms to 6.5s. And joining
   // `products` directly rather than a CTE of rivals is what lets the set-code
   // and trigram indexes be used at all; a CTE is an optimisation fence.
-  const rows = await sql`
+  const rows = await withNameMatching((tx) => tx`
     WITH latest AS (${latestSnapshots}),
     mine AS MATERIALIZED (${ourProducts}),
     pairs AS MATERIALIZED (
@@ -509,7 +544,7 @@ export async function getPricePositions(
           FROM page
         ) shaped
       ) AS rows
-  `;
+  `);
 
   const answer = rows[0];
   return {
@@ -529,7 +564,7 @@ export async function getPricePositions(
  * time-series chart would be an empty promise.
  */
 export async function getPricingAnalytics(): Promise<PricingAnalytics> {
-  const [row] = await sql`
+  const [row] = await withNameMatching((tx) => tx`
     WITH latest AS (${latestSnapshots}),
     mine AS MATERIALIZED (
       SELECT p.id, p.name, p.set_code, l.price, l.sold
@@ -631,7 +666,7 @@ export async function getPricingAnalytics(): Promise<PricingAnalytics> {
             AND abs((s.price - s.cheapest) / s.cheapest) < ${EXTREME_GAP}
         ) g
       ) AS "gapVolume"
-  `;
+  `);
 
   return pricingAnalyticsSchema.parse(row);
 }
@@ -650,7 +685,7 @@ export async function getPricePositionDetail(
   `;
   if (!mine) return null;
 
-  const rivals = await sql`
+  const rivals = await withNameMatching((tx) => tx`
     WITH latest AS (${latestSnapshots}),
     mine AS (SELECT * FROM (${ourProducts}) o WHERE o.id = ${productId}),
     rivals AS (${theirProducts})
@@ -669,7 +704,7 @@ export async function getPricePositionDetail(
     FROM mine m
     JOIN rivals r ON ${rivalMatch}
     ORDER BY r.price ASC NULLS LAST
-  `;
+  `);
 
   const cheapest = rivals[0] ?? null;
   const prices = rivals.map((row) => Number(row.price)).filter((value) => Number.isFinite(value));
