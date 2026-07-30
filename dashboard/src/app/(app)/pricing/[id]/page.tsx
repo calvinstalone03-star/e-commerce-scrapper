@@ -15,7 +15,7 @@ import {
   formatSold,
   formatStoreName,
 } from '@/lib/format';
-import { channelOfOwnProduct, getPriceHistory, getPricePositionDetail } from '@/lib/queries';
+import { getPriceHistory, getPricePositionDetail } from '@/lib/queries';
 
 /**
  * One of our products against every rival tied to it.
@@ -60,7 +60,12 @@ export default async function PricingDetailPage({
   const detail = await getPricePositionDetail(productId);
   if (!detail) notFound();
 
-  const channel = await channelOfOwnProduct(productId);
+  // `getPricePositionDetail` already resolved this product's channel to build
+  // its `mine` CTE (`ourListings` filters on `s.marketplace = channel`), so
+  // `product.marketplace` *is* that channel by construction — a second
+  // `channelOfOwnProduct` call here would only re-pay for a value already in
+  // hand.
+  const channel = detail.product.marketplace;
   const asked = (await searchParams)[CHANNEL_PARAM];
 
   // The id already names a shop, so a link that arrives with the other channel
@@ -69,7 +74,7 @@ export default async function PricingDetailPage({
   // catch would swallow that throw and turn this into a normal render.
   // withChannel() always sets a single query value, so the corrected URL's
   // `asked` can only equal `channel` on the next request — one hop, not a loop.
-  if (channel && asked !== channel) {
+  if (asked !== channel) {
     redirect(withChannel(`/pricing/${productId}`, channel));
   }
 
