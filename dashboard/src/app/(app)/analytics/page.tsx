@@ -9,6 +9,7 @@ import {
 } from '@/components/AnalyticsCharts';
 import { EmptyState } from '@/components/EmptyState';
 import { Card, CardContent, CardHeader, CardTitle, Stat } from '@/components/ui';
+import { resolveChannel } from '@/lib/channel';
 import { formatPrice } from '@/lib/format';
 import { getOwnShops, getPricingAnalytics } from '@/lib/queries';
 
@@ -57,7 +58,12 @@ export default async function AnalyticsPage() {
     );
   }
 
-  const analytics = await getPricingAnalytics();
+  // `channel` is only null when no shop is marked ours, which the early
+  // return above has already handled. Reading `?kanal=` from the URL and
+  // naming the shop on this page is Task 5 — this just keeps the build
+  // honest about `getPricingAnalytics` now taking a channel.
+  const channel = resolveChannel(undefined, shops)!;
+  const analytics = await getPricingAnalytics(channel);
   const { position, rivals, bands, gapVolume } = analytics;
 
   const compared = position.cheapest + position.middle + position.dearest;

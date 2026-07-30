@@ -1,14 +1,32 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
+
+/**
+ * `unstable_cache` needs a real Next.js server behind it — specifically the
+ * incremental cache the server process hangs off `globalThis` — and throws
+ * outright when that is missing, rather than quietly skipping the cache.
+ * Vitest never starts that server, so the throw happens no matter where the
+ * cache boundary sits in `queries.ts`. Next's own client-bundle build hits the
+ * same gap and closes it the same way: caching becomes a no-op and the
+ * wrapped function is called directly. This is that fallback, applied to this
+ * process instead — the tests below prove the pairing is correct, not that
+ * caching works, so a no-op cache is exactly what they need.
+ */
+vi.mock('next/cache', () => ({
+  unstable_cache: <Fn extends (...args: readonly unknown[]) => unknown>(fn: Fn): Fn => fn,
+}));
 
 import { sql } from '@/lib/db';
 import {
   channelOfOwnProduct,
+  computePairingSnapshot,
+  getOwnShopScorecard,
   getOwnShops,
   getPricePositionDetail,
   getPricePositions,
+  getPricingAnalytics,
   withNameMatching,
 } from '@/lib/queries';
 import { pricePositionFilterSchema } from '@/lib/schemas';
@@ -497,5 +515,77 @@ describe('name matching', () => {
     const { rows } = await getPricePositions('shopee', anyFilter);
     expect(rows).toHaveLength(1);
     expect(Number(rows[0].cheapestPrice)).toBe(400_000);
+  });
+});
+
+describe('pairing snapshot', () => {
+  /**
+   * The overview scorecard and the analytics position mix are the same numbers
+   * shown twice. They are computed once for that reason, and these tests are
+   * what keep them from drifting apart again.
+   */
+  async function bothShopsWithOneRival() {
+    const shopeeMine = await addStore('i_bricks', { own: true, marketplace: 'shopee' });
+    const tokopediaMine = await addStore('i-bricks', { own: true, marketplace: 'tokopedia' });
+    const rival = await addStore('brickstore');
+    // One set in both our shops: cheapest on Shopee, dearest on Tokopedia.
+    await addProduct(shopeeMine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 380_000 });
+    await addProduct(tokopediaMine, {
+      name: 'LEGO 10696 Brick Box',
+      setCode: '10696',
+      price: 460_000,
+      marketplace: 'tokopedia',
+    });
+    await addProduct(rival, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 400_000 });
+    // A second Shopee listing nobody sells against.
+    await addProduct(shopeeMine, { name: 'Bundle Baseplate 3pcs', setCode: null, price: 145_000 });
+  }
+
+  test('counts each channel on its own, so a shared set is never counted twice', async () => {
+    await bothShopsWithOneRival();
+
+    const shopee = await computePairingSnapshot('shopee');
+    const tokopedia = await computePairingSnapshot('tokopedia');
+
+    expect(shopee.listings).toBe(2);
+    expect(shopee.withRivals).toBe(1);
+    expect(shopee.position).toEqual({ cheapest: 1, middle: 0, dearest: 0, unmatched: 1 });
+
+    expect(tokopedia.listings).toBe(1);
+    expect(tokopedia.withRivals).toBe(1);
+    expect(tokopedia.position).toEqual({ cheapest: 0, middle: 0, dearest: 1, unmatched: 0 });
+  });
+
+  test('money on the table is what this channel is leaving, not both', async () => {
+    await bothShopsWithOneRival();
+
+    // Shopee undercuts the rival, so nothing is on the table there.
+    expect(Number((await computePairingSnapshot('shopee')).atStake)).toBe(0);
+    // Tokopedia is Rp 60.000 above the cheapest rival.
+    expect(Number((await computePairingSnapshot('tokopedia')).atStake)).toBe(60_000);
+  });
+
+  test('the scorecard and the analytics page cannot disagree', async () => {
+    await bothShopsWithOneRival();
+    const shop = (await getOwnShops()).find((row) => row.marketplace === 'shopee')!;
+
+    const scorecard = await getOwnShopScorecard('shopee', shop);
+    const analytics = await getPricingAnalytics('shopee');
+
+    expect(scorecard.position).toEqual(analytics.position);
+    expect(scorecard.channel).toBe('shopee');
+    expect(scorecard.shopUsername).toBe('i_bricks');
+  });
+
+  test('a shop with no priced listing reports zeros rather than throwing', async () => {
+    const mine = await addStore('i_bricks', { own: true, marketplace: 'shopee' });
+    await addProduct(mine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: null });
+
+    const snapshot = await computePairingSnapshot('shopee');
+
+    expect(snapshot.listings).toBe(0);
+    expect(snapshot.position).toEqual({ cheapest: 0, middle: 0, dearest: 0, unmatched: 0 });
+    expect(Number(snapshot.atStake ?? 0)).toBe(0);
+    expect(snapshot.rivals).toEqual([]);
   });
 });

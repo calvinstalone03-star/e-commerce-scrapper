@@ -1,5 +1,6 @@
 import 'server-only';
 
+import { unstable_cache } from 'next/cache';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 
 import type { Channel } from '@/lib/channel';
@@ -8,6 +9,7 @@ import {
   filterOptionsSchema,
   overviewSchema,
   ownShopSchema,
+  ownShopScorecardSchema,
   pricePointSchema,
   pricePositionRowSchema,
   pricePositionSummarySchema,
@@ -18,6 +20,7 @@ import {
   type FilterOptions,
   type Overview,
   type OwnShop,
+  type OwnShopScorecard,
   type PricePoint,
   type PricePositionFilter,
   type PricePositionRow,
@@ -564,23 +567,35 @@ export async function getPricePositions(
 }
 
 /**
- * The four questions the analytics screen answers, in one statement.
+ * Every figure both scoped screens need, computed once per channel.
  *
- * All four rest on the same pairing as the worklist, so they share its CTE
- * rather than recomputing it — the same reason that page went from three round
- * trips to one. Every figure here is a snapshot of one moment: with 38 products
- * carrying more than one observation, there is no trend to draw yet, and a
- * time-series chart would be an empty promise.
+ * This statement was `getPricingAnalytics`, and its `mine` CTE joined
+ * `is_own` alone — exactly the join that cannot tell the Shopee shop from the
+ * Tokopedia one apart. Taking a channel is the fix. The scorecard's three
+ * extra numbers (`listings`, `withRivals`, `atStake`) are computed here rather
+ * than in a second statement for the same reason the worklist shares one CTE
+ * for three answers: two figures that are supposed to be identical have to
+ * come from the same `scored` rows, the same trigram threshold, the same
+ * moment, or one of them eventually disagrees and nobody notices which.
+ *
+ * Uncached and exported so tests can call it directly. `getPairingSnapshot`
+ * below is the cached entry point every page actually calls; it needs no Next
+ * request context to run.
  */
-export async function getPricingAnalytics(): Promise<PricingAnalytics> {
+export type PairingSnapshot = PricingAnalytics & {
+  listings: number;
+  withRivals: number;
+  atStake: string | null;
+};
+
+export async function computePairingSnapshot(channel: Channel): Promise<PairingSnapshot> {
   const [row] = await withNameMatching((tx) => tx`
     WITH latest AS (${latestSnapshots}),
     mine AS MATERIALIZED (
-      SELECT p.id, p.name, p.set_code, l.price, l.sold
-      FROM products p
-      JOIN stores s ON s.id = p.shop_ref AND s.is_own
-      JOIN latest l ON l.product_ref = p.id
-      WHERE l.price IS NOT NULL
+      SELECT o.id, o.name, o.set_code, o.price, l.sold
+      FROM (${ourListings(channel)}) o
+      JOIN latest l ON l.product_ref = o.id
+      WHERE o.price IS NOT NULL
     ),
     pairs AS MATERIALIZED (
       SELECT m.id AS mine_id, m.price AS my_price, l.price AS their_price,
@@ -674,10 +689,62 @@ export async function getPricingAnalytics(): Promise<PricingAnalytics> {
             -- price, the same reason the worklist hides those rows by default.
             AND abs((s.price - s.cheapest) / s.cheapest) < ${EXTREME_GAP}
         ) g
-      ) AS "gapVolume"
+      ) AS "gapVolume",
+      (SELECT count(*) FROM scored)                  AS listings,
+      (SELECT count(*) FROM scored WHERE rivals > 0) AS "withRivals",
+      (
+        SELECT coalesce(sum(price - cheapest) FILTER (WHERE price > cheapest), 0)
+        FROM scored WHERE rivals > 0
+      ) AS "atStake"
   `);
 
-  return pricingAnalyticsSchema.parse(row);
+  return {
+    ...pricingAnalyticsSchema.parse(row),
+    listings: Number(row.listings),
+    withRivals: Number(row.withRivals),
+    atStake: row.atStake === null ? null : String(row.atStake),
+  };
+}
+
+/**
+ * The same snapshot, at most five minutes old.
+ *
+ * The pairing is the expensive part of this app — 2.9–3.3s against Neon — and
+ * two screens need all of it. Snapshots only change when a scrape runs, so a
+ * five-minute-old answer is the same answer; the first visit pays for it and the
+ * rest do not.
+ *
+ * The cache wraps `computePairingSnapshot` from outside on purpose: the tests
+ * call the inner function, which needs no Next request context to run.
+ */
+export const getPairingSnapshot = unstable_cache(
+  (channel: Channel) => computePairingSnapshot(channel),
+  ['pairing'],
+  { revalidate: 300, tags: ['pairing'] },
+);
+// The arguments are part of the cache key, so `shopee` and `tokopedia` can never
+// be served each other's snapshot. The key parts above only namespace it.
+
+/** What the analytics page needs: the snapshot without the scorecard extras. */
+export async function getPricingAnalytics(channel: Channel): Promise<PricingAnalytics> {
+  const { position, rivals, bands, gapVolume } = await getPairingSnapshot(channel);
+  return { position, rivals, bands, gapVolume };
+}
+
+/** What the overview needs: the headline four, named for the shop they describe. */
+export async function getOwnShopScorecard(
+  channel: Channel,
+  shop: OwnShop,
+): Promise<OwnShopScorecard> {
+  const snapshot = await getPairingSnapshot(channel);
+  return ownShopScorecardSchema.parse({
+    channel,
+    shopUsername: shop.username,
+    listings: snapshot.listings,
+    withRivals: snapshot.withRivals,
+    position: snapshot.position,
+    atStake: snapshot.atStake,
+  });
 }
 
 /**

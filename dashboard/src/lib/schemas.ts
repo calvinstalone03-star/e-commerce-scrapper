@@ -214,6 +214,28 @@ export const pricingAnalyticsSchema = z.object({
 });
 export type PricingAnalytics = z.infer<typeof pricingAnalyticsSchema>;
 
+/**
+ * The overview's answer to "where do we stand in this channel".
+ *
+ * A subset of the pairing snapshot rather than its own query: two numbers that
+ * are supposed to be the same number must come from the same statement, or one
+ * of them is eventually wrong and nobody notices which.
+ */
+export const ownShopScorecardSchema = z.object({
+  channel: marketplaceSchema,
+  shopUsername: z.string(),
+  listings: z.coerce.number().int(),
+  withRivals: z.coerce.number().int(),
+  position: z.object({
+    cheapest: z.coerce.number().int(),
+    middle: z.coerce.number().int(),
+    dearest: z.coerce.number().int(),
+    unmatched: z.coerce.number().int(),
+  }),
+  atStake: moneySchema,
+});
+export type OwnShopScorecard = z.infer<typeof ownShopScorecardSchema>;
+
 export const overviewSchema = z.object({
   stores: z.coerce.number().int(),
   products: z.coerce.number().int(),
