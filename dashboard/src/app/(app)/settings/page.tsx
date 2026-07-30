@@ -3,7 +3,7 @@ import type { Metadata } from 'next';
 import { CredentialsForm } from '@/components/CredentialsForm';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui';
 import { currentUsername, usingDefaultPassword } from '@/lib/auth';
-import { CHANNEL_PARAM, resolveChannel } from '@/lib/channel';
+import { channelFromParams } from '@/lib/channel';
 import { getOwnShops } from '@/lib/queries';
 
 /**
@@ -38,7 +38,7 @@ export default async function SettingsPage({
   ]);
   // Same resolution the rest of the app uses, so "kanal aktif" here always
   // names the shop every other screen is currently reporting on.
-  const channel = resolveChannel(params[CHANNEL_PARAM] as string | undefined, shops);
+  const channel = channelFromParams(params, shops);
 
   return (
     <div className="max-w-2xl space-y-6">

@@ -72,3 +72,20 @@ export function withChannel(href: string, channel: Channel | null): string {
   params.set(CHANNEL_PARAM, channel);
   return `${path}?${params}`;
 }
+
+/**
+ * The channel named by a server page's searchParams, tolerating arrays.
+ *
+ * `params[CHANNEL_PARAM] as string | undefined` is a false cast: a repeated
+ * query key (`?kanal=a&kanal=b`) makes Next hand back an array, not a string,
+ * and the cast just hides that rather than handling it. `raw[0]` matches what
+ * the client shell's `searchParams.get()` returns for the same URL, so a
+ * server page and the shell agree on which value wins.
+ */
+export function channelFromParams(
+  params: Record<string, string | string[] | undefined>,
+  shops: ReadonlyArray<{ marketplace: string }>,
+): Channel | null {
+  const raw = params[CHANNEL_PARAM];
+  return resolveChannel(Array.isArray(raw) ? raw[0] : raw, shops);
+}

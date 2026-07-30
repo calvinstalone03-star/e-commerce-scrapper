@@ -5,7 +5,7 @@ import { EmptyState } from '@/components/EmptyState';
 import { PricingSearch } from '@/components/PricingSearch';
 import { UrlChoice } from '@/components/UrlChoice';
 import { Badge, Card, CardContent, Stat, TBody, TD, TH, THead, TR, Table, cn } from '@/components/ui';
-import { CHANNEL_PARAM, channelShop, resolveChannel, type Channel } from '@/lib/channel';
+import { channelFromParams, channelShop, withChannel, type Channel } from '@/lib/channel';
 import { MARKETPLACE_LABELS, formatDate, formatPrice, formatStoreName } from '@/lib/format';
 import { getOwnShops, getPricePositions } from '@/lib/queries';
 import {
@@ -78,15 +78,23 @@ export default async function PricingPage({
     );
   }
 
-  const channel = resolveChannel(params[CHANNEL_PARAM] as string | undefined, shops);
+  const channel = channelFromParams(params, shops);
   const shop = channelShop(channel, shops);
+
+  // Unreachable in practice — the zero-shops return above already guarantees
+  // a channel resolves — but this is the same idiom the other scoped pages use
+  // rather than asserting past a case that cannot happen.
+  if (!channel || !shop) {
+    return (
+      <div className="space-y-6">
+        <PageHeader />
+      </div>
+    );
+  }
 
   // One statement answers all three: the page, its total, and the headline
   // counts over the whole catalogue.
-  //
-  // `channel` is only null when no shop is marked ours, which the early return
-  // above has already handled.
-  const { rows, total, summary } = await getPricePositions(channel!, filter);
+  const { rows, total, summary } = await getPricePositions(channel, filter);
 
   const unmatched = summary.products - summary.matched;
 
@@ -123,7 +131,7 @@ export default async function PricingPage({
         </CardContent>
       </Card>
 
-      <SearchBox filter={filter} />
+      <SearchBox filter={filter} channel={channel} />
       <Filters filter={filter} />
 
       {rows.length === 0 ? (
@@ -158,7 +166,7 @@ export default async function PricingPage({
                 <TR key={row.id} className="relative hover:bg-surface-muted">
                   <TD>
                     <Link
-                      href={`/pricing/${row.id}`}
+                      href={withChannel(`/pricing/${row.id}`, channel)}
                       className="font-medium text-foreground underline-offset-4 before:absolute before:inset-0 before:content-[''] hover:underline"
                     >
                       {row.name ?? 'Produk tanpa nama'}
@@ -227,7 +235,7 @@ export default async function PricingPage({
             </TBody>
           </Table>
 
-          <PageLinks filter={filter} total={total} />
+          <PageLinks filter={filter} total={total} channel={channel} />
         </>
       )}
     </div>
@@ -284,15 +292,15 @@ function Gap({ value }: { value: number | null }) {
  * The "clear" link stays here because it is a plain link and belongs to the
  * server-rendered part.
  */
-function SearchBox({ filter }: { filter: PricePositionFilter }) {
+function SearchBox({ filter, channel }: { filter: PricePositionFilter; channel: Channel | null }) {
   const carried = { ...filter, q: undefined, page: undefined };
 
   return (
     <div className="flex flex-wrap items-center gap-3">
-      <PricingSearch q={filter.q ?? ''} carried={carried} />
+      <PricingSearch q={filter.q ?? ''} carried={carried} channel={channel} />
       {filter.q ? (
         <Link
-          href={`/pricing?${toSearchParams(carried)}`}
+          href={withChannel(`/pricing?${toSearchParams(carried)}`, channel)}
           className="text-sm text-muted underline-offset-4 hover:underline"
         >
           Hapus pencarian
@@ -370,7 +378,15 @@ function Filters({ filter }: { filter: PricePositionFilter }) {
  * That component is callback-driven for the client-side list views; this page is
  * a Server Component, so its paging has to survive in the URL.
  */
-function PageLinks({ filter, total }: { filter: PricePositionFilter; total: number }) {
+function PageLinks({
+  filter,
+  total,
+  channel,
+}: {
+  filter: PricePositionFilter;
+  total: number;
+  channel: Channel | null;
+}) {
   const pages = Math.max(1, Math.ceil(total / filter.pageSize));
   const from = total === 0 ? 0 : (filter.page - 1) * filter.pageSize + 1;
   const to = Math.min(filter.page * filter.pageSize, total);
@@ -389,7 +405,7 @@ function PageLinks({ filter, total }: { filter: PricePositionFilter; total: numb
           {[10, 25, 50, 100].map((size) => (
             <Link
               key={size}
-              href={`/pricing?${toSearchParams({ ...filter, pageSize: size, page: 1 })}`}
+              href={withChannel(`/pricing?${toSearchParams({ ...filter, pageSize: size, page: 1 })}`, channel)}
               aria-current={filter.pageSize === size ? 'true' : undefined}
               className={cn(
                 'rounded px-1.5 py-0.5 tabular-nums transition-colors',
@@ -410,7 +426,7 @@ function PageLinks({ filter, total }: { filter: PricePositionFilter; total: numb
         </span>
         {filter.page > 1 ? (
           <Link
-            href={`/pricing?${toSearchParams({ ...filter, page: filter.page - 1 })}`}
+            href={withChannel(`/pricing?${toSearchParams({ ...filter, page: filter.page - 1 })}`, channel)}
             className="rounded-md border border-line bg-surface px-3 py-1.5 text-muted transition-colors hover:text-foreground"
           >
             Sebelumnya
@@ -418,7 +434,7 @@ function PageLinks({ filter, total }: { filter: PricePositionFilter; total: numb
         ) : null}
         {filter.page < pages ? (
           <Link
-            href={`/pricing?${toSearchParams({ ...filter, page: filter.page + 1 })}`}
+            href={withChannel(`/pricing?${toSearchParams({ ...filter, page: filter.page + 1 })}`, channel)}
             className="rounded-md border border-line bg-surface px-3 py-1.5 text-muted transition-colors hover:text-foreground"
           >
             Berikutnya

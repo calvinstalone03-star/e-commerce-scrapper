@@ -7,7 +7,7 @@ import { OverviewCards } from '@/components/OverviewCards';
 import { OwnShopScorecard } from '@/components/OwnShopScorecard';
 import { ProductImage } from '@/components/ProductImage';
 import { Badge, Card, CardContent, CardHeader, CardTitle } from '@/components/ui';
-import { CHANNEL_PARAM, channelShop, resolveChannel } from '@/lib/channel';
+import { channelFromParams, channelShop } from '@/lib/channel';
 import {
   MARKETPLACE_LABELS,
   formatDateTime,
@@ -255,7 +255,7 @@ export default async function OverviewPage({
   // `shop` is derived from this same `channel`, not from an independent lookup —
   // the only way to guarantee the scorecard below is never asked for one shop
   // while labelled with another's channel.
-  const channel = resolveChannel(params[CHANNEL_PARAM] as string | undefined, shops);
+  const channel = channelFromParams(params, shops);
   const shop = channelShop(channel, shops);
 
   const [overview, scorecard, cheapest, priciest, topStores] = await Promise.all([

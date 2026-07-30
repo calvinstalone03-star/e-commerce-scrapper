@@ -2,6 +2,7 @@ import 'server-only';
 
 import { unstable_cache } from 'next/cache';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
+import { cache } from 'react';
 
 import type { Channel } from '@/lib/channel';
 import { sql } from '@/lib/db';
@@ -368,8 +369,15 @@ const theirProducts = sql`
   WHERE l.price IS NOT NULL
 `;
 
-/** Shops marked ours. Empty means the screen has nothing to stand on. */
-export async function getOwnShops(): Promise<OwnShop[]> {
+/**
+ * Shops marked ours. Empty means the screen has nothing to stand on.
+ *
+ * `React.cache()`-wrapped: every scoped screen calls this once in the layout
+ * (to build the shop switcher) and again in the page itself, and without the
+ * wrapper that is the same query twice per request for two callers that were
+ * always going to agree.
+ */
+export const getOwnShops = cache(async (): Promise<OwnShop[]> => {
   const rows = await sql`
     SELECT s.id, s.marketplace, s.username, s.name,
            count(p.id) AS products
@@ -380,7 +388,7 @@ export async function getOwnShops(): Promise<OwnShop[]> {
     ORDER BY products DESC, s.username
   `;
   return rows.map((row) => ownShopSchema.parse(row));
-}
+});
 
 export async function getPricePositions(
   channel: Channel,
@@ -707,12 +715,16 @@ export async function computePairingSnapshot(channel: Channel): Promise<PairingS
 }
 
 /**
- * The same snapshot, at most five minutes old.
+ * The same snapshot, served immediately and refreshed in the background.
  *
  * The pairing is the expensive part of this app — 2.9–3.3s against Neon — and
  * two screens need all of it. Snapshots only change when a scrape runs, so a
- * five-minute-old answer is the same answer; the first visit pays for it and the
- * rest do not.
+ * few-minutes-old answer is the same answer; the first visit after each
+ * five-minute window pays for a refresh and the rest do not. `revalidate: 300`
+ * is stale-while-revalidate, not a hard ceiling: a request past that window is
+ * still answered from what is already cached while the refresh runs for
+ * whoever asks next, so a figure can be one refresh older than five minutes,
+ * never "at most" five.
  *
  * The cache wraps `computePairingSnapshot` from outside on purpose: the tests
  * call the inner function, which needs no Next request context to run.
@@ -764,10 +776,17 @@ export async function channelOfOwnProduct(productId: number): Promise<Channel | 
   return (row?.marketplace as Channel | undefined) ?? null;
 }
 
-/** One of our products and every rival tied to it, dearest question first. */
-export async function getPricePositionDetail(
+/**
+ * One of our products and every rival tied to it, dearest question first.
+ *
+ * `React.cache()`-wrapped: `generateMetadata` and the page body both call this
+ * with the same id on every visit to the detail page, and without the wrapper
+ * the whole pairing query — the expensive part of this app — runs twice just
+ * to fill in a `<title>`.
+ */
+export const getPricePositionDetail = cache(async (
   productId: number,
-): Promise<{ product: PricePositionRow; rivals: RivalRow[] } | null> {
+): Promise<{ product: PricePositionRow; rivals: RivalRow[] } | null> => {
   const channel = await channelOfOwnProduct(productId);
   if (!channel) return null;
 
@@ -827,7 +846,7 @@ export async function getPricePositionDetail(
     }),
     rivals: rivals.map((row) => rivalRowSchema.parse(row)),
   };
-}
+});
 
 // ---------------------------------------------------------------------------
 // Filter options

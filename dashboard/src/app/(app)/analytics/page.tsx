@@ -9,7 +9,7 @@ import {
 } from '@/components/AnalyticsCharts';
 import { EmptyState } from '@/components/EmptyState';
 import { Card, CardContent, CardHeader, CardTitle, Stat } from '@/components/ui';
-import { CHANNEL_PARAM, channelShop, resolveChannel } from '@/lib/channel';
+import { channelFromParams, channelShop, withChannel } from '@/lib/channel';
 import { MARKETPLACE_LABELS, formatPrice } from '@/lib/format';
 import { getOwnShops, getPricingAnalytics } from '@/lib/queries';
 import type { OwnShop } from '@/lib/schemas';
@@ -46,7 +46,7 @@ export default async function AnalyticsPage({
   // `shop` is derived from this same `channel`, not from an independent lookup —
   // the only way to guarantee the heading below never names one shop while the
   // figures underneath answer for the other.
-  const channel = resolveChannel(params[CHANNEL_PARAM] as string | undefined, shops);
+  const channel = channelFromParams(params, shops);
   const shop = channelShop(channel, shops);
 
   if (!channel || !shop) {
@@ -192,7 +192,7 @@ export default async function AnalyticsPage({
       <p className="text-sm text-muted">
         Semua angka di atas adalah potret satu waktu, dari snapshot terbaru tiap produk. Tren harga
         baru bisa digambar setelah produk yang sama di-scrape di hari yang berbeda.{' '}
-        <Link href="/pricing" className="text-accent underline-offset-4 hover:underline">
+        <Link href={withChannel('/pricing', channel)} className="text-accent underline-offset-4 hover:underline">
           Buka daftar kerja
         </Link>{' '}
         untuk menindaklanjuti per produk.

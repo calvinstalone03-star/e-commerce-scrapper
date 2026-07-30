@@ -12,6 +12,7 @@ import {
 } from '@/components/shell/rail-store';
 import { cn } from '@/components/ui/cn';
 import { CHANNEL_PARAM, resolveChannel, withChannel, type Channel } from '@/lib/channel';
+import { MARKETPLACE_LABELS } from '@/lib/format';
 
 /**
  * The frame every signed-in page sits in: a rail that collapses, a topbar that
@@ -57,6 +58,13 @@ export function AppShell({
   // it against the same `shops` the layout already fetched.
   const searchParams = useSearchParams();
   const channel = resolveChannel(searchParams.get(CHANNEL_PARAM), shops);
+  // The rest of the query — `stance`, `matched`, `page` and the like — so the
+  // shop switcher keeps a filtered worklist's filters instead of resetting it
+  // to the bare page. Guarded rather than always appending `?`: an empty
+  // `URLSearchParams#toString()` would otherwise leave every switcher href
+  // ending in a bare `?`.
+  const query = searchParams.toString();
+  const pathWithQuery = query ? `${pathname}?${query}` : pathname;
   const collapsed = useSyncExternalStore(subscribeRail, readRail, readRailOnServer);
   const [drawer, setDrawer] = useState(false);
 
@@ -66,7 +74,7 @@ export function AppShell({
     <div className="flex min-h-screen flex-col">
       <Topbar
         shops={shops}
-        pathname={pathname}
+        pathWithQuery={pathWithQuery}
         channel={channel}
         username={username}
         warnDefaultPassword={warnDefaultPassword}
@@ -103,7 +111,19 @@ export function AppShell({
               {/* Closed by the tap that navigates, rather than by watching the
                   pathname: the drawer would otherwise stay open over the page it
                   just opened, and every way out of it is a tap we already own —
-                  a link, the backdrop, or the page underneath. */}
+                  a link, the backdrop, or the page underneath. The switcher
+                  gets the same treatment as the nav links below it: below `md`
+                  this drawer is the only place the channel can be changed at
+                  all, and a chip that left the drawer open would be the one
+                  tap in here that behaved differently from every other. */}
+              <div className="mb-3 flex flex-wrap items-center gap-1.5 border-b border-line pb-3">
+                <ShopSwitcher
+                  shops={shops}
+                  channel={channel}
+                  pathWithQuery={pathWithQuery}
+                  onNavigate={() => setDrawer(false)}
+                />
+              </div>
               <NavLinks
                 pathname={pathname}
                 collapsed={false}
@@ -127,7 +147,7 @@ export function AppShell({
 
 function Topbar({
   shops,
-  pathname,
+  pathWithQuery,
   channel,
   username,
   warnDefaultPassword,
@@ -137,7 +157,7 @@ function Topbar({
   collapsed,
 }: {
   shops: ShopBadge[];
-  pathname: string;
+  pathWithQuery: string;
   channel: Channel | null;
   username: string;
   warnDefaultPassword: boolean;
@@ -186,31 +206,10 @@ function Topbar({
       {/* Which shop every number on every page is about, and the switch that
           changes it. Without this the dashboard says "kita" everywhere and
           never says who that is, or lets you ask the same question of the
-          other shop. */}
+          other shop. Hidden below `md`; the drawer renders the same
+          `ShopSwitcher` for narrower screens. */}
       <div className="ml-2 hidden min-w-0 items-center gap-1.5 md:flex">
-        {shops.length === 0 ? (
-          <span className="rounded-md border border-dashed border-line px-2 py-1 text-xs text-muted">
-            belum ada toko sendiri
-          </span>
-        ) : shops.length === 1 ? (
-          <ShopBadgeChip shop={shops[0]} active />
-        ) : (
-          shops.map((shop) => (
-            <Link
-              key={shop.id}
-              // `ShopBadge.marketplace` is a bare string (kept decoupled from the
-              // schema types the pages use), so it is resolved against the same
-              // `shops` list to get back a real `Channel` for `withChannel` —
-              // `channel.ts` itself is untouched.
-              href={withChannel(pathname, resolveChannel(shop.marketplace, shops))}
-              aria-current={shop.marketplace === channel ? 'true' : undefined}
-              className={chipClassName(shop.marketplace === channel)}
-              title={`${shop.products} produk ter-scrape`}
-            >
-              <ShopBadgeContent shop={shop} />
-            </Link>
-          ))
-        )}
+        <ShopSwitcher shops={shops} channel={channel} pathWithQuery={pathWithQuery} />
       </div>
 
       <div className="ml-auto flex items-center gap-2">
@@ -275,12 +274,89 @@ function ShopBadgeContent({ shop }: { shop: ShopBadge }) {
  * the same `chipClassName` and `ShopBadgeContent` the two-shop switcher uses,
  * so the two renderings share one definition instead of two
  * independently-maintained copies that can silently drift apart.
+ *
+ * `marketplace` is the shop's own marketplace, already resolved to a real
+ * `Channel` by the caller (the same `resolveChannel` call the two-shop
+ * switcher makes) — the dot next to the username is otherwise the only thing
+ * that says Shopee or Tokopedia, and it is `aria-hidden`.
  */
-function ShopBadgeChip({ shop, active }: { shop: ShopBadge; active?: boolean }) {
+function ShopBadgeChip({
+  shop,
+  marketplace,
+  active,
+}: {
+  shop: ShopBadge;
+  marketplace: Channel | null;
+  active?: boolean;
+}) {
   return (
-    <span className={chipClassName(Boolean(active))} title={`${shop.products} produk ter-scrape`}>
+    <span
+      className={chipClassName(Boolean(active))}
+      title={`${shop.products} produk ter-scrape`}
+      aria-label={marketplace ? `${MARKETPLACE_LABELS[marketplace]} · ${shop.username}` : shop.username}
+    >
       <ShopBadgeContent shop={shop} />
     </span>
+  );
+}
+
+/**
+ * The switch itself: nothing to show, one static chip, or a chip per shop —
+ * shared between the topbar (`md` and up) and the mobile drawer, which below
+ * `md` is the only place it can be reached at all. `onNavigate` closes the
+ * drawer on a tap, the same treatment every `NavLinks` item gets; the topbar
+ * passes nothing, since there is no drawer over it to close.
+ */
+function ShopSwitcher({
+  shops,
+  channel,
+  pathWithQuery,
+  onNavigate,
+}: {
+  shops: ShopBadge[];
+  channel: Channel | null;
+  pathWithQuery: string;
+  onNavigate?: () => void;
+}) {
+  if (shops.length === 0) {
+    return (
+      <span className="rounded-md border border-dashed border-line px-2 py-1 text-xs text-muted">
+        belum ada toko sendiri
+      </span>
+    );
+  }
+
+  if (shops.length === 1) {
+    return (
+      <ShopBadgeChip shop={shops[0]} marketplace={resolveChannel(shops[0].marketplace, shops)} active />
+    );
+  }
+
+  return (
+    <>
+      {shops.map((shop) => {
+        // `ShopBadge.marketplace` is a bare string (kept decoupled from the
+        // schema types the pages use), so it is resolved once against the same
+        // `shops` list to get back a real `Channel` — reused for both the href
+        // and the accessible name — `channel.ts` itself is untouched.
+        const shopChannel = resolveChannel(shop.marketplace, shops);
+        return (
+          <Link
+            key={shop.id}
+            href={withChannel(pathWithQuery, shopChannel)}
+            aria-current={shop.marketplace === channel ? 'true' : undefined}
+            aria-label={
+              shopChannel ? `${MARKETPLACE_LABELS[shopChannel]} · ${shop.username}` : shop.username
+            }
+            onClick={onNavigate}
+            className={chipClassName(shop.marketplace === channel)}
+            title={`${shop.products} produk ter-scrape`}
+          >
+            <ShopBadgeContent shop={shop} />
+          </Link>
+        );
+      })}
+    </>
   );
 }
 

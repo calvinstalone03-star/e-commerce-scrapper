@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 
-import { CHANNEL_PARAM, channelShop, resolveChannel, withChannel } from '@/lib/channel';
+import { CHANNEL_PARAM, channelFromParams, channelShop, resolveChannel, withChannel } from '@/lib/channel';
 import type { OwnShop } from '@/lib/schemas';
 
 /**
@@ -73,5 +73,16 @@ describe('withChannel', () => {
 
   test('names the parameter the rest of the app names', () => {
     expect(CHANNEL_PARAM).toBe('kanal');
+  });
+});
+
+describe('channelFromParams', () => {
+  test('takes the first value when the query key repeats', () => {
+    expect(channelFromParams({ kanal: ['tokopedia', 'shopee'] }, both)).toBe('tokopedia');
+  });
+
+  test('behaves like resolveChannel on a single value', () => {
+    expect(channelFromParams({ kanal: 'tokopedia' }, both)).toBe('tokopedia');
+    expect(channelFromParams({}, both)).toBe('shopee');
   });
 });
