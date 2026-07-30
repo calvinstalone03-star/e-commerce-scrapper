@@ -2,6 +2,7 @@ import 'server-only';
 
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 
+import type { Channel } from '@/lib/channel';
 import { sql } from '@/lib/db';
 import {
   filterOptionsSchema,
@@ -336,12 +337,20 @@ const rivalMatch = sql`
   )
 `;
 
-/** Our shops and their listings, newest price each. */
-const ourProducts = sql`
+/**
+ * Our listings in one channel, newest price each.
+ *
+ * A factory rather than a constant because "ours" is only half a definition:
+ * the Shopee shop and the Tokopedia shop list the same 1,174 sets, so a query
+ * that joins on `is_own` alone answers for a shop that does not exist. Taking
+ * the channel as an argument means there is no unscoped fragment left for a
+ * later screen to reach for.
+ */
+const ourListings = (channel: Channel) => sql`
   SELECT p.id, p.marketplace, p.name, p.url, p.image, p.set_code,
          l.price, l.scraped_at
   FROM products p
-  JOIN stores s ON s.id = p.shop_ref AND s.is_own
+  JOIN stores s ON s.id = p.shop_ref AND s.is_own AND s.marketplace = ${channel}
   LEFT JOIN latest l ON l.product_ref = p.id
 `;
 
@@ -371,13 +380,13 @@ export async function getOwnShops(): Promise<OwnShop[]> {
 }
 
 export async function getPricePositions(
+  channel: Channel,
   filter: PricePositionFilter,
 ): Promise<{ rows: PricePositionRow[]; total: number; summary: PricePositionSummary }> {
   const offset = (filter.page - 1) * filter.pageSize;
 
   const where = sql`
     WHERE TRUE
-    ${filter.marketplace ? sql`AND b.marketplace = ${filter.marketplace}` : sql``}
     ${
       // One box searches both ways a person identifies a product: the words on
       // it, and the number printed on the corner. A set number typed in full is
@@ -449,7 +458,7 @@ export async function getPricePositions(
   // and trigram indexes be used at all; a CTE is an optimisation fence.
   const rows = await withNameMatching((tx) => tx`
     WITH latest AS (${latestSnapshots}),
-    mine AS MATERIALIZED (${ourProducts}),
+    mine AS MATERIALIZED (${ourListings(channel)}),
     pairs AS MATERIALIZED (
       -- The exact half: same set number, therefore the same box.
       SELECT m.id AS mine_id, m.price AS my_price, l.price, p.marketplace,
@@ -671,13 +680,33 @@ export async function getPricingAnalytics(): Promise<PricingAnalytics> {
   return pricingAnalyticsSchema.parse(row);
 }
 
+/**
+ * Which of our shops a listing belongs to, or null when it is not ours.
+ *
+ * The detail page is reached with a product id, and an id already names a shop.
+ * Looking the channel up rather than taking it from the URL means a shared link
+ * opens on the shop it is actually about.
+ */
+export async function channelOfOwnProduct(productId: number): Promise<Channel | null> {
+  const [row] = await sql`
+    SELECT s.marketplace
+    FROM products p
+    JOIN stores s ON s.id = p.shop_ref AND s.is_own
+    WHERE p.id = ${productId}
+  `;
+  return (row?.marketplace as Channel | undefined) ?? null;
+}
+
 /** One of our products and every rival tied to it, dearest question first. */
 export async function getPricePositionDetail(
   productId: number,
 ): Promise<{ product: PricePositionRow; rivals: RivalRow[] } | null> {
+  const channel = await channelOfOwnProduct(productId);
+  if (!channel) return null;
+
   const [mine] = await sql`
     WITH latest AS (${latestSnapshots}),
-    mine AS (${ourProducts})
+    mine AS (${ourListings(channel)})
     SELECT m.id, m.marketplace, m.name, m.url, m.image,
            m.set_code AS "setCode", m.price, m.scraped_at AS "scrapedAt"
     FROM mine m
@@ -687,7 +716,7 @@ export async function getPricePositionDetail(
 
   const rivals = await withNameMatching((tx) => tx`
     WITH latest AS (${latestSnapshots}),
-    mine AS (SELECT * FROM (${ourProducts}) o WHERE o.id = ${productId}),
+    mine AS (SELECT * FROM (${ourListings(channel)}) o WHERE o.id = ${productId}),
     rivals AS (${theirProducts})
     SELECT r.id, r.marketplace, r.name, r.url, r.image,
            r.set_code AS "setCode",

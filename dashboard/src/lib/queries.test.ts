@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
 
 import { sql } from '@/lib/db';
 import {
+  channelOfOwnProduct,
   getOwnShops,
   getPricePositionDetail,
   getPricePositions,
@@ -106,7 +107,7 @@ describe('price position', () => {
       price: 1_199_000,
     });
 
-    const { rows, total } = await getPricePositions(anyFilter);
+    const { rows, total } = await getPricePositions('shopee', anyFilter);
 
     expect(total).toBe(1);
     expect(rows[0].id).toBe(productId);
@@ -136,7 +137,7 @@ describe('price position', () => {
       price: 900_000,
     });
 
-    const { rows } = await getPricePositions(anyFilter);
+    const { rows } = await getPricePositions('shopee', anyFilter);
     expect(rows[0].rivals).toBe(0);
     expect(rows[0].cheapestPrice).toBeNull();
     expect(rows[0].matchKind).toBeNull();
@@ -153,7 +154,7 @@ describe('price position', () => {
       price: 999_000,
     });
 
-    const { rows } = await getPricePositions(anyFilter);
+    const { rows } = await getPricePositions('shopee', anyFilter);
     expect(rows).toHaveLength(2);
     for (const row of rows) expect(row.rivals).toBe(0);
   });
@@ -170,7 +171,7 @@ describe('price position', () => {
       marketplace: 'tokopedia',
     });
 
-    const { rows } = await getPricePositions(anyFilter);
+    const { rows } = await getPricePositions('shopee', anyFilter);
     expect(rows[0].rivals).toBe(1);
     expect(rows[0].cheapestMarketplace).toBe('tokopedia');
   });
@@ -197,7 +198,7 @@ describe('price position', () => {
       price: 50_000,
     });
 
-    const { rows } = await getPricePositions(anyFilter);
+    const { rows } = await getPricePositions('shopee', anyFilter);
     expect(rows[0].rivals).toBe(1);
     expect(rows[0].matchKind).toBe('name');
     expect(Number(rows[0].cheapestPrice)).toBe(132_000);
@@ -216,13 +217,13 @@ describe('price position', () => {
     // Nobody to compare against at all.
     await addProduct(mine, { name: 'LEGO 11024 Baseplate', setCode: '11024', price: 100_000 });
 
-    const over = await getPricePositions(pricePositionFilterSchema.parse({ stance: 'over' }));
+    const over = await getPricePositions('shopee', pricePositionFilterSchema.parse({ stance: 'over' }));
     expect(over.rows.map((row) => row.setCode)).toEqual(['10696']);
 
-    const under = await getPricePositions(pricePositionFilterSchema.parse({ stance: 'under' }));
+    const under = await getPricePositions('shopee', pricePositionFilterSchema.parse({ stance: 'under' }));
     expect(under.rows.map((row) => row.setCode)).toEqual(['60411']);
 
-    const unmatched = await getPricePositions(pricePositionFilterSchema.parse({ matched: 'none' }));
+    const unmatched = await getPricePositions('shopee', pricePositionFilterSchema.parse({ matched: 'none' }));
     expect(unmatched.rows.map((row) => row.setCode)).toEqual(['11024']);
   });
 
@@ -246,11 +247,11 @@ describe('price position', () => {
     await addProduct(mine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 577_940 });
     await addProduct(rival, { name: 'LEGO 10696 Classic Box', setCode: '10696', price: 449_300 });
 
-    const hidden = await getPricePositions(pricePositionFilterSchema.parse({}));
+    const hidden = await getPricePositions('shopee', pricePositionFilterSchema.parse({}));
     expect(hidden.rows.map((row) => row.setCode)).toEqual(['10696']);
     expect(hidden.total).toBe(1);
 
-    const shown = await getPricePositions(pricePositionFilterSchema.parse({ extreme: 'show' }));
+    const shown = await getPricePositions('shopee', pricePositionFilterSchema.parse({ extreme: 'show' }));
     expect(shown.rows.map((row) => row.setCode).sort()).toEqual(['10696', '71049']);
   });
 
@@ -258,7 +259,7 @@ describe('price position', () => {
     const mine = await addStore('i_bricks', { own: true });
     await addProduct(mine, { name: 'LEGO 11024 Baseplate', setCode: '11024', price: 100_000 });
 
-    const { rows } = await getPricePositions(pricePositionFilterSchema.parse({}));
+    const { rows } = await getPricePositions('shopee', pricePositionFilterSchema.parse({}));
     expect(rows.map((row) => row.setCode)).toEqual(['11024']);
   });
 
@@ -271,17 +272,17 @@ describe('price position', () => {
     });
     await addProduct(mine, { name: 'LEGO City 60411 Fire Rescue', setCode: '60411', price: 164_550 });
 
-    const byName = await getPricePositions(pricePositionFilterSchema.parse({ q: 'john deere' }));
+    const byName = await getPricePositions('shopee', pricePositionFilterSchema.parse({ q: 'john deere' }));
     expect(byName.rows.map((row) => row.setCode)).toEqual(['42218']);
 
-    const byCode = await getPricePositions(pricePositionFilterSchema.parse({ q: '42218' }));
+    const byCode = await getPricePositions('shopee', pricePositionFilterSchema.parse({ q: '42218' }));
     expect(byCode.rows.map((row) => row.setCode)).toEqual(['42218']);
 
     // Half-remembered numbers are the common case: the box is across the room.
-    const byPrefix = await getPricePositions(pricePositionFilterSchema.parse({ q: '604' }));
+    const byPrefix = await getPricePositions('shopee', pricePositionFilterSchema.parse({ q: '604' }));
     expect(byPrefix.rows.map((row) => row.setCode)).toEqual(['60411']);
 
-    const nothing = await getPricePositions(pricePositionFilterSchema.parse({ q: 'zzzz' }));
+    const nothing = await getPricePositions('shopee', pricePositionFilterSchema.parse({ q: 'zzzz' }));
     expect(nothing.rows).toHaveLength(0);
     expect(nothing.total).toBe(0);
     // The headline still describes the catalogue, not the search.
@@ -298,9 +299,9 @@ describe('price position', () => {
       });
     }
 
-    const first = await getPricePositions(pricePositionFilterSchema.parse({ pageSize: 3, page: 1 }));
-    const second = await getPricePositions(pricePositionFilterSchema.parse({ pageSize: 3, page: 2 }));
-    const third = await getPricePositions(pricePositionFilterSchema.parse({ pageSize: 3, page: 3 }));
+    const first = await getPricePositions('shopee', pricePositionFilterSchema.parse({ pageSize: 3, page: 1 }));
+    const second = await getPricePositions('shopee', pricePositionFilterSchema.parse({ pageSize: 3, page: 2 }));
+    const third = await getPricePositions('shopee', pricePositionFilterSchema.parse({ pageSize: 3, page: 3 }));
 
     expect(first.total).toBe(7);
     const seen = [...first.rows, ...second.rows, ...third.rows].map((row) => row.id);
@@ -318,7 +319,7 @@ describe('price position', () => {
     await addProduct(rival, { name: 'LEGO 60411 Fire Heli', setCode: '60411', price: 199_000 });
     await addProduct(mine, { name: 'Bundle tanpa nomor', setCode: null, price: 100_000 });
 
-    const { summary } = await getPricePositions(pricePositionFilterSchema.parse({}));
+    const { summary } = await getPricePositions('shopee', pricePositionFilterSchema.parse({}));
     expect(summary.products).toBe(3);
     expect(summary.matched).toBe(2);
     expect(summary.overpriced).toBe(1);
@@ -366,6 +367,88 @@ describe('price position', () => {
     expect(shops.map((shop) => shop.username)).toEqual(['i_bricks']);
     expect(shops[0].products).toBe(1);
   });
+
+  test('a channel sees only its own listings, never the other shop\'s', async () => {
+    const shopeeMine = await addStore('i_bricks', { own: true, marketplace: 'shopee' });
+    const tokopediaMine = await addStore('i-bricks', { own: true, marketplace: 'tokopedia' });
+    const rival = await addStore('brickstore');
+    await addProduct(shopeeMine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 500_000 });
+    await addProduct(tokopediaMine, {
+      name: 'LEGO 10696 Brick Box',
+      setCode: '10696',
+      price: 520_000,
+      marketplace: 'tokopedia',
+    });
+    await addProduct(rival, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 400_000 });
+
+    const shopee = await getPricePositions('shopee', anyFilter);
+    const tokopedia = await getPricePositions('tokopedia', anyFilter);
+
+    expect(shopee.rows).toHaveLength(1);
+    expect(Number(shopee.rows[0].price)).toBe(500_000);
+    expect(tokopedia.rows).toHaveLength(1);
+    expect(Number(tokopedia.rows[0].price)).toBe(520_000);
+    // The set exists in both our shops; neither screen may report two.
+    expect(shopee.summary.products).toBe(1);
+    expect(tokopedia.summary.products).toBe(1);
+  });
+
+  test('our listing in the other channel is never counted as a rival', async () => {
+    const shopeeMine = await addStore('i_bricks', { own: true, marketplace: 'shopee' });
+    const tokopediaMine = await addStore('i-bricks', { own: true, marketplace: 'tokopedia' });
+    await addProduct(shopeeMine, { name: 'LEGO 21034 London', setCode: '21034', price: 700_000 });
+    await addProduct(tokopediaMine, {
+      name: 'LEGO 21034 London',
+      setCode: '21034',
+      price: 600_000,
+      marketplace: 'tokopedia',
+    });
+
+    const { rows } = await getPricePositions('shopee', anyFilter);
+
+    // Cheaper, same set, but it is us. Our own shelf is not competition.
+    expect(rows[0].rivals).toBe(0);
+    expect(rows[0].cheapestPrice).toBeNull();
+  });
+
+  test('a product knows which of our shops it belongs to', async () => {
+    const tokopediaMine = await addStore('i-bricks', { own: true, marketplace: 'tokopedia' });
+    const rival = await addStore('brickstore');
+    const mine = await addProduct(tokopediaMine, {
+      name: 'LEGO 21034 London',
+      setCode: '21034',
+      price: 700_000,
+      marketplace: 'tokopedia',
+    });
+    const theirs = await addProduct(rival, {
+      name: 'LEGO 21034 London',
+      setCode: '21034',
+      price: 650_000,
+    });
+
+    expect(await channelOfOwnProduct(mine)).toBe('tokopedia');
+    // A rival's product is nobody's channel, and the detail page has to say so
+    // rather than render someone else's shelf as ours.
+    expect(await channelOfOwnProduct(theirs)).toBeNull();
+  });
+
+  test('a cheaper rival on the other marketplace still counts against us', async () => {
+    const mine = await addStore('i_bricks', { own: true, marketplace: 'shopee' });
+    const rival = await addStore('toko-brick-jkt', { marketplace: 'tokopedia' });
+    await addProduct(mine, { name: 'LEGO 42218 John Deere', setCode: '42218', price: 1_245_000 });
+    await addProduct(rival, {
+      name: 'LEGO 42218 John Deere',
+      setCode: '42218',
+      price: 1_089_000,
+      marketplace: 'tokopedia',
+    });
+
+    const { rows } = await getPricePositions('shopee', anyFilter);
+
+    expect(rows[0].rivals).toBe(1);
+    expect(Number(rows[0].cheapestPrice)).toBe(1_089_000);
+    expect(rows[0].cheapestMarketplace).toBe('tokopedia');
+  });
 });
 
 /**
@@ -397,14 +480,14 @@ describe('name matching', () => {
   });
 
   test('composes the shared query fragments, which belong to the outer handle', async () => {
-    // `rivalMatch`, `ourProducts` and `latestSnapshots` are built from `sql`, and
+    // `rivalMatch`, `ourListings` and `latestSnapshots` are built from `sql`, and
     // every wrapped query embeds them while running on a transaction handle.
     const mine = await addStore('i_bricks', { own: true });
     const theirs = await addStore('brickstore');
     await addProduct(mine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 500_000 });
     await addProduct(theirs, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 400_000 });
 
-    const { rows } = await getPricePositions(anyFilter);
+    const { rows } = await getPricePositions('shopee', anyFilter);
     expect(rows).toHaveLength(1);
     expect(Number(rows[0].cheapestPrice)).toBe(400_000);
   });

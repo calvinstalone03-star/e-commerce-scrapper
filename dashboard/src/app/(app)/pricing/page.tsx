@@ -5,9 +5,15 @@ import { EmptyState } from '@/components/EmptyState';
 import { PricingSearch } from '@/components/PricingSearch';
 import { UrlChoice } from '@/components/UrlChoice';
 import { Badge, Card, CardContent, Stat, TBody, TD, TH, THead, TR, Table, cn } from '@/components/ui';
+import { CHANNEL_PARAM, channelShop, resolveChannel, type Channel } from '@/lib/channel';
 import { MARKETPLACE_LABELS, formatDate, formatPrice, formatStoreName } from '@/lib/format';
 import { getOwnShops, getPricePositions } from '@/lib/queries';
-import { pricePositionFilterSchema, toSearchParams, type PricePositionFilter } from '@/lib/schemas';
+import {
+  pricePositionFilterSchema,
+  toSearchParams,
+  type OwnShop,
+  type PricePositionFilter,
+} from '@/lib/schemas';
 
 /**
  * Where our prices sit against everyone else's.
@@ -72,15 +78,21 @@ export default async function PricingPage({
     );
   }
 
+  const channel = resolveChannel(params[CHANNEL_PARAM] as string | undefined, shops);
+  const shop = channelShop(channel, shops);
+
   // One statement answers all three: the page, its total, and the headline
   // counts over the whole catalogue.
-  const { rows, total, summary } = await getPricePositions(filter);
+  //
+  // `channel` is only null when no shop is marked ours, which the early return
+  // above has already handled.
+  const { rows, total, summary } = await getPricePositions(channel!, filter);
 
   const unmatched = summary.products - summary.matched;
 
   return (
     <div className="space-y-6">
-      <PageHeader shops={shops.map((shop) => shop.username)} />
+      <PageHeader shop={shop} channel={channel} />
 
       <Card>
         <CardContent className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
@@ -222,13 +234,20 @@ export default async function PricingPage({
   );
 }
 
-function PageHeader({ shops }: { shops?: string[] }) {
+function PageHeader({
+  shop = null,
+  channel = null,
+}: {
+  shop?: OwnShop | null;
+  channel?: Channel | null;
+}) {
   return (
     <header className="space-y-1">
       <h1 className="text-2xl font-semibold tracking-tight text-foreground">Posisi harga</h1>
       <p className="max-w-2xl text-sm text-muted">
-        Produk kita dibanding produk toko lain dengan nomor set LEGO yang sama, lintas marketplace.
-        {shops && shops.length > 0 ? ` Toko kita: ${shops.join(', ')}.` : null}
+        Produk <span className="font-medium text-foreground">{shop?.username}</span> di{' '}
+        {MARKETPLACE_LABELS[channel!]} dibanding produk toko lain dengan nomor set LEGO yang sama,
+        lintas marketplace.
       </p>
     </header>
   );
@@ -275,25 +294,18 @@ function SearchBox({ filter }: { filter: PricePositionFilter }) {
 /**
  * The filter row.
  *
- * Four dropdowns and a sort, where there used to be four groups of chips. The
+ * Three dropdowns and a sort, where there used to be four groups of chips. The
  * chips were honest about their options and silent about what they did: by the
  * time there were fifteen of them across three rows, they took more height than
  * the table and read as decoration. A labelled control says what it filters
  * while closed, which is most of the time.
+ *
+ * Marketplace used to be a fourth dropdown here; it is gone now that a channel
+ * — not a filter — decides which shop of ours the whole page is about.
  */
 function Filters({ filter }: { filter: PricePositionFilter }) {
   return (
-    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-      <UrlChoice
-        label="Marketplace"
-        param="marketplace"
-        value={filter.marketplace ?? 'all'}
-        options={[
-          { value: 'all', label: 'Semua marketplace' },
-          { value: 'shopee', label: 'Shopee' },
-          { value: 'tokopedia', label: 'Tokopedia' },
-        ]}
-      />
+    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
       <UrlChoice
         label="Posisi"
         param="stance"

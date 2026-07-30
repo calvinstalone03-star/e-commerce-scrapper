@@ -284,7 +284,6 @@ export const pricePositionFilterSchema = z.object({
    */
   extreme: z.enum(['hide', 'show']).default('hide').catch('hide'),
   minRivals: intFromQuery.nonnegative().max(50).optional().catch(undefined),
-  marketplace: marketplaceSchema.optional().catch(undefined),
   sort: z.enum(['gap', 'position', 'rivals', 'price', 'name']).default('gap').catch('gap'),
   dir: sortDirSchema.default('desc').catch('desc'),
   page: intFromQuery.min(1).default(1).catch(1),
