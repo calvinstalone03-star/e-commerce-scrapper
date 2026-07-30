@@ -4,8 +4,10 @@ import { connection } from 'next/server';
 
 import { EmptyState } from '@/components/EmptyState';
 import { OverviewCards } from '@/components/OverviewCards';
+import { OwnShopScorecard } from '@/components/OwnShopScorecard';
 import { ProductImage } from '@/components/ProductImage';
 import { Badge, Card, CardContent, CardHeader, CardTitle } from '@/components/ui';
+import { CHANNEL_PARAM, channelShop, resolveChannel } from '@/lib/channel';
 import {
   MARKETPLACE_LABELS,
   formatDateTime,
@@ -13,7 +15,7 @@ import {
   formatSold,
   formatStoreName,
 } from '@/lib/format';
-import { getOverview, getProducts, getStores } from '@/lib/queries';
+import { getOverview, getOwnShopScorecard, getOwnShops, getProducts, getStores } from '@/lib/queries';
 import {
   productFilterSchema,
   storeFilterSchema,
@@ -238,14 +240,27 @@ function TopStores({ stores }: { stores: StoreRow[] }) {
   );
 }
 
-export default async function OverviewPage() {
+export default async function OverviewPage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
   // Without this the page is prerendered at build time and every total freezes at
   // whatever the database held when `next build` ran. This page's whole job is to
   // answer "what does the database say now".
   await connection();
 
-  const [overview, cheapest, priciest, topStores] = await Promise.all([
+  const params = await searchParams;
+  const shops = await getOwnShops();
+  // `shop` is derived from this same `channel`, not from an independent lookup —
+  // the only way to guarantee the scorecard below is never asked for one shop
+  // while labelled with another's channel.
+  const channel = resolveChannel(params[CHANNEL_PARAM] as string | undefined, shops);
+  const shop = channelShop(channel, shops);
+
+  const [overview, scorecard, cheapest, priciest, topStores] = await Promise.all([
     getOverview(),
+    channel && shop ? getOwnShopScorecard(channel, shop) : null,
     getProducts(productFilterSchema.parse({ sort: 'price', dir: 'asc', pageSize: 5 })),
     getProducts(productFilterSchema.parse({ sort: 'price', dir: 'desc', pageSize: 5 })),
     getStores(storeFilterSchema.parse({ sort: 'products', dir: 'desc', pageSize: 5 })),
@@ -286,7 +301,14 @@ export default async function OverviewPage() {
     <div className="space-y-6">
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight text-foreground">Ringkasan</h1>
+          <h1 className="text-2xl font-semibold tracking-tight text-foreground">
+            Ringkasan
+            {shop ? (
+              <span className="ml-2 text-base font-normal text-muted">
+                {MARKETPLACE_LABELS[shop.marketplace]} · {shop.username}
+              </span>
+            ) : null}
+          </h1>
           <p className="max-w-2xl text-sm text-muted">
             Semua yang sudah terekam dari{' '}
             {overview.marketplaces
@@ -305,7 +327,29 @@ export default async function OverviewPage() {
         </p>
       </header>
 
-      <OverviewCards overview={overview} />
+      {scorecard ? (
+        <OwnShopScorecard scorecard={scorecard} />
+      ) : (
+        <EmptyState
+          title="Belum ada toko yang ditandai sebagai toko kita"
+          description={
+            <>
+              Angka posisi harga di halaman ini relatif terhadap toko sendiri. Tandai sekali lewat
+              terminal — satu perintah per marketplace:
+              <code className="mt-2 block rounded-md border border-line bg-surface-muted px-3 py-2 text-left font-mono text-xs text-foreground">
+                ecom-scraper own-shop shopee i_bricks
+                <br />
+                ecom-scraper own-shop tokopedia i-bricks
+              </code>
+            </>
+          }
+        />
+      )}
+
+      <section className="space-y-3">
+        <h2 className="text-xs font-medium tracking-wide text-muted uppercase">Pasar</h2>
+        <OverviewCards overview={overview} />
+      </section>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <ProductCard
