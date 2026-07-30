@@ -309,6 +309,27 @@ In `dashboard/src/lib/queries.test.ts`, add to the `price position` describe blo
     expect(rows[0].cheapestPrice).toBeNull();
   });
 
+  test('a product knows which of our shops it belongs to', async () => {
+    const tokopediaMine = await addStore('i-bricks', { own: true, marketplace: 'tokopedia' });
+    const rival = await addStore('brickstore');
+    const mine = await addProduct(tokopediaMine, {
+      name: 'LEGO 21034 London',
+      setCode: '21034',
+      price: 700_000,
+      marketplace: 'tokopedia',
+    });
+    const theirs = await addProduct(rival, {
+      name: 'LEGO 21034 London',
+      setCode: '21034',
+      price: 650_000,
+    });
+
+    expect(await channelOfOwnProduct(mine)).toBe('tokopedia');
+    // A rival's product is nobody's channel, and the detail page has to say so
+    // rather than render someone else's shelf as ours.
+    expect(await channelOfOwnProduct(theirs)).toBeNull();
+  });
+
   test('a cheaper rival on the other marketplace still counts against us', async () => {
     const mine = await addStore('i_bricks', { own: true, marketplace: 'shopee' });
     const rival = await addStore('toko-brick-jkt', { marketplace: 'tokopedia' });
@@ -1162,43 +1183,10 @@ git commit -m "Switch shops from the topbar, and keep the choice while navigatin
 - Modify: `dashboard/src/lib/queries.test.ts`
 
 **Interfaces:**
-- Consumes: `channelOfOwnProduct` and `getPricePositionDetail` from Task 2.
+- Consumes: `channelOfOwnProduct` and `getPricePositionDetail` from Task 2 — both already covered by tests written there. This task is page wiring, so it has no new unit test; its verification is Step 3.
 - Produces: nothing new.
 
-- [ ] **Step 1: Write the failing test**
-
-In `dashboard/src/lib/queries.test.ts`, inside the `price position` describe block:
-
-```ts
-  test('a product knows which of our shops it belongs to', async () => {
-    const tokopediaMine = await addStore('i-bricks', { own: true, marketplace: 'tokopedia' });
-    const rival = await addStore('brickstore');
-    const mine = await addProduct(tokopediaMine, {
-      name: 'LEGO 21034 London',
-      setCode: '21034',
-      price: 700_000,
-      marketplace: 'tokopedia',
-    });
-    const theirs = await addProduct(rival, {
-      name: 'LEGO 21034 London',
-      setCode: '21034',
-      price: 650_000,
-    });
-
-    expect(await channelOfOwnProduct(mine)).toBe('tokopedia');
-    // A rival's product is nobody's channel.
-    expect(await channelOfOwnProduct(theirs)).toBeNull();
-  });
-```
-
-Add `channelOfOwnProduct` to the import list from `@/lib/queries`.
-
-- [ ] **Step 2: Run it and watch it fail**
-
-Run: `cd dashboard && npx vitest run src/lib/queries.test.ts -t "which of our shops"`
-Expected: FAIL if Task 2 was skipped; PASS immediately if Task 2 already added the function — in that case keep the test (it pins behaviour the detail page now depends on) and move to Step 3.
-
-- [ ] **Step 3: Make the detail page channel-aware**
+- [ ] **Step 1: Make the detail page channel-aware**
 
 In `dashboard/src/app/(app)/pricing/[id]/page.tsx`, links back to the worklist and the shell's chips should agree with the product being shown. Resolve the product's channel and redirect once when the URL disagrees:
 
@@ -1227,16 +1215,23 @@ If this page does not currently accept `searchParams`, add the prop with the sam
 
 Every "back to the worklist" link on the page becomes `withChannel('/pricing', channel)`.
 
-- [ ] **Step 4: Run the suite, typecheck, lint**
+- [ ] **Step 2: Run the suite, typecheck, lint**
 
 Run: `cd dashboard && npx vitest run && npm run build && npm run lint`
 Expected: all green.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 3: Verify in the browser**
+
+Run `npm run dev`, open a Tokopedia product's detail from `/pricing?kanal=tokopedia`,
+then edit the URL to `?kanal=shopee` on that same product.
+Expected: the URL is corrected back to `?kanal=tokopedia`, the heading names the
+Tokopedia shop, and the topbar chip stays on Tokopedia.
+
+- [ ] **Step 4: Commit**
 
 ```bash
 cd /Users/calvin/ecom-scraper
-git add "dashboard/src/app/(app)/pricing/[id]/page.tsx" dashboard/src/lib/queries.test.ts
+git add "dashboard/src/app/(app)/pricing/[id]/page.tsx"
 git commit -m "Open a product's detail on the shop that lists it"
 ```
 
