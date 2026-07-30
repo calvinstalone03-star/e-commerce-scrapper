@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useSearchParams } from 'next/navigation';
 import { useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 
 import {
@@ -11,6 +11,7 @@ import {
   writeRail,
 } from '@/components/shell/rail-store';
 import { cn } from '@/components/ui/cn';
+import { CHANNEL_PARAM, resolveChannel, withChannel, type Channel } from '@/lib/channel';
 
 /**
  * The frame every signed-in page sits in: a rail that collapses, a topbar that
@@ -51,6 +52,11 @@ export function AppShell({
   children: ReactNode;
 }) {
   const pathname = usePathname();
+  // A layout cannot read search params, so the shell — already a client
+  // component for the rail and the drawer — reads `kanal` itself and resolves
+  // it against the same `shops` the layout already fetched.
+  const searchParams = useSearchParams();
+  const channel = resolveChannel(searchParams.get(CHANNEL_PARAM), shops);
   const collapsed = useSyncExternalStore(subscribeRail, readRail, readRailOnServer);
   const [drawer, setDrawer] = useState(false);
 
@@ -60,6 +66,8 @@ export function AppShell({
     <div className="flex min-h-screen flex-col">
       <Topbar
         shops={shops}
+        pathname={pathname}
+        channel={channel}
         username={username}
         warnDefaultPassword={warnDefaultPassword}
         signOutAction={signOutAction}
@@ -76,7 +84,7 @@ export function AppShell({
           )}
         >
           <nav aria-label="Navigasi utama">
-            <NavLinks pathname={pathname} collapsed={collapsed} />
+            <NavLinks pathname={pathname} collapsed={collapsed} channel={channel} />
           </nav>
         </aside>
 
@@ -99,6 +107,7 @@ export function AppShell({
               <NavLinks
                 pathname={pathname}
                 collapsed={false}
+                channel={channel}
                 onNavigate={() => setDrawer(false)}
               />
             </nav>
@@ -118,6 +127,8 @@ export function AppShell({
 
 function Topbar({
   shops,
+  pathname,
+  channel,
   username,
   warnDefaultPassword,
   signOutAction,
@@ -126,6 +137,8 @@ function Topbar({
   collapsed,
 }: {
   shops: ShopBadge[];
+  pathname: string;
+  channel: Channel | null;
   username: string;
   warnDefaultPassword: boolean;
   signOutAction: () => Promise<void>;
@@ -138,7 +151,7 @@ function Topbar({
       {/* Name first, then the control. The brand is what the eye lands on and it
           belongs at the corner; the toggle belongs beside the column it opens
           and closes, which is the one to its right. */}
-      <Link href="/" className="flex min-w-0 items-center gap-2">
+      <Link href={withChannel('/', channel)} className="flex min-w-0 items-center gap-2">
         <span
           aria-hidden
           className="flex size-7 shrink-0 items-center justify-center rounded-md bg-accent/12 text-accent"
@@ -170,18 +183,33 @@ function Topbar({
         <BurgerIcon />
       </button>
 
-      {/* Which shops every number on every page is relative to. Without this the
-          dashboard says "kita" everywhere and never says who that is. */}
+      {/* Which shop every number on every page is about, and the switch that
+          changes it. Without this the dashboard says "kita" everywhere and
+          never says who that is, or lets you ask the same question of the
+          other shop. */}
       <div className="ml-2 hidden min-w-0 items-center gap-1.5 md:flex">
         {shops.length === 0 ? (
           <span className="rounded-md border border-dashed border-line px-2 py-1 text-xs text-muted">
             belum ada toko sendiri
           </span>
+        ) : shops.length === 1 ? (
+          <ShopBadgeChip shop={shops[0]} active />
         ) : (
           shops.map((shop) => (
-            <span
+            <Link
               key={shop.id}
-              className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-muted px-2 py-1 text-xs whitespace-nowrap text-muted"
+              // `ShopBadge.marketplace` is a bare string (kept decoupled from the
+              // schema types the pages use), so it is resolved against the same
+              // `shops` list to get back a real `Channel` for `withChannel` —
+              // `channel.ts` itself is untouched.
+              href={withChannel(pathname, resolveChannel(shop.marketplace, shops))}
+              aria-current={shop.marketplace === channel ? 'true' : undefined}
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs whitespace-nowrap transition-colors',
+                shop.marketplace === channel
+                  ? 'border-accent/40 bg-accent/10 text-foreground'
+                  : 'border-line bg-surface-muted text-muted hover:text-foreground',
+              )}
               title={`${shop.products} produk ter-scrape`}
             >
               <span
@@ -191,9 +219,9 @@ function Topbar({
                   shop.marketplace === 'shopee' ? 'bg-shopee' : 'bg-tokopedia',
                 )}
               />
-              <span className="font-medium text-foreground">{shop.username}</span>
+              <span className="font-medium">{shop.username}</span>
               <span className="tabular-nums">{shop.products.toLocaleString('id-ID')}</span>
-            </span>
+            </Link>
           ))
         )}
       </div>
@@ -211,6 +239,36 @@ function Topbar({
         <SignOutButton signOutAction={signOutAction} />
       </div>
     </header>
+  );
+}
+
+/**
+ * The one-shop case: nothing to switch to, so a static chip rather than a
+ * `Link` that would only ever point at the page already on screen. Its markup
+ * mirrors the lit state of the two-shop switcher above so neither rendering
+ * can drift from the other.
+ */
+function ShopBadgeChip({ shop, active }: { shop: ShopBadge; active?: boolean }) {
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs whitespace-nowrap',
+        active
+          ? 'border-accent/40 bg-accent/10 text-foreground'
+          : 'border-line bg-surface-muted text-muted',
+      )}
+      title={`${shop.products} produk ter-scrape`}
+    >
+      <span
+        aria-hidden
+        className={cn(
+          'size-1.5 rounded-full',
+          shop.marketplace === 'shopee' ? 'bg-shopee' : 'bg-tokopedia',
+        )}
+      />
+      <span className="font-medium text-foreground">{shop.username}</span>
+      <span className="tabular-nums">{shop.products.toLocaleString('id-ID')}</span>
+    </span>
   );
 }
 
@@ -283,10 +341,12 @@ function SignOutButton({ signOutAction }: { signOutAction: () => Promise<void> }
 function NavLinks({
   pathname,
   collapsed,
+  channel,
   onNavigate,
 }: {
   pathname: string;
   collapsed: boolean;
+  channel: Channel | null;
   onNavigate?: () => void;
 }) {
   return (
@@ -296,7 +356,7 @@ function NavLinks({
         return (
           <li key={item.href}>
             <Link
-              href={item.href}
+              href={withChannel(item.href, channel)}
               onClick={onNavigate}
               aria-current={active ? 'page' : undefined}
               title={collapsed ? item.label : undefined}
