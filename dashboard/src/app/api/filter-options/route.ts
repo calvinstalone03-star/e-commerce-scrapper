@@ -1,3 +1,4 @@
+import { withSession } from '@/lib/api-session';
 import { getFilterOptions } from '@/lib/queries';
 
 /**
@@ -12,7 +13,8 @@ export const dynamic = 'force-dynamic';
 
 const CACHE_CONTROL = 'private, max-age=30, stale-while-revalidate=300';
 
-export async function GET() {
+/** Behind the login — see `lib/api-session.ts`. */
+export const GET = withSession(async () => {
   try {
     const options = await getFilterOptions();
 
@@ -29,4 +31,4 @@ export async function GET() {
       { status: 503 },
     );
   }
-}
+});

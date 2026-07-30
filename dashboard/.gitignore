@@ -32,6 +32,9 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# The template is the documentation for what a deployment has to set, so it
+# belongs in the repo — it holds names and comments, never values.
+!.env.example
 
 # vercel
 .vercel

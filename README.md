@@ -509,46 +509,93 @@ Only the last leg moves. The ingest server keeps running locally and writes to
 whichever database `DATABASE_URL` names, so pointing it at Neon is what puts
 scraped data somewhere Vercel can read.
 
-**1. A database.** Create a Neon project, then take its **pooled** connection
-string — the one with `-pooler` in the host. A serverless deployment is many
-short-lived instances, and the direct endpoint gives each one its own
-connection.
+**1. A database.** Create a Neon project and take **both** connection strings —
+they differ by `-pooler` in the host. The dashboard gets the pooled one: a
+serverless deployment is many short-lived instances, and the direct endpoint
+gives each one its own connection. Schema work and bulk loading get the direct
+one, because a pooler in transaction mode is the wrong place for either.
 
-**2. The schema and the data.**
+The dashboard is built for that pooled endpoint specifically: it sends no
+connection-level startup parameters, since Neon's pooler refuses the whole
+connection over one — `unsupported startup parameter in options`. The trigram
+threshold the price matching needs is set per transaction instead
+(`withNameMatching` in `dashboard/src/lib/queries.ts`).
+
+**2. The schema and the data.** Both against the **direct** endpoint.
 
 ```bash
-export NEON_URL='postgresql://…-pooler….neon.tech/…?sslmode=require'
+export NEON_DIRECT='postgresql://…@ep-….neon.tech/…?sslmode=require'
+LOCAL=postgresql://calvin@127.0.0.1:5432/ecom_scraper
 
 # Schema first: the same migrations, applied to the new database.
-DATABASE_URL="$NEON_URL" ecom-scraper initdb
+DATABASE_URL="$NEON_DIRECT" ecom-scraper initdb
 
-# Then the rows, if you want the history rather than a fresh start.
-pg_dump --data-only --no-owner postgresql://calvin@127.0.0.1:5432/ecom_scraper \
-  | psql "$NEON_URL"
+# Then the rows, if you want the history rather than a fresh start. One table at
+# a time, in this order: a single --data-only dump does not guarantee parents
+# before children, and `products` without its `stores` is a foreign key error.
+# `app_credentials` is deliberately absent — let the deployment seed its own
+# login from DASHBOARD_PASSWORD rather than inheriting the laptop's.
+for t in stores products price_snapshots product_keywords scrape_runs; do
+  pg_dump --data-only --no-owner --no-privileges -t "public.$t" "$LOCAL" \
+    | psql -v ON_ERROR_STOP=1 "$NEON_DIRECT"
+done
+
+# Fresh rows, no statistics: without this the planner guesses and the price
+# screens pay for it.
+psql "$NEON_DIRECT" -c 'ANALYZE'
 ```
 
 **3. The dashboard.** Point Vercel at this repo with **Root Directory =
-`dashboard`**, and set one environment variable:
+`dashboard`**, and set two environment variables:
 
 ```bash
-vercel env add DATABASE_URL production   # paste the pooled Neon URL
+vercel env add DATABASE_URL production        # paste the pooled Neon URL
+vercel env add DASHBOARD_PASSWORD production  # anything but the default below
 vercel --prod
 ```
 
-**4. Change the password before you tell anyone the URL.** A deployment is on
-the public internet, and the login seeds itself with `admin` / `ecom123` on
-first run. The dashboard says so in the topbar until you change it, on
-`/settings`.
+`DATABASE_URL` is required rather than optional: deployed, the dashboard refuses
+to start without it instead of falling back to a localhost Postgres that is not
+there — a fallback whose error message sends you debugging the wrong machine.
+
+**4. `DASHBOARD_PASSWORD` is what keeps the URL private.** The login seeds
+itself on first run, and without that variable it seeds the default printed
+below — which is in this README, on the public internet, next to your
+deployment. Setting it means the dashboard is never briefly open. Optionally set
+`DASHBOARD_USERNAME` too; both are read only when the credential row does not
+exist yet, so changing the password later on `/settings` is not undone by the
+next cold start.
+
+| | |
+|---|---|
+| Default login | `admin` / `ecom123` |
+| Changed at | `/settings` |
+| Warned about | topbar and `/settings`, until it is no longer the default |
+
+Everything the dashboard serves is behind that login — the pages by the route
+group they sit in, and the JSON routes (`/api/products`, `/api/stores`,
+`/api/filter-options`, `/api/products/<id>/history`) by an explicit guard, since
+no layout runs for those. Unauthenticated, each answers `401`.
 
 **5. Keep scraping into the same database.** Set `DATABASE_URL` to the Neon URL
 in the repo root `.env` and restart the ingest server, or the extension will go
 on filling the local database while the dashboard reads the hosted one and
 reports that nothing has changed since the day you deployed.
 
-What this costs: every page read crosses the network instead of a socket, so the
-price screens go from ~0.4s to whatever your latency to the Neon region is. If
-that matters more than remote access, run the dashboard locally — it is the same
-code, and `scripts/dashboard-server.sh` already does it.
+What this costs, measured against `ap-southeast-1` with 12.4k listings and 32
+shops in the database:
+
+| Screen | Local socket | Neon pooled |
+|---|---|---|
+| Ringkasan, Produk, Toko, Pengaturan | ~0.05s | 0.12 – 0.17s |
+| Posisi harga, Analitik | ~0.4s | 2.9 – 3.3s |
+
+The two slow ones are the trigram pairing, and they are slow because that work is
+paid on a compute smaller than the laptop's — not because of the round trip. The
+same pairing takes 12s at the threshold this app sets and 40s at pg_trgm's
+default, which is what the per-transaction `SET LOCAL` is for. If those three
+seconds matter more than remote access, run the dashboard locally — it is the
+same code, and `scripts/dashboard-server.sh` already does it.
 
 ## Exit codes
 

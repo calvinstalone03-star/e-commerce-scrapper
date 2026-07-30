@@ -81,6 +81,19 @@ export function storeSearchParams(filter: StoreFilter): URLSearchParams {
   return toSearchParams(withoutDefaults(filter, STORE_FILTER_DEFAULTS));
 }
 
+/**
+ * What a failed status means to whoever is looking at the screen.
+ *
+ * 401 is not a bug: the routes are behind the login, so a tab left open past
+ * the session's week gets one. "Permintaan gagal (HTTP 401)" would send the
+ * reader hunting for a broken request; the session is what actually needs
+ * attention, and reloading fixes it.
+ */
+export function apiErrorMessage(status: number): string {
+  if (status === 401) return 'Sesi berakhir. Muat ulang halaman untuk masuk lagi.';
+  return `Permintaan gagal (HTTP ${status})`;
+}
+
 async function getJson<Schema extends z.ZodType>(
   url: string,
   schema: Schema,
@@ -89,7 +102,7 @@ async function getJson<Schema extends z.ZodType>(
   const response = await fetch(url, { signal, headers: { Accept: 'application/json' } });
 
   if (!response.ok) {
-    throw new ApiError(`Permintaan gagal (HTTP ${response.status})`, response.status, url);
+    throw new ApiError(apiErrorMessage(response.status), response.status, url);
   }
 
   let payload: unknown;

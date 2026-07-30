@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import { sql } from '@/lib/db';
 
@@ -79,6 +79,51 @@ describe('credentials', () => {
     expect(await auth.verifyPassword('admin', auth.DEFAULT_CREDENTIALS.password.toUpperCase())).toBe(
       false,
     );
+  });
+});
+
+describe('seeding from the environment', () => {
+  /**
+   * A deployment is on the public internet from the moment it answers, and the
+   * published default in this file is in the README. `DASHBOARD_PASSWORD` closes
+   * the window between the first request and someone reaching /settings.
+   */
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  test('seeds the username and password the deployment was given', async () => {
+    vi.stubEnv('DASHBOARD_USERNAME', 'calvin');
+    vi.stubEnv('DASHBOARD_PASSWORD', 'rahasia-deploy');
+
+    expect(await auth.verifyPassword('calvin', 'rahasia-deploy')).toBe(true);
+    expect(
+      await auth.verifyPassword(auth.DEFAULT_CREDENTIALS.username, auth.DEFAULT_CREDENTIALS.password),
+    ).toBe(false);
+  });
+
+  test('a password from the environment is not the default, so nothing nags', async () => {
+    vi.stubEnv('DASHBOARD_PASSWORD', 'rahasia-deploy');
+    await auth.currentUsername(); // force the seed
+    expect(await auth.usingDefaultPassword()).toBe(false);
+  });
+
+  test('a username alone still seeds the published default password', async () => {
+    vi.stubEnv('DASHBOARD_USERNAME', 'calvin');
+    expect(await auth.verifyPassword('calvin', auth.DEFAULT_CREDENTIALS.password)).toBe(true);
+    expect(await auth.usingDefaultPassword()).toBe(true);
+  });
+
+  test('never overwrites credentials that were already changed', async () => {
+    await auth.updateCredentials({
+      currentPassword: auth.DEFAULT_CREDENTIALS.password,
+      newPassword: 'dari-ui-123',
+    });
+
+    vi.stubEnv('DASHBOARD_PASSWORD', 'dari-env-123');
+
+    expect(await auth.verifyPassword('admin', 'dari-ui-123')).toBe(true);
+    expect(await auth.verifyPassword('admin', 'dari-env-123')).toBe(false);
   });
 });
 

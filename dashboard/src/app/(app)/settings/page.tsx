@@ -21,6 +21,9 @@ export const metadata: Metadata = {
   description: 'Username, password, dan toko yang dianggap milik sendiri.',
 };
 
+/** Set by Vercel on every deployment, and by nothing on a laptop. */
+const isDeployed = Boolean(process.env.VERCEL);
+
 export default async function SettingsPage() {
   const [shops, username, defaultPassword] = await Promise.all([
     getOwnShops(),
@@ -37,8 +40,23 @@ export default async function SettingsPage() {
 
       {defaultPassword ? (
         <p className="rounded-md border border-negative/40 bg-negative/10 px-3 py-2.5 text-sm leading-relaxed text-negative">
-          Password masih bawaan. Dashboard ini hanya mendengarkan di 127.0.0.1, jadi tidak terbuka
-          dari jaringan — tapi siapa pun yang memakai laptop ini bisa membukanya. Ganti di bawah.
+          {/* Two different problems wearing the same warning. On the laptop the
+              server binds 127.0.0.1 and the risk is whoever else uses it; on a
+              deployment the risk is everyone, and the password is the one in the
+              README. Saying "tidak terbuka dari jaringan" there would be a lie. */}
+          {isDeployed ? (
+            <>
+              Password masih bawaan, dan dashboard ini terbuka dari internet. Kredensialnya ada di
+              README, jadi siapa pun yang tahu URL-nya bisa masuk. Ganti sekarang, sebelum yang
+              lain.
+            </>
+          ) : (
+            <>
+              Password masih bawaan. Dashboard ini hanya mendengarkan di 127.0.0.1, jadi tidak
+              terbuka dari jaringan — tapi siapa pun yang memakai laptop ini bisa membukanya. Ganti
+              di bawah.
+            </>
+          )}
         </p>
       ) : null}
 

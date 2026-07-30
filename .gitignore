@@ -22,3 +22,7 @@ logs/
 
 # Dashboard login credentials (hashed, plus the session signing key)
 .dashboard-auth.json
+
+# Stray npm/vitest caches: running a dashboard command from the repo root
+# creates one here, and `git add -A` will stage it.
+node_modules/
