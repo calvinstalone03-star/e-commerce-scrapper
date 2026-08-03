@@ -281,8 +281,13 @@ const NAME_MATCH_THRESHOLD = 0.45;
  * A price ratio past which the pairing is a packaging difference, not a
  * position: 1.0 means "double, or half". Expressed as a ratio rather than a
  * percentage because that is what the SQL compares.
+ *
+ * Exported so `lib/notify/positions.ts` imports this exact constant rather
+ * than copying the literal. Two thresholds with one name is how the
+ * dashboard and the notifier would come to silently disagree about which
+ * comparisons are trustworthy.
  */
-const EXTREME_GAP = 1.0;
+export const EXTREME_GAP = 1.0;
 
 /**
  * Our products beside their rivals'.

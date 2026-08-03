@@ -1,0 +1,213 @@
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
+
+import { sql } from '@/lib/db';
+import { ownSetPositions } from '@/lib/notify/positions';
+import { EXTREME_GAP } from '@/lib/queries';
+
+/**
+ * Where we stand on a set, against a real database.
+ *
+ * The load-bearing case is `8827`, modelled directly on the spec's example: a
+ * `set_code` shared by a sealed box of sixty and a single loose minifigure.
+ * `extreme` is what stops that pairing from producing a confidently wrong
+ * position line.
+ */
+
+const MIGRATIONS = join(process.cwd(), '..', 'migrations');
+const HOUR = 3600 * 1000;
+const BASE = new Date('2026-08-01T00:00:00Z');
+
+beforeAll(async () => {
+  for (const file of readdirSync(MIGRATIONS)
+    .filter((name) => name.endsWith('.sql'))
+    .sort()) {
+    await sql.unsafe(readFileSync(join(MIGRATIONS, file), 'utf8'));
+  }
+});
+
+afterAll(async () => {
+  await sql.end();
+});
+
+beforeEach(async () => {
+  await sql`TRUNCATE price_snapshots, product_keywords, products, stores RESTART IDENTITY CASCADE`;
+});
+
+async function addStore(id: number, username: string, isOwn = false): Promise<void> {
+  await sql`
+    INSERT INTO stores (id, marketplace, shop_id, username, is_own, first_seen, last_seen)
+    VALUES (${id}, 'shopee', ${id * 1000}, ${username}, ${isOwn}, ${BASE}, ${BASE})`;
+}
+
+async function addProduct(id: number, storeId: number | null, setCode: string | null): Promise<void> {
+  await sql`
+    INSERT INTO products (id, marketplace, item_id, shop_ref, name, set_code, url, first_seen, last_seen)
+    VALUES (${id}, 'shopee', ${id * 100}, ${storeId}, ${'Test product ' + id}, ${setCode},
+            ${'https://shopee.co.id/p/' + id}, ${BASE}, ${BASE})`;
+}
+
+async function addSnapshot(productId: number, price: number, hoursAfterBase = 0): Promise<void> {
+  await sql`
+    INSERT INTO price_snapshots (product_ref, price, sold, scraped_at)
+    VALUES (${productId}, ${price}, 100, ${new Date(BASE.getTime() + hoursAfterBase * HOUR)})`;
+}
+
+describe('ownSetPositions', () => {
+  test('picks the cheapest of two own shops, and only the latest price of each', async () => {
+    await addStore(1, 'i_bricks_shopee', true);
+    await addStore(2, 'i_bricks_toko', true);
+    await addStore(3, 'rival-a', false);
+    await addStore(4, 'rival-b', false);
+
+    await addProduct(1, 1, '42218');
+    await addSnapshot(1, 200000, 0); // superseded — must not win
+    await addSnapshot(1, 180000, 5);
+
+    await addProduct(2, 2, '42218');
+    await addSnapshot(2, 190000, 0);
+
+    await addProduct(3, 3, '42218');
+    await addSnapshot(3, 150000, 0);
+
+    await addProduct(4, 4, '42218');
+    await addSnapshot(4, 160000, 0);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('42218')).toEqual({
+      setCode: '42218',
+      ourPrice: '180000',
+      ourShop: 'i_bricks_shopee',
+      cheapestRival: '150000',
+      rivalCount: 2,
+      extreme: false,
+    });
+  });
+
+  test('a set with one own shop', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'rival-c', false);
+    await addProduct(1, 1, '60411');
+    await addSnapshot(1, 100000);
+    await addProduct(2, 2, '60411');
+    await addSnapshot(2, 120000);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('60411')).toEqual({
+      setCode: '60411',
+      ourPrice: '100000',
+      ourShop: 'i_bricks',
+      cheapestRival: '120000',
+      rivalCount: 1,
+      extreme: false,
+    });
+  });
+
+  test('a set our shops carry with no rivals', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addProduct(1, 1, '71811');
+    await addSnapshot(1, 250000);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('71811')).toEqual({
+      setCode: '71811',
+      ourPrice: '250000',
+      ourShop: 'i_bricks',
+      cheapestRival: null,
+      rivalCount: 0,
+      extreme: false,
+    });
+  });
+
+  test('a set where we have no priced listing', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'rival-d', false);
+    await addProduct(1, 1, '75192'); // never scraped a price
+    await addProduct(2, 2, '75192');
+    await addSnapshot(2, 50000);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('75192')).toEqual({
+      setCode: '75192',
+      ourPrice: null,
+      ourShop: null,
+      cheapestRival: '50000',
+      rivalCount: 1,
+      extreme: false,
+    });
+  });
+
+  test('flags the extreme gap modelled on set 8827', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'cupliss', false);
+    await addProduct(1, 1, '8827'); // sealed box of sixty
+    await addSnapshot(1, 8_500_000);
+    await addProduct(2, 2, '8827'); // one loose minifigure
+    await addSnapshot(2, 397_000);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('8827')).toEqual({
+      setCode: '8827',
+      ourPrice: '8500000',
+      ourShop: 'i_bricks',
+      cheapestRival: '397000',
+      rivalCount: 1,
+      extreme: true,
+    });
+  });
+
+  test('does not flag a gap just under the threshold', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'rival-e', false);
+    const rivalPrice = 100_000;
+    // Derived from EXTREME_GAP, not a literal 1.0, so this stays "just under"
+    // if the dashboard's threshold ever moves.
+    const ourPrice = Math.round(rivalPrice * (1 + EXTREME_GAP)) - 1000;
+    await addProduct(1, 1, '10312');
+    await addSnapshot(1, ourPrice);
+    await addProduct(2, 2, '10312');
+    await addSnapshot(2, rivalPrice);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('10312')).toMatchObject({ extreme: false });
+  });
+
+  test('flags a gap exactly at the threshold, not only past it', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'rival-f', false);
+    const rivalPrice = 100_000;
+    const ourPrice = Math.round(rivalPrice * (1 + EXTREME_GAP));
+    await addProduct(1, 1, '10311');
+    await addSnapshot(1, ourPrice);
+    await addProduct(2, 2, '10311');
+    await addSnapshot(2, rivalPrice);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('10311')).toMatchObject({ extreme: true });
+  });
+
+  test('never includes a set no own shop carries', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'rival-g', false);
+    await addProduct(1, 1, '42218');
+    await addSnapshot(1, 100000);
+    // A rival-only set: no own shop lists it, so it must not appear.
+    await addProduct(2, 2, '99999');
+    await addSnapshot(2, 50000);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.has('42218')).toBe(true);
+    expect(positions.has('99999')).toBe(false);
+    expect(positions.size).toBe(1);
+  });
+});
