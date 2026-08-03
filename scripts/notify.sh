@@ -35,9 +35,14 @@ if [ -z "${NOTIFY_URL:-}" ] || [ -z "${NOTIFY_SECRET:-}" ]; then
     exit 2
 fi
 
-# --fail so a 401 or 503 is a non-zero exit rather than a body printed as if it
-# were success. No -v, ever: the Authorization header is on this request.
-curl -fsS -X POST \
+# --fail-with-body, not --fail: both make a 401 or 503 a non-zero exit rather
+# than a body printed as if it were success, but --fail throws the body away on
+# the way out. That body is the whole diagnostic — the route answers a failed
+# run with `detail`, carrying Postgres's or Telegram's own words — and without
+# it the operator's log reads `curl: (22) ... 503` and nothing else.
+#
+# No -v, ever: the Authorization header is on this request.
+curl -sS --fail-with-body -X POST \
      -H "Authorization: Bearer ${NOTIFY_SECRET}" \
      -H 'content-type: application/json' \
      "${NOTIFY_URL%/}/api/notify"
