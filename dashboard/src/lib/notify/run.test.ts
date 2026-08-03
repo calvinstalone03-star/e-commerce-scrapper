@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from 'vit
 
 import { sql } from '@/lib/db';
 import { resolveSettings, runNotify, secretMatches } from '@/lib/notify/run';
+import { readCeilings } from '@/lib/notify/watermark';
 
 /**
  * The run, end to end against a real database with a fake Telegram.
@@ -71,6 +72,28 @@ async function seedPriceChange(): Promise<void> {
     VALUES (1, 211850, ${new Date(BASE.getTime() + 24 * HOUR)})`;
   // The store is already known, so this run is about the price, not the shop.
   await sql`UPDATE notify_watermark SET last_store_id = 1, last_product_id = 1 WHERE id = 1`;
+}
+
+/**
+ * The watermark row, read fresh rather than assumed — the quiet and stale
+ * branches are told apart only by whether this changes across a call.
+ */
+async function readWatermarkRow(): Promise<{
+  lastSnapshotId: string;
+  lastProductId: number;
+  lastStoreId: number;
+  lastStaleWarningAt: Date | null;
+}> {
+  const [row] = await sql`
+    SELECT last_snapshot_id, last_product_id, last_store_id, last_stale_warning_at
+      FROM notify_watermark
+     WHERE id = 1`;
+  return {
+    lastSnapshotId: String(row.last_snapshot_id),
+    lastProductId: row.last_product_id,
+    lastStoreId: row.last_store_id,
+    lastStaleWarningAt: row.last_stale_warning_at,
+  };
 }
 
 describe('resolveSettings', () => {
@@ -159,13 +182,30 @@ describe('runNotify', () => {
       INSERT INTO products (id, marketplace, item_id, shop_ref, name, first_seen, last_seen)
       VALUES (1, 'shopee', 222, 1, 'LEGO', ${NOW}, ${NOW})`;
     await sql`INSERT INTO price_snapshots (product_ref, price, scraped_at) VALUES (1, 1000, ${NOW})`;
-    await sql`UPDATE notify_watermark SET last_store_id = 1, last_product_id = 1, last_snapshot_id = 1 WHERE id = 1`;
+    // Store and product watermark cover what was just seeded, so neither
+    // becomes a "new" event. The snapshot watermark is deliberately left
+    // behind the ceiling (id 1) instead of pinned to it: a single snapshot has
+    // no older predecessor to compare against, so it still produces no
+    // price-change event, but "advanced to the ceiling" and "never advanced"
+    // stay distinguishable below — pinning to the ceiling would erase that.
+    await sql`UPDATE notify_watermark SET last_store_id = 1, last_product_id = 1 WHERE id = 1`;
+
+    const ceilings = await readCeilings(sql);
+    const before = await readWatermarkRow();
+    expect(before.lastSnapshotId).not.toBe(ceilings.snapshotId);
 
     const fetchImpl = okFetch();
     const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl });
 
     expect(outcome.sent).toBe(0);
     expect(fetchImpl).not.toHaveBeenCalled();
+
+    // Quiet, not stale: the watermark still advances to the ceiling, so the
+    // rows just examined are not re-examined next run.
+    const after = await readWatermarkRow();
+    expect(after.lastSnapshotId).toBe(ceilings.snapshotId);
+    expect(after.lastProductId).toBe(ceilings.productId);
+    expect(after.lastStoreId).toBe(ceilings.storeId);
   });
 
   test('leaves the watermark alone when Telegram refuses', async () => {
@@ -199,7 +239,12 @@ describe('runNotify', () => {
       INSERT INTO products (id, marketplace, item_id, shop_ref, name, first_seen, last_seen)
       VALUES (1, 'shopee', 222, 1, 'LEGO', ${BASE}, ${BASE})`;
     await sql`INSERT INTO price_snapshots (product_ref, price, scraped_at) VALUES (1, 1000, ${BASE})`;
-    await sql`UPDATE notify_watermark SET last_store_id = 1, last_product_id = 1, last_snapshot_id = 1 WHERE id = 1`;
+    // Same reasoning as the quiet-branch test above: the snapshot watermark is
+    // left behind the ceiling rather than pinned to it, so "did not advance"
+    // is something the assertions below can actually observe.
+    await sql`UPDATE notify_watermark SET last_store_id = 1, last_product_id = 1 WHERE id = 1`;
+
+    const before = await readWatermarkRow();
 
     const fetchImpl = okFetch();
     // NOW is 48h after the only snapshot; the threshold is 36h.
@@ -212,6 +257,14 @@ describe('runNotify', () => {
       ((fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1] as RequestInit).body as string,
     );
     expect(body.text).toContain('Data tidak bergerak');
+
+    // Stale: there was nothing to report, so the watermark ids must not move —
+    // moving them would hide the gap if the database starts moving again.
+    // (`lastStaleWarningAt` is excluded: stamping it is this branch's whole job.)
+    const after = await readWatermarkRow();
+    expect(after.lastSnapshotId).toBe(before.lastSnapshotId);
+    expect(after.lastProductId).toBe(before.lastProductId);
+    expect(after.lastStoreId).toBe(before.lastStoreId);
   });
 
   test('does not repeat the staleness warning within a day', async () => {
@@ -222,9 +275,12 @@ describe('runNotify', () => {
       INSERT INTO products (id, marketplace, item_id, shop_ref, name, first_seen, last_seen)
       VALUES (1, 'shopee', 222, 1, 'LEGO', ${BASE}, ${BASE})`;
     await sql`INSERT INTO price_snapshots (product_ref, price, scraped_at) VALUES (1, 1000, ${BASE})`;
-    await sql`UPDATE notify_watermark SET last_store_id = 1, last_product_id = 1, last_snapshot_id = 1 WHERE id = 1`;
+    // Same reasoning as the other two branch tests above: left behind the
+    // ceiling so a spurious write on the second call below is observable.
+    await sql`UPDATE notify_watermark SET last_store_id = 1, last_product_id = 1 WHERE id = 1`;
 
     await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: okFetch() });
+    const before = await readWatermarkRow();
 
     const second = okFetch();
     const outcome = await runNotify({
@@ -236,5 +292,10 @@ describe('runNotify', () => {
     expect(outcome.stale).toBe(true);
     expect(outcome.sent).toBe(0);
     expect(second).not.toHaveBeenCalled();
+
+    // Within the cooldown, the second call writes nothing at all — not the
+    // watermark ids, and not a fresh stale-warning stamp either.
+    const after = await readWatermarkRow();
+    expect(after).toEqual(before);
   });
 });
