@@ -184,18 +184,62 @@ describe('renderDigest', () => {
   test('never splits inside a line', () => {
     const events: Events = {
       ...empty,
+      // Prices vary per entry, the way the limit test's fixture does — a
+      // fixed delta would fold all 400 into one small group (same store,
+      // same signed delta), which renders as four short lines and can never
+      // exercise a real split at all.
       priceChanges: Array.from({ length: 400 }, (_, index) =>
         change({
           productId: index + 1,
           setCode: String(10000 + index),
           name: `LEGO Very Long Product Name Number ${index} With Padding To Make It Wide`,
+          previousPrice: String(100000 + index * 1000),
+          price: String(200000 + index * 3000),
         }),
       ),
     };
 
-    for (const message of renderDigest(events, { baseUrl: BASE_URL, now: NOW })) {
+    const messages = renderDigest(events, { baseUrl: BASE_URL, now: NOW });
+
+    // Confirms the fixture actually forces a split — otherwise the loop below
+    // checks nothing and the test proves nothing.
+    expect(messages.length).toBeGreaterThan(1);
+
+    for (const message of messages) {
       // A split mid-tag would leave an unbalanced <a>. Count them instead of
       // eyeballing: every opened anchor must close in the same message.
+      const opened = (message.match(/<a /g) ?? []).length;
+      const closed = (message.match(/<\/a>/g) ?? []).length;
+      expect(opened).toBe(closed);
+    }
+  });
+
+  test('hard-truncates a single overlong line without leaving an unbalanced tag', () => {
+    // A name long enough that its rendered line clears TELEGRAM_MAX_CHARS by
+    // only a handful of characters: the cut lands inside the trailing
+    // `<a href="...">lihat</a>` itself rather than before it, which is the
+    // one case a naive character-offset slice cannot get right for free.
+    const product: NewProduct = {
+      productId: 1,
+      name: 'x'.repeat(4020),
+      setCode: null,
+      marketplace: 'shopee',
+      url: null,
+      storeId: 1,
+      username: 'toko',
+    };
+
+    const messages = renderDigest(
+      { ...empty, newProducts: [product] },
+      { baseUrl: BASE_URL, now: NOW },
+    );
+
+    // Confirms the fixture actually reaches the hard-truncation branch —
+    // otherwise the assertions below would pass vacuously.
+    expect(messages.some((message) => message.includes('…'))).toBe(true);
+
+    for (const message of messages) {
+      expect(message.length).toBeLessThanOrEqual(TELEGRAM_MAX_CHARS);
       const opened = (message.match(/<a /g) ?? []).length;
       const closed = (message.match(/<\/a>/g) ?? []).length;
       expect(opened).toBe(closed);

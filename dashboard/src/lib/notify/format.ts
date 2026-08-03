@@ -186,6 +186,23 @@ function renderNewProducts(products: NewProduct[], baseUrl: string): string[] {
 }
 
 /**
+ * Drop a trailing anchor a raw character cut left half-open.
+ *
+ * A cut at an arbitrary offset can land inside `<a href="...`, inside the
+ * link text, or inside `</a>` itself — three different-looking cuts that are
+ * the same problem: an `<a ` with no `</a>` in what got kept. Comparing the
+ * two counts catches all three without needing to know which one happened,
+ * and it is the same test an unbalanced result is judged by, so fixing it
+ * this way cannot leave a case the check does not also see.
+ */
+function dropDanglingAnchor(sliced: string): string {
+  const opened = (sliced.match(/<a /g) ?? []).length;
+  const closed = (sliced.match(/<\/a>/g) ?? []).length;
+  if (opened <= closed) return sliced;
+  return sliced.slice(0, sliced.lastIndexOf('<a '));
+}
+
+/**
  * Pack lines into messages, splitting only between lines.
  *
  * A split inside a line can land inside an `<a href=...>`, which leaves an
@@ -194,7 +211,9 @@ function renderNewProducts(products: NewProduct[], baseUrl: string): string[] {
  *
  * A single line longer than the whole limit cannot be placed anywhere, so it is
  * hard-truncated — the only case where a character boundary is cut, and it is
- * the alternative to dropping the line entirely.
+ * the alternative to dropping the line entirely. The cut itself can still
+ * land inside the line's trailing anchor, so `dropDanglingAnchor` backs it up
+ * far enough to leave nothing but a closed `<a>` or none at all.
  */
 function paginate(lines: string[]): string[] {
   const messages: string[] = [];
@@ -209,7 +228,10 @@ function paginate(lines: string[]): string[] {
   };
 
   for (const raw of lines) {
-    const line = raw.length > TELEGRAM_MAX_CHARS ? `${raw.slice(0, TELEGRAM_MAX_CHARS - 1)}…` : raw;
+    const line =
+      raw.length > TELEGRAM_MAX_CHARS
+        ? `${dropDanglingAnchor(raw.slice(0, TELEGRAM_MAX_CHARS - 1))}…`
+        : raw;
     // +1 for the newline that will join it to the previous line.
     if (length + line.length + 1 > TELEGRAM_MAX_CHARS) flush();
     current.push(line);
