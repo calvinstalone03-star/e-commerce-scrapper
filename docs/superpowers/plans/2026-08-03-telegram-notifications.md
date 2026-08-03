@@ -1829,7 +1829,7 @@ npm run test -- src/lib/notify/format.test.ts
 npx tsc --noEmit
 ```
 
-Expected: 16 tests pass.
+Expected: 17 tests pass (1 for `escapeHtml`, 4 for `foldPriceChanges`, 10 for `renderDigest`, 2 for `renderStaleWarning`).
 
 - [ ] **Step 5: Commit**
 
