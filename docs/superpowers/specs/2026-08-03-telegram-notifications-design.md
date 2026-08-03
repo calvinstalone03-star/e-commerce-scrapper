@@ -532,6 +532,8 @@ memengaruhi deployment yang sebenarnya.
 | Satu produk tertangkap tiga kali satu putaran | Satu kejadian, memakai snapshot terbaru |
 | Snapshot dengan `scraped_at` mundur | Tidak berpengaruh pada watermark (memakai id), tapi **berpengaruh** pada pemilihan pembanding, yang memang memakai waktu. Yang mundur melewati ambang umur lebih cepat — diterima sadar, karena alternatifnya mengurutkan umur dengan id yang tidak mengukur waktu |
 | Telegram membalas 429 | Hormati `retry_after`, coba lagi sekali. Gagal lagi → watermark **tidak** maju, kejadiannya terkirim di pemicuan berikutnya |
+| Telegram membalas 200 tapi badannya bukan JSON | **Gagal**, bukan sukses. Gateway yang menjawab 200 dengan halaman HTML error akan membuat watermark maju padahal tak ada yang terkirim — kehilangan senyap, persis yang dicegah desain ini. Ditemukan di review; `readBody` sekarang membedakan tiga keadaan, bukan dua |
+| `fetch` menolak sebelum ada respons | Galatnya **tidak** diteruskan apa adanya. URL permintaan memuat bot token, dan sebagian pembungkus `fetch` menyertakan URL di pesan galatnya. Pesan yang dilempar dibangun hanya dari `error.name` |
 | Telegram gagal di tengah digest berbilah | Watermark tidak maju sama sekali. Duplikat lebih baik daripada hilang diam-diam |
 | Dua pemicuan bersamaan | `SELECT ... FOR UPDATE` pada baris watermark; yang kedua menunggu lalu tidak menemukan apa-apa |
 | Database basi | Peringatan, maksimal sekali per 24 jam. Watermark tidak maju |

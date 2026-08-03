@@ -1984,6 +1984,12 @@ Expected: FAIL — `Failed to resolve import "@/lib/notify/telegram"`.
 
 - [ ] **Step 3: Write the implementation**
 
+> **The reference code below shipped with two Critical defects, both found in review and both since fixed in `dashboard/src/lib/notify/telegram.ts`. Read the shipped file, not this block, if you are re-deriving this module.**
+>
+> **One.** `postOnce` never caught a *rejecting* `fetchImpl`. The request URL embeds the bot token, so a wrapper that puts the URL in its own error message — `node-fetch`'s `FetchError` does — carried the token straight out. Task 6 puts `error.message` into a 503 response body, so that was one hop from a live HTTP response. Node 20's Undici happens not to embed the URL, so nothing leaked in practice, but the guarantee has to live in this module rather than in whichever `fetch` is injected. The fix wraps the call and re-throws using only `error.name`.
+>
+> **Two, worse.** `readBody` returned `{}` when the body would not parse, so `body.ok` was `undefined`, `undefined !== false` was `true`, and an unparseable 2xx counted as delivered. A gateway answering 200 with an HTML error page would have made the caller advance its watermark having sent nothing — the exact silent loss this whole design exists to prevent. The fix replaces the shape with a three-state discriminated union (`{parsed: true, ok: true}` / `{parsed: true, ok: false, …}` / `{parsed: false}`), and only the first counts as success.
+
 Create `dashboard/src/lib/notify/telegram.ts`:
 
 ```ts
