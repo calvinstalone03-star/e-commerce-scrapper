@@ -520,9 +520,19 @@ export async function getPricePositions(
         END AS gap_percent,
         -- Precomputed so the filter reads a column instead of an expression over
         -- an aggregate, which is the whole reason this query is fast now.
+        --
+        -- Divided by the smaller of the two, not by cheapest_price alone —
+        -- unlike gap_percent above. Dividing by the rival unconditionally only
+        -- ever flags a gap when WE are the dearer side: when the rival is
+        -- dearer the ratio is bounded below 1 for any positive pair, so no
+        -- multiple, however large, trips a threshold of 1.0 in that direction.
+        -- least() catches both. gap_ratio never reaches the client — only
+        -- gap_percent is serialized, in "shaped" below — so this changes which
+        -- rows the extreme filter hides, not any number already displayed.
         CASE
-          WHEN m.price IS NULL OR g.cheapest_price IS NULL OR g.cheapest_price = 0 THEN NULL
-          ELSE abs((m.price - g.cheapest_price) / g.cheapest_price)
+          WHEN m.price IS NULL OR g.cheapest_price IS NULL OR least(m.price, g.cheapest_price) = 0
+            THEN NULL
+          ELSE abs((m.price - g.cheapest_price) / least(m.price, g.cheapest_price))
         END AS gap_ratio
       FROM mine m
       LEFT JOIN agg g ON g.mine_id = m.id
@@ -697,10 +707,16 @@ export async function computePairingSnapshot(channel: Channel): Promise<PairingS
                  round((s.price - s.cheapest) / s.cheapest * 100, 1) AS "gapPercent"
           FROM scored s
           JOIN mine m ON m.id = s.id
-          WHERE s.rivals > 0 AND s.sold IS NOT NULL AND s.cheapest > 0
+          WHERE s.rivals > 0 AND s.sold IS NOT NULL AND s.cheapest > 0 AND s.price > 0
             -- Beyond this the pairing is a packaging difference rather than a
             -- price, the same reason the worklist hides those rows by default.
-            AND abs((s.price - s.cheapest) / s.cheapest) < ${EXTREME_GAP}
+            -- least(), not s.cheapest alone: dividing by the rival uncondition-
+            -- ally only ever excludes a pairing when WE are the dearer side,
+            -- because that ratio is bounded below 1 no matter how large the
+            -- true multiple is when the rival is the dearer one. "gapPercent"
+            -- above is untouched — same signed, rival-denominated figure the
+            -- chart always plotted — only which rows reach it changes.
+            AND abs((s.price - s.cheapest) / least(s.price, s.cheapest)) < ${EXTREME_GAP}
         ) g
       ) AS "gapVolume",
       (SELECT count(*) FROM scored)                  AS listings,

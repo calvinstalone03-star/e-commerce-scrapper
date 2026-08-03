@@ -211,3 +211,77 @@ describe('ownSetPositions', () => {
     expect(positions.size).toBe(1);
   });
 });
+
+describe('ownSetPositions — extreme gap is symmetric', () => {
+  /**
+   * `abs(ours - rival) / rival` only ever fires when WE are the dearer side:
+   * when the rival is dearer, that ratio is `1 - ours/rival`, bounded below 1
+   * for any positive pair of prices, so no multiple — however large — trips
+   * a threshold of 1.0 in that direction. `abs(ours - rival) / least(ours,
+   * rival)` fixes that without moving the case the old formula already got
+   * right: when we are the dearer side, the rival's price already is the
+   * smaller one, so `least()` picks the same denominator as before.
+   */
+
+  test('flags a gap where the rival is the dearer side by a huge multiple (set 75059)', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'rival-h', false);
+    await addProduct(1, 1, '75059');
+    await addSnapshot(1, 350_000);
+    await addProduct(2, 2, '75059');
+    await addSnapshot(2, 12_500_000);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('75059')).toMatchObject({
+      ourPrice: '350000',
+      cheapestRival: '12500000',
+      extreme: true,
+    });
+  });
+
+  test('flags a gap just over the threshold when we are the dearer side', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'rival-i', false);
+    const rivalPrice = 100_000;
+    const ourPrice = Math.round(rivalPrice * (1 + EXTREME_GAP)) + 1000;
+    await addProduct(1, 1, '10321');
+    await addSnapshot(1, ourPrice);
+    await addProduct(2, 2, '10321');
+    await addSnapshot(2, rivalPrice);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('10321')).toMatchObject({ extreme: true });
+  });
+
+  test('flags a gap just over the threshold when the rival is the dearer side', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'rival-j', false);
+    const ourPrice = 100_000;
+    const rivalPrice = Math.round(ourPrice * (1 + EXTREME_GAP)) + 1000;
+    await addProduct(1, 1, '10322');
+    await addSnapshot(1, ourPrice);
+    await addProduct(2, 2, '10322');
+    await addSnapshot(2, rivalPrice);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('10322')).toMatchObject({ extreme: true });
+  });
+
+  test('does not flag a gap just under the threshold when the rival is the dearer side', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'rival-k', false);
+    const ourPrice = 100_000;
+    const rivalPrice = Math.round(ourPrice * (1 + EXTREME_GAP)) - 1000;
+    await addProduct(1, 1, '10323');
+    await addSnapshot(1, ourPrice);
+    await addProduct(2, 2, '10323');
+    await addSnapshot(2, rivalPrice);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('10323')).toMatchObject({ extreme: false });
+  });
+});

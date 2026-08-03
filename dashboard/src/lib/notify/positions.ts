@@ -118,10 +118,19 @@ export async function ownSetPositions(tx: Sql): Promise<Map<string, SetPosition>
       rivalCount: Number(row.rival_count),
       // Both sides must exist to say anything about the gap between them: a
       // set where we have no recorded price is unpriced, not extreme.
+      //
+      // Divided by the smaller of the two, not by cheapestRival alone.
+      // Dividing by the rival unconditionally only ever fires when WE are the
+      // dearer side — when the rival is dearer the ratio is `1 - ours/rival`,
+      // bounded below 1 for any positive pair, so no multiple, however large,
+      // trips a threshold of 1.0 in that direction. least() catches both
+      // directions and leaves the case that already worked unchanged: when we
+      // are the dearer side, our price was never the smaller one anyway.
       extreme:
         ourPrice !== null &&
         cheapestRival !== null &&
-        Math.abs(Number(ourPrice) - Number(cheapestRival)) / Number(cheapestRival) >=
+        Math.abs(Number(ourPrice) - Number(cheapestRival)) /
+          Math.min(Number(ourPrice), Number(cheapestRival)) >=
           EXTREME_GAP,
     });
   }

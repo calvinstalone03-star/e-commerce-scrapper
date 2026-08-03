@@ -46,6 +46,7 @@ import { sql } from '@/lib/db';
 import {
   channelOfOwnProduct,
   computePairingSnapshot,
+  EXTREME_GAP,
   getOwnShopScorecard,
   getOwnShops,
   getPairingSnapshot,
@@ -103,7 +104,12 @@ async function addStore(
   return row.id;
 }
 
-/** Insert a listing and its price. `setCode` is what the ingest layer derives. */
+/**
+ * Insert a listing and its price. `setCode` is what the ingest layer derives.
+ * `sold` defaults to unset (NULL), matching every fixture that does not need
+ * it; `computePairingSnapshot`'s `gapVolume` requires it non-null, so the
+ * tests that exercise that field pass it explicitly.
+ */
 async function addProduct(
   storeId: number,
   {
@@ -111,7 +117,8 @@ async function addProduct(
     setCode,
     price,
     marketplace = 'shopee',
-  }: { name: string; setCode: string | null; price: number | null; marketplace?: string },
+    sold,
+  }: { name: string; setCode: string | null; price: number | null; marketplace?: string; sold?: number },
 ): Promise<number> {
   const [product] = await sql`
     INSERT INTO products (marketplace, item_id, shop_ref, name, set_code, first_seen, last_seen)
@@ -121,8 +128,8 @@ async function addProduct(
   `;
   if (price !== null) {
     await sql`
-      INSERT INTO price_snapshots (product_ref, price, scraped_at)
-      VALUES (${product.id}, ${price}, now())
+      INSERT INTO price_snapshots (product_ref, price, sold, scraped_at)
+      VALUES (${product.id}, ${price}, ${sold ?? null}, now())
     `;
   }
   return product.id;
@@ -296,6 +303,70 @@ describe('price position', () => {
 
     const shown = await getPricePositions('shopee', pricePositionFilterSchema.parse({ extreme: 'show' }));
     expect(shown.rows.map((row) => row.setCode).sort()).toEqual(['10696', '71049']);
+  });
+
+  /**
+   * `gap_ratio` divided by the rival's price alone: bounded below 1 no matter
+   * how large the true multiple is, whenever the RIVAL is the dearer side.
+   * `abs(ours - rival) / least(ours, rival)` catches both directions. These
+   * pin that without touching `gap_percent` — the signed, rival-denominated
+   * figure `Gap`/the detail page actually display — which is a separate
+   * column computed the same way it always was.
+   */
+  describe('extreme gap is symmetric', () => {
+    test('hides a gap too large to be a price decision even when the rival is the dearer side (set 75059)', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-bulk-lot');
+
+      // Mirrors production set 75059: we list a small pack, a rival lists a
+      // box or bulk lot, and the set number happens to match.
+      await addProduct(mine, { name: 'LEGO 75059 single pack', setCode: '75059', price: 350_000 });
+      await addProduct(rival, { name: 'LEGO 75059 bulk lot', setCode: '75059', price: 12_500_000 });
+      // An ordinary, actionable gap, so a non-vacuous result proves the
+      // filter is selective rather than accidentally hiding everything.
+      await addProduct(mine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 577_940 });
+      await addProduct(rival, { name: 'LEGO 10696 Classic Box', setCode: '10696', price: 449_300 });
+
+      const hidden = await getPricePositions('shopee', pricePositionFilterSchema.parse({}));
+      expect(hidden.rows.map((row) => row.setCode)).toEqual(['10696']);
+
+      const shown = await getPricePositions('shopee', pricePositionFilterSchema.parse({ extreme: 'show' }));
+      expect(shown.rows.map((row) => row.setCode).sort()).toEqual(['10696', '75059']);
+
+      // The displayed gap is untouched: still signed, still divided by the
+      // rival's (here, larger) price — the same number this row always had.
+      const revealed = shown.rows.find((row) => row.setCode === '75059');
+      expect(revealed?.gapPercent).toBeCloseTo(((350_000 - 12_500_000) / 12_500_000) * 100, 1);
+    });
+
+    test('hides a gap just over the threshold when the rival is the dearer side', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-just-over');
+      const ourPrice = 100_000;
+      // Derived from EXTREME_GAP, not a literal 1.0, so this stays "just over"
+      // if the dashboard's threshold ever moves.
+      const rivalPrice = Math.round(ourPrice * (1 + EXTREME_GAP)) + 1000;
+      await addProduct(mine, { name: 'LEGO 10331 small pack', setCode: '10331', price: ourPrice });
+      await addProduct(rival, { name: 'LEGO 10331 bulk lot', setCode: '10331', price: rivalPrice });
+
+      const hidden = await getPricePositions('shopee', pricePositionFilterSchema.parse({}));
+      expect(hidden.rows.map((row) => row.setCode)).toEqual([]);
+
+      const shown = await getPricePositions('shopee', pricePositionFilterSchema.parse({ extreme: 'show' }));
+      expect(shown.rows.map((row) => row.setCode)).toEqual(['10331']);
+    });
+
+    test('does not hide a gap just under the threshold when the rival is the dearer side', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-just-under');
+      const ourPrice = 100_000;
+      const rivalPrice = Math.round(ourPrice * (1 + EXTREME_GAP)) - 1000;
+      await addProduct(mine, { name: 'LEGO 10332 small pack', setCode: '10332', price: ourPrice });
+      await addProduct(rival, { name: 'LEGO 10332 bulk lot', setCode: '10332', price: rivalPrice });
+
+      const { rows } = await getPricePositions('shopee', pricePositionFilterSchema.parse({}));
+      expect(rows.map((row) => row.setCode)).toEqual(['10332']);
+    });
   });
 
   test('a product with no rival is never hidden as extreme', async () => {
@@ -612,6 +683,63 @@ describe('pairing snapshot', () => {
     expect(snapshot.position).toEqual({ cheapest: 0, middle: 0, dearest: 0, unmatched: 0 });
     expect(Number(snapshot.atStake ?? 0)).toBe(0);
     expect(snapshot.rivals).toEqual([]);
+  });
+
+  /**
+   * Same defect as `gap_ratio` in `getPricePositions`, because `gapVolume`'s
+   * extreme filter used to be the identical asymmetric expression: dividing
+   * by the rival's price alone only ever excludes a pairing when WE are the
+   * dearer side. `least(price, cheapest)` catches both directions. `gapPercent`
+   * on the points that remain is untouched — same signed, rival-denominated
+   * figure the chart always plotted.
+   */
+  describe('gapVolume is symmetric', () => {
+    test('excludes a gap too large to be a price decision even when the rival is the dearer side (set 75059)', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-bulk-lot');
+
+      await addProduct(mine, { name: 'LEGO 75059 single pack', setCode: '75059', price: 350_000, sold: 5 });
+      await addProduct(rival, { name: 'LEGO 75059 bulk lot', setCode: '75059', price: 12_500_000 });
+      // An ordinary, actionable gap, so the exclusion is provably selective.
+      await addProduct(mine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 577_940, sold: 8 });
+      await addProduct(rival, { name: 'LEGO 10696 Classic Box', setCode: '10696', price: 449_300 });
+
+      const snapshot = await computePairingSnapshot('shopee');
+      const names = snapshot.gapVolume.map((point) => point.name);
+
+      expect(names).not.toContain('LEGO 75059 single pack');
+      expect(names).toContain('LEGO 10696 Brick Box');
+      // Excluding it from the chart does not erase it from the catalogue.
+      expect(snapshot.listings).toBe(2);
+    });
+
+    test('excludes a gap just over the threshold when the rival is the dearer side', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-just-over');
+      const ourPrice = 100_000;
+      // Derived from EXTREME_GAP, not a literal 1.0, so this stays "just over"
+      // if the dashboard's threshold ever moves.
+      const rivalPrice = Math.round(ourPrice * (1 + EXTREME_GAP)) + 1000;
+      await addProduct(mine, { name: 'LEGO 10331 small pack', setCode: '10331', price: ourPrice, sold: 3 });
+      await addProduct(rival, { name: 'LEGO 10331 bulk lot', setCode: '10331', price: rivalPrice });
+
+      const snapshot = await computePairingSnapshot('shopee');
+
+      expect(snapshot.gapVolume).toEqual([]);
+    });
+
+    test('includes a gap just under the threshold when the rival is the dearer side', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-just-under');
+      const ourPrice = 100_000;
+      const rivalPrice = Math.round(ourPrice * (1 + EXTREME_GAP)) - 1000;
+      await addProduct(mine, { name: 'LEGO 10332 small pack', setCode: '10332', price: ourPrice, sold: 3 });
+      await addProduct(rival, { name: 'LEGO 10332 bulk lot', setCode: '10332', price: rivalPrice });
+
+      const snapshot = await computePairingSnapshot('shopee');
+
+      expect(snapshot.gapVolume.map((point) => point.name)).toEqual(['LEGO 10332 small pack']);
+    });
   });
 });
 
