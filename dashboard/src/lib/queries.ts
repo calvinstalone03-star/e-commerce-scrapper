@@ -1,12 +1,16 @@
 import 'server-only';
 
+import { unstable_cache } from 'next/cache';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
+import { cache } from 'react';
 
+import type { Channel } from '@/lib/channel';
 import { sql } from '@/lib/db';
 import {
   filterOptionsSchema,
   overviewSchema,
   ownShopSchema,
+  ownShopScorecardSchema,
   pricePointSchema,
   pricePositionRowSchema,
   pricePositionSummarySchema,
@@ -17,6 +21,7 @@ import {
   type FilterOptions,
   type Overview,
   type OwnShop,
+  type OwnShopScorecard,
   type PricePoint,
   type PricePositionFilter,
   type PricePositionRow,
@@ -336,12 +341,20 @@ const rivalMatch = sql`
   )
 `;
 
-/** Our shops and their listings, newest price each. */
-const ourProducts = sql`
+/**
+ * Our listings in one channel, newest price each.
+ *
+ * A factory rather than a constant because "ours" is only half a definition:
+ * the Shopee shop and the Tokopedia shop list the same 1,174 sets, so a query
+ * that joins on `is_own` alone answers for a shop that does not exist. Taking
+ * the channel as an argument means there is no unscoped fragment left for a
+ * later screen to reach for.
+ */
+const ourListings = (channel: Channel) => sql`
   SELECT p.id, p.marketplace, p.name, p.url, p.image, p.set_code,
          l.price, l.scraped_at
   FROM products p
-  JOIN stores s ON s.id = p.shop_ref AND s.is_own
+  JOIN stores s ON s.id = p.shop_ref AND s.is_own AND s.marketplace = ${channel}
   LEFT JOIN latest l ON l.product_ref = p.id
 `;
 
@@ -356,8 +369,15 @@ const theirProducts = sql`
   WHERE l.price IS NOT NULL
 `;
 
-/** Shops marked ours. Empty means the screen has nothing to stand on. */
-export async function getOwnShops(): Promise<OwnShop[]> {
+/**
+ * Shops marked ours. Empty means the screen has nothing to stand on.
+ *
+ * `React.cache()`-wrapped: every scoped screen calls this once in the layout
+ * (to build the shop switcher) and again in the page itself, and without the
+ * wrapper that is the same query twice per request for two callers that were
+ * always going to agree.
+ */
+export const getOwnShops = cache(async (): Promise<OwnShop[]> => {
   const rows = await sql`
     SELECT s.id, s.marketplace, s.username, s.name,
            count(p.id) AS products
@@ -368,16 +388,16 @@ export async function getOwnShops(): Promise<OwnShop[]> {
     ORDER BY products DESC, s.username
   `;
   return rows.map((row) => ownShopSchema.parse(row));
-}
+});
 
 export async function getPricePositions(
+  channel: Channel,
   filter: PricePositionFilter,
 ): Promise<{ rows: PricePositionRow[]; total: number; summary: PricePositionSummary }> {
   const offset = (filter.page - 1) * filter.pageSize;
 
   const where = sql`
     WHERE TRUE
-    ${filter.marketplace ? sql`AND b.marketplace = ${filter.marketplace}` : sql``}
     ${
       // One box searches both ways a person identifies a product: the words on
       // it, and the number printed on the corner. A set number typed in full is
@@ -449,7 +469,7 @@ export async function getPricePositions(
   // and trigram indexes be used at all; a CTE is an optimisation fence.
   const rows = await withNameMatching((tx) => tx`
     WITH latest AS (${latestSnapshots}),
-    mine AS MATERIALIZED (${ourProducts}),
+    mine AS MATERIALIZED (${ourListings(channel)}),
     pairs AS MATERIALIZED (
       -- The exact half: same set number, therefore the same box.
       SELECT m.id AS mine_id, m.price AS my_price, l.price, p.marketplace,
@@ -555,23 +575,35 @@ export async function getPricePositions(
 }
 
 /**
- * The four questions the analytics screen answers, in one statement.
+ * Every figure both scoped screens need, computed once per channel.
  *
- * All four rest on the same pairing as the worklist, so they share its CTE
- * rather than recomputing it — the same reason that page went from three round
- * trips to one. Every figure here is a snapshot of one moment: with 38 products
- * carrying more than one observation, there is no trend to draw yet, and a
- * time-series chart would be an empty promise.
+ * This statement was `getPricingAnalytics`, and its `mine` CTE joined
+ * `is_own` alone — exactly the join that cannot tell the Shopee shop from the
+ * Tokopedia one apart. Taking a channel is the fix. The scorecard's three
+ * extra numbers (`listings`, `withRivals`, `atStake`) are computed here rather
+ * than in a second statement for the same reason the worklist shares one CTE
+ * for three answers: two figures that are supposed to be identical have to
+ * come from the same `scored` rows, the same trigram threshold, the same
+ * moment, or one of them eventually disagrees and nobody notices which.
+ *
+ * Uncached and exported so tests can call it directly. `getPairingSnapshot`
+ * below is the cached entry point every page actually calls; it needs no Next
+ * request context to run.
  */
-export async function getPricingAnalytics(): Promise<PricingAnalytics> {
+export type PairingSnapshot = PricingAnalytics & {
+  listings: number;
+  withRivals: number;
+  atStake: string | null;
+};
+
+export async function computePairingSnapshot(channel: Channel): Promise<PairingSnapshot> {
   const [row] = await withNameMatching((tx) => tx`
     WITH latest AS (${latestSnapshots}),
     mine AS MATERIALIZED (
-      SELECT p.id, p.name, p.set_code, l.price, l.sold
-      FROM products p
-      JOIN stores s ON s.id = p.shop_ref AND s.is_own
-      JOIN latest l ON l.product_ref = p.id
-      WHERE l.price IS NOT NULL
+      SELECT o.id, o.name, o.set_code, o.price, l.sold
+      FROM (${ourListings(channel)}) o
+      JOIN latest l ON l.product_ref = o.id
+      WHERE o.price IS NOT NULL
     ),
     pairs AS MATERIALIZED (
       SELECT m.id AS mine_id, m.price AS my_price, l.price AS their_price,
@@ -665,19 +697,102 @@ export async function getPricingAnalytics(): Promise<PricingAnalytics> {
             -- price, the same reason the worklist hides those rows by default.
             AND abs((s.price - s.cheapest) / s.cheapest) < ${EXTREME_GAP}
         ) g
-      ) AS "gapVolume"
+      ) AS "gapVolume",
+      (SELECT count(*) FROM scored)                  AS listings,
+      (SELECT count(*) FROM scored WHERE rivals > 0) AS "withRivals",
+      (
+        SELECT coalesce(sum(price - cheapest) FILTER (WHERE price > cheapest), 0)
+        FROM scored WHERE rivals > 0
+      ) AS "atStake"
   `);
 
-  return pricingAnalyticsSchema.parse(row);
+  return {
+    ...pricingAnalyticsSchema.parse(row),
+    listings: Number(row.listings),
+    withRivals: Number(row.withRivals),
+    atStake: row.atStake === null ? null : String(row.atStake),
+  };
 }
 
-/** One of our products and every rival tied to it, dearest question first. */
-export async function getPricePositionDetail(
+/**
+ * The same snapshot, served immediately and refreshed in the background.
+ *
+ * The pairing is the expensive part of this app — 2.9–3.3s against Neon — and
+ * two screens need all of it. Snapshots only change when a scrape runs, so a
+ * few-minutes-old answer is the same answer; the first visit after each
+ * five-minute window pays for a refresh and the rest do not. `revalidate: 300`
+ * is stale-while-revalidate, not a hard ceiling: a request past that window is
+ * still answered from what is already cached while the refresh runs for
+ * whoever asks next, so a figure can be one refresh older than five minutes,
+ * never "at most" five.
+ *
+ * The cache wraps `computePairingSnapshot` from outside on purpose: the tests
+ * call the inner function, which needs no Next request context to run.
+ */
+export const getPairingSnapshot = unstable_cache(
+  (channel: Channel) => computePairingSnapshot(channel),
+  ['pairing'],
+  { revalidate: 300, tags: ['pairing'] },
+);
+// The arguments are part of the cache key, so `shopee` and `tokopedia` can never
+// be served each other's snapshot. The key parts above only namespace it.
+
+/** What the analytics page needs: the snapshot without the scorecard extras. */
+export async function getPricingAnalytics(channel: Channel): Promise<PricingAnalytics> {
+  const { position, rivals, bands, gapVolume } = await getPairingSnapshot(channel);
+  return { position, rivals, bands, gapVolume };
+}
+
+/** What the overview needs: the headline four, named for the shop they describe. */
+export async function getOwnShopScorecard(
+  channel: Channel,
+  shop: OwnShop,
+): Promise<OwnShopScorecard> {
+  const snapshot = await getPairingSnapshot(channel);
+  return ownShopScorecardSchema.parse({
+    channel,
+    shopUsername: shop.username,
+    listings: snapshot.listings,
+    withRivals: snapshot.withRivals,
+    position: snapshot.position,
+    atStake: snapshot.atStake,
+  });
+}
+
+/**
+ * Which of our shops a listing belongs to, or null when it is not ours.
+ *
+ * The detail page is reached with a product id, and an id already names a shop.
+ * Looking the channel up rather than taking it from the URL means a shared link
+ * opens on the shop it is actually about.
+ */
+export async function channelOfOwnProduct(productId: number): Promise<Channel | null> {
+  const [row] = await sql`
+    SELECT s.marketplace
+    FROM products p
+    JOIN stores s ON s.id = p.shop_ref AND s.is_own
+    WHERE p.id = ${productId}
+  `;
+  return (row?.marketplace as Channel | undefined) ?? null;
+}
+
+/**
+ * One of our products and every rival tied to it, dearest question first.
+ *
+ * `React.cache()`-wrapped: `generateMetadata` and the page body both call this
+ * with the same id on every visit to the detail page, and without the wrapper
+ * the whole pairing query — the expensive part of this app — runs twice just
+ * to fill in a `<title>`.
+ */
+export const getPricePositionDetail = cache(async (
   productId: number,
-): Promise<{ product: PricePositionRow; rivals: RivalRow[] } | null> {
+): Promise<{ product: PricePositionRow; rivals: RivalRow[] } | null> => {
+  const channel = await channelOfOwnProduct(productId);
+  if (!channel) return null;
+
   const [mine] = await sql`
     WITH latest AS (${latestSnapshots}),
-    mine AS (${ourProducts})
+    mine AS (${ourListings(channel)})
     SELECT m.id, m.marketplace, m.name, m.url, m.image,
            m.set_code AS "setCode", m.price, m.scraped_at AS "scrapedAt"
     FROM mine m
@@ -687,7 +802,7 @@ export async function getPricePositionDetail(
 
   const rivals = await withNameMatching((tx) => tx`
     WITH latest AS (${latestSnapshots}),
-    mine AS (SELECT * FROM (${ourProducts}) o WHERE o.id = ${productId}),
+    mine AS (SELECT * FROM (${ourListings(channel)}) o WHERE o.id = ${productId}),
     rivals AS (${theirProducts})
     SELECT r.id, r.marketplace, r.name, r.url, r.image,
            r.set_code AS "setCode",
@@ -731,7 +846,7 @@ export async function getPricePositionDetail(
     }),
     rivals: rivals.map((row) => rivalRowSchema.parse(row)),
   };
-}
+});
 
 // ---------------------------------------------------------------------------
 // Filter options

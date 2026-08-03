@@ -9,8 +9,10 @@ import {
 } from '@/components/AnalyticsCharts';
 import { EmptyState } from '@/components/EmptyState';
 import { Card, CardContent, CardHeader, CardTitle, Stat } from '@/components/ui';
-import { formatPrice } from '@/lib/format';
+import { channelFromParams, channelShop, withChannel } from '@/lib/channel';
+import { MARKETPLACE_LABELS, formatPrice } from '@/lib/format';
 import { getOwnShops, getPricingAnalytics } from '@/lib/queries';
+import type { OwnShop } from '@/lib/schemas';
 
 /**
  * The four questions worth asking before changing a price.
@@ -34,10 +36,20 @@ export const metadata: Metadata = {
 
 const count = new Intl.NumberFormat('id-ID');
 
-export default async function AnalyticsPage() {
+export default async function AnalyticsPage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const params = await searchParams;
   const shops = await getOwnShops();
+  // `shop` is derived from this same `channel`, not from an independent lookup —
+  // the only way to guarantee the heading below never names one shop while the
+  // figures underneath answer for the other.
+  const channel = channelFromParams(params, shops);
+  const shop = channelShop(channel, shops);
 
-  if (shops.length === 0) {
+  if (!channel || !shop) {
     return (
       <div className="space-y-6">
         <Header />
@@ -49,6 +61,8 @@ export default async function AnalyticsPage() {
               yang milikmu:
               <code className="mt-2 block rounded-md border border-line bg-surface-muted px-3 py-2 text-left font-mono text-xs text-foreground">
                 ecom-scraper own-shop shopee i_bricks
+                <br />
+                ecom-scraper own-shop tokopedia i-bricks
               </code>
             </>
           }
@@ -57,7 +71,7 @@ export default async function AnalyticsPage() {
     );
   }
 
-  const analytics = await getPricingAnalytics();
+  const analytics = await getPricingAnalytics(channel);
   const { position, rivals, bands, gapVolume } = analytics;
 
   const compared = position.cheapest + position.middle + position.dearest;
@@ -70,7 +84,7 @@ export default async function AnalyticsPage() {
   if (compared === 0) {
     return (
       <div className="space-y-6">
-        <Header />
+        <Header shop={shop} />
         <EmptyState
           title="Belum ada produk yang bisa dibandingkan"
           description="Scrape katalog beberapa toko kompetitor dulu — perbandingannya terjadi di database setelah itu, dan halaman ini terisi sendiri."
@@ -81,7 +95,7 @@ export default async function AnalyticsPage() {
 
   return (
     <div className="space-y-6">
-      <Header />
+      <Header shop={shop} />
 
       <Card>
         <CardContent className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
@@ -178,7 +192,7 @@ export default async function AnalyticsPage() {
       <p className="text-sm text-muted">
         Semua angka di atas adalah potret satu waktu, dari snapshot terbaru tiap produk. Tren harga
         baru bisa digambar setelah produk yang sama di-scrape di hari yang berbeda.{' '}
-        <Link href="/pricing" className="text-accent underline-offset-4 hover:underline">
+        <Link href={withChannel('/pricing', channel)} className="text-accent underline-offset-4 hover:underline">
           Buka daftar kerja
         </Link>{' '}
         untuk menindaklanjuti per produk.
@@ -187,10 +201,17 @@ export default async function AnalyticsPage() {
   );
 }
 
-function Header() {
+function Header({ shop }: { shop?: OwnShop | null }) {
   return (
     <header className="space-y-1">
-      <h1 className="text-2xl font-semibold tracking-tight text-foreground">Analitik</h1>
+      <h1 className="text-2xl font-semibold tracking-tight text-foreground">
+        Analitik
+        {shop ? (
+          <span className="ml-2 text-base font-normal text-muted">
+            {MARKETPLACE_LABELS[shop.marketplace]} · {shop.username}
+          </span>
+        ) : null}
+      </h1>
       <p className="max-w-2xl text-sm text-muted">
         Empat pertanyaan yang menentukan keputusan harga: siapa yang menekan kita, di mana uangnya,
         seberapa besar katalog yang terekspos, dan apakah harga benar-benar menggerakkan penjualan.

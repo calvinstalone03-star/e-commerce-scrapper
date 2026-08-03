@@ -5,9 +5,15 @@ import { EmptyState } from '@/components/EmptyState';
 import { PricingSearch } from '@/components/PricingSearch';
 import { UrlChoice } from '@/components/UrlChoice';
 import { Badge, Card, CardContent, Stat, TBody, TD, TH, THead, TR, Table, cn } from '@/components/ui';
+import { channelFromParams, channelShop, withChannel, type Channel } from '@/lib/channel';
 import { MARKETPLACE_LABELS, formatDate, formatPrice, formatStoreName } from '@/lib/format';
 import { getOwnShops, getPricePositions } from '@/lib/queries';
-import { pricePositionFilterSchema, toSearchParams, type PricePositionFilter } from '@/lib/schemas';
+import {
+  pricePositionFilterSchema,
+  toSearchParams,
+  type OwnShop,
+  type PricePositionFilter,
+} from '@/lib/schemas';
 
 /**
  * Where our prices sit against everyone else's.
@@ -72,15 +78,29 @@ export default async function PricingPage({
     );
   }
 
+  const channel = channelFromParams(params, shops);
+  const shop = channelShop(channel, shops);
+
+  // Unreachable in practice — the zero-shops return above already guarantees
+  // a channel resolves — but this is the same idiom the other scoped pages use
+  // rather than asserting past a case that cannot happen.
+  if (!channel || !shop) {
+    return (
+      <div className="space-y-6">
+        <PageHeader />
+      </div>
+    );
+  }
+
   // One statement answers all three: the page, its total, and the headline
   // counts over the whole catalogue.
-  const { rows, total, summary } = await getPricePositions(filter);
+  const { rows, total, summary } = await getPricePositions(channel, filter);
 
   const unmatched = summary.products - summary.matched;
 
   return (
     <div className="space-y-6">
-      <PageHeader shops={shops.map((shop) => shop.username)} />
+      <PageHeader shop={shop} channel={channel} />
 
       <Card>
         <CardContent className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
@@ -111,7 +131,7 @@ export default async function PricingPage({
         </CardContent>
       </Card>
 
-      <SearchBox filter={filter} />
+      <SearchBox filter={filter} channel={channel} />
       <Filters filter={filter} />
 
       {rows.length === 0 ? (
@@ -146,7 +166,7 @@ export default async function PricingPage({
                 <TR key={row.id} className="relative hover:bg-surface-muted">
                   <TD>
                     <Link
-                      href={`/pricing/${row.id}`}
+                      href={withChannel(`/pricing/${row.id}`, channel)}
                       className="font-medium text-foreground underline-offset-4 before:absolute before:inset-0 before:content-[''] hover:underline"
                     >
                       {row.name ?? 'Produk tanpa nama'}
@@ -215,20 +235,38 @@ export default async function PricingPage({
             </TBody>
           </Table>
 
-          <PageLinks filter={filter} total={total} />
+          <PageLinks filter={filter} total={total} channel={channel} />
         </>
       )}
     </div>
   );
 }
 
-function PageHeader({ shops }: { shops?: string[] }) {
+function PageHeader({
+  shop = null,
+  channel = null,
+}: {
+  shop?: OwnShop | null;
+  channel?: Channel | null;
+}) {
   return (
     <header className="space-y-1">
       <h1 className="text-2xl font-semibold tracking-tight text-foreground">Posisi harga</h1>
       <p className="max-w-2xl text-sm text-muted">
-        Produk kita dibanding produk toko lain dengan nomor set LEGO yang sama, lintas marketplace.
-        {shops && shops.length > 0 ? ` Toko kita: ${shops.join(', ')}.` : null}
+        {shop && channel ? (
+          <>
+            Produk <span className="font-medium text-foreground">{shop.username}</span> di{' '}
+            {MARKETPLACE_LABELS[channel]} dibanding produk toko lain dengan nomor set LEGO yang
+            sama, lintas marketplace.
+          </>
+        ) : (
+          // No shop resolved yet — the zero-own-shops branch above renders this
+          // header before any channel exists to name. A complete, generic
+          // sentence here rather than interpolating missing pieces: the
+          // EmptyState right below already explains why there is nothing to
+          // name, so this line only has to stay grammatical, not specific.
+          'Produk kita dibanding produk toko lain dengan nomor set LEGO yang sama, lintas marketplace.'
+        )}
       </p>
     </header>
   );
@@ -254,15 +292,15 @@ function Gap({ value }: { value: number | null }) {
  * The "clear" link stays here because it is a plain link and belongs to the
  * server-rendered part.
  */
-function SearchBox({ filter }: { filter: PricePositionFilter }) {
+function SearchBox({ filter, channel }: { filter: PricePositionFilter; channel: Channel | null }) {
   const carried = { ...filter, q: undefined, page: undefined };
 
   return (
     <div className="flex flex-wrap items-center gap-3">
-      <PricingSearch q={filter.q ?? ''} carried={carried} />
+      <PricingSearch q={filter.q ?? ''} carried={carried} channel={channel} />
       {filter.q ? (
         <Link
-          href={`/pricing?${toSearchParams(carried)}`}
+          href={withChannel(`/pricing?${toSearchParams(carried)}`, channel)}
           className="text-sm text-muted underline-offset-4 hover:underline"
         >
           Hapus pencarian
@@ -275,25 +313,18 @@ function SearchBox({ filter }: { filter: PricePositionFilter }) {
 /**
  * The filter row.
  *
- * Four dropdowns and a sort, where there used to be four groups of chips. The
+ * Three dropdowns and a sort, where there used to be four groups of chips. The
  * chips were honest about their options and silent about what they did: by the
  * time there were fifteen of them across three rows, they took more height than
  * the table and read as decoration. A labelled control says what it filters
  * while closed, which is most of the time.
+ *
+ * Marketplace used to be a fourth dropdown here; it is gone now that a channel
+ * — not a filter — decides which shop of ours the whole page is about.
  */
 function Filters({ filter }: { filter: PricePositionFilter }) {
   return (
-    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-      <UrlChoice
-        label="Marketplace"
-        param="marketplace"
-        value={filter.marketplace ?? 'all'}
-        options={[
-          { value: 'all', label: 'Semua marketplace' },
-          { value: 'shopee', label: 'Shopee' },
-          { value: 'tokopedia', label: 'Tokopedia' },
-        ]}
-      />
+    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
       <UrlChoice
         label="Posisi"
         param="stance"
@@ -347,7 +378,15 @@ function Filters({ filter }: { filter: PricePositionFilter }) {
  * That component is callback-driven for the client-side list views; this page is
  * a Server Component, so its paging has to survive in the URL.
  */
-function PageLinks({ filter, total }: { filter: PricePositionFilter; total: number }) {
+function PageLinks({
+  filter,
+  total,
+  channel,
+}: {
+  filter: PricePositionFilter;
+  total: number;
+  channel: Channel | null;
+}) {
   const pages = Math.max(1, Math.ceil(total / filter.pageSize));
   const from = total === 0 ? 0 : (filter.page - 1) * filter.pageSize + 1;
   const to = Math.min(filter.page * filter.pageSize, total);
@@ -366,7 +405,7 @@ function PageLinks({ filter, total }: { filter: PricePositionFilter; total: numb
           {[10, 25, 50, 100].map((size) => (
             <Link
               key={size}
-              href={`/pricing?${toSearchParams({ ...filter, pageSize: size, page: 1 })}`}
+              href={withChannel(`/pricing?${toSearchParams({ ...filter, pageSize: size, page: 1 })}`, channel)}
               aria-current={filter.pageSize === size ? 'true' : undefined}
               className={cn(
                 'rounded px-1.5 py-0.5 tabular-nums transition-colors',
@@ -387,7 +426,7 @@ function PageLinks({ filter, total }: { filter: PricePositionFilter; total: numb
         </span>
         {filter.page > 1 ? (
           <Link
-            href={`/pricing?${toSearchParams({ ...filter, page: filter.page - 1 })}`}
+            href={withChannel(`/pricing?${toSearchParams({ ...filter, page: filter.page - 1 })}`, channel)}
             className="rounded-md border border-line bg-surface px-3 py-1.5 text-muted transition-colors hover:text-foreground"
           >
             Sebelumnya
@@ -395,7 +434,7 @@ function PageLinks({ filter, total }: { filter: PricePositionFilter; total: numb
         ) : null}
         {filter.page < pages ? (
           <Link
-            href={`/pricing?${toSearchParams({ ...filter, page: filter.page + 1 })}`}
+            href={withChannel(`/pricing?${toSearchParams({ ...filter, page: filter.page + 1 })}`, channel)}
             className="rounded-md border border-line bg-surface px-3 py-1.5 text-muted transition-colors hover:text-foreground"
           >
             Berikutnya

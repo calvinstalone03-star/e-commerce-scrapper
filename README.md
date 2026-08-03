@@ -453,6 +453,10 @@ The dashboard's **Posisi harga** screen answers one question over a whole
 catalogue: which of our prices is somebody else beating, and by how much. Two
 things have to be true before it can.
 
+Mark more than one shop as ours and the dashboard does not add them together:
+**Ringkasan**, **Posisi harga**, and **Analitik** each report on one shop at a
+time, picked from the topbar.
+
 **Say which shop is ours.** The marketplace does not record it and no scrape can
 work it out, so it is an operator decision and a stored column rather than
 something inferred:

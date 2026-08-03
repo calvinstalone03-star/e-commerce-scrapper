@@ -1,13 +1,57 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
+
+/**
+ * `unstable_cache` needs a real Next.js server behind it — specifically the
+ * incremental cache the server process hangs off `globalThis` — and throws
+ * outright when that is missing, rather than quietly skipping the cache.
+ * Vitest never starts that server, so the throw happens no matter where the
+ * cache boundary sits in `queries.ts`. Next's own client-bundle build hits the
+ * same gap and closes it the same way: caching becomes a no-op and the
+ * wrapped function is called directly. This is that fallback, applied to this
+ * process instead — the tests below prove the pairing is correct, not that
+ * caching works, so a no-op cache is exactly what they need.
+ *
+ * A silent passthrough would erase the one thing worth checking about this
+ * stub, though: whether `getPairingSnapshot` really is the wrapped function
+ * and `computePairingSnapshot` really is not — the inversion that would let
+ * the cache boundary end up around the wrong export. So the stub marks
+ * whatever it wraps and records the key parts and options it was called
+ * with; `describe('cache boundary', ...)` below asserts on both, which is
+ * also how it pins the exact revalidate window and tag against a silent
+ * change to either.
+ */
+const cacheStub = vi.hoisted(() => {
+  const calls: Array<{ keyParts: unknown; options: unknown }> = [];
+  const WRAPPED = Symbol('wrapped by the unstable_cache stub');
+  return { calls, WRAPPED };
+});
+
+vi.mock('next/cache', () => ({
+  unstable_cache: <Fn extends (...args: readonly unknown[]) => unknown>(
+    fn: Fn,
+    keyParts: unknown,
+    options: unknown,
+  ): Fn => {
+    cacheStub.calls.push({ keyParts, options });
+    const wrapped = ((...args: Parameters<Fn>) => fn(...args)) as Fn;
+    Reflect.set(wrapped, cacheStub.WRAPPED, true);
+    return wrapped;
+  },
+}));
 
 import { sql } from '@/lib/db';
 import {
+  channelOfOwnProduct,
+  computePairingSnapshot,
+  getOwnShopScorecard,
   getOwnShops,
+  getPairingSnapshot,
   getPricePositionDetail,
   getPricePositions,
+  getPricingAnalytics,
   withNameMatching,
 } from '@/lib/queries';
 import { pricePositionFilterSchema } from '@/lib/schemas';
@@ -106,7 +150,7 @@ describe('price position', () => {
       price: 1_199_000,
     });
 
-    const { rows, total } = await getPricePositions(anyFilter);
+    const { rows, total } = await getPricePositions('shopee', anyFilter);
 
     expect(total).toBe(1);
     expect(rows[0].id).toBe(productId);
@@ -136,7 +180,7 @@ describe('price position', () => {
       price: 900_000,
     });
 
-    const { rows } = await getPricePositions(anyFilter);
+    const { rows } = await getPricePositions('shopee', anyFilter);
     expect(rows[0].rivals).toBe(0);
     expect(rows[0].cheapestPrice).toBeNull();
     expect(rows[0].matchKind).toBeNull();
@@ -153,7 +197,7 @@ describe('price position', () => {
       price: 999_000,
     });
 
-    const { rows } = await getPricePositions(anyFilter);
+    const { rows } = await getPricePositions('shopee', anyFilter);
     expect(rows).toHaveLength(2);
     for (const row of rows) expect(row.rivals).toBe(0);
   });
@@ -170,7 +214,7 @@ describe('price position', () => {
       marketplace: 'tokopedia',
     });
 
-    const { rows } = await getPricePositions(anyFilter);
+    const { rows } = await getPricePositions('shopee', anyFilter);
     expect(rows[0].rivals).toBe(1);
     expect(rows[0].cheapestMarketplace).toBe('tokopedia');
   });
@@ -197,7 +241,7 @@ describe('price position', () => {
       price: 50_000,
     });
 
-    const { rows } = await getPricePositions(anyFilter);
+    const { rows } = await getPricePositions('shopee', anyFilter);
     expect(rows[0].rivals).toBe(1);
     expect(rows[0].matchKind).toBe('name');
     expect(Number(rows[0].cheapestPrice)).toBe(132_000);
@@ -216,13 +260,13 @@ describe('price position', () => {
     // Nobody to compare against at all.
     await addProduct(mine, { name: 'LEGO 11024 Baseplate', setCode: '11024', price: 100_000 });
 
-    const over = await getPricePositions(pricePositionFilterSchema.parse({ stance: 'over' }));
+    const over = await getPricePositions('shopee', pricePositionFilterSchema.parse({ stance: 'over' }));
     expect(over.rows.map((row) => row.setCode)).toEqual(['10696']);
 
-    const under = await getPricePositions(pricePositionFilterSchema.parse({ stance: 'under' }));
+    const under = await getPricePositions('shopee', pricePositionFilterSchema.parse({ stance: 'under' }));
     expect(under.rows.map((row) => row.setCode)).toEqual(['60411']);
 
-    const unmatched = await getPricePositions(pricePositionFilterSchema.parse({ matched: 'none' }));
+    const unmatched = await getPricePositions('shopee', pricePositionFilterSchema.parse({ matched: 'none' }));
     expect(unmatched.rows.map((row) => row.setCode)).toEqual(['11024']);
   });
 
@@ -246,11 +290,11 @@ describe('price position', () => {
     await addProduct(mine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 577_940 });
     await addProduct(rival, { name: 'LEGO 10696 Classic Box', setCode: '10696', price: 449_300 });
 
-    const hidden = await getPricePositions(pricePositionFilterSchema.parse({}));
+    const hidden = await getPricePositions('shopee', pricePositionFilterSchema.parse({}));
     expect(hidden.rows.map((row) => row.setCode)).toEqual(['10696']);
     expect(hidden.total).toBe(1);
 
-    const shown = await getPricePositions(pricePositionFilterSchema.parse({ extreme: 'show' }));
+    const shown = await getPricePositions('shopee', pricePositionFilterSchema.parse({ extreme: 'show' }));
     expect(shown.rows.map((row) => row.setCode).sort()).toEqual(['10696', '71049']);
   });
 
@@ -258,7 +302,7 @@ describe('price position', () => {
     const mine = await addStore('i_bricks', { own: true });
     await addProduct(mine, { name: 'LEGO 11024 Baseplate', setCode: '11024', price: 100_000 });
 
-    const { rows } = await getPricePositions(pricePositionFilterSchema.parse({}));
+    const { rows } = await getPricePositions('shopee', pricePositionFilterSchema.parse({}));
     expect(rows.map((row) => row.setCode)).toEqual(['11024']);
   });
 
@@ -271,17 +315,17 @@ describe('price position', () => {
     });
     await addProduct(mine, { name: 'LEGO City 60411 Fire Rescue', setCode: '60411', price: 164_550 });
 
-    const byName = await getPricePositions(pricePositionFilterSchema.parse({ q: 'john deere' }));
+    const byName = await getPricePositions('shopee', pricePositionFilterSchema.parse({ q: 'john deere' }));
     expect(byName.rows.map((row) => row.setCode)).toEqual(['42218']);
 
-    const byCode = await getPricePositions(pricePositionFilterSchema.parse({ q: '42218' }));
+    const byCode = await getPricePositions('shopee', pricePositionFilterSchema.parse({ q: '42218' }));
     expect(byCode.rows.map((row) => row.setCode)).toEqual(['42218']);
 
     // Half-remembered numbers are the common case: the box is across the room.
-    const byPrefix = await getPricePositions(pricePositionFilterSchema.parse({ q: '604' }));
+    const byPrefix = await getPricePositions('shopee', pricePositionFilterSchema.parse({ q: '604' }));
     expect(byPrefix.rows.map((row) => row.setCode)).toEqual(['60411']);
 
-    const nothing = await getPricePositions(pricePositionFilterSchema.parse({ q: 'zzzz' }));
+    const nothing = await getPricePositions('shopee', pricePositionFilterSchema.parse({ q: 'zzzz' }));
     expect(nothing.rows).toHaveLength(0);
     expect(nothing.total).toBe(0);
     // The headline still describes the catalogue, not the search.
@@ -298,9 +342,9 @@ describe('price position', () => {
       });
     }
 
-    const first = await getPricePositions(pricePositionFilterSchema.parse({ pageSize: 3, page: 1 }));
-    const second = await getPricePositions(pricePositionFilterSchema.parse({ pageSize: 3, page: 2 }));
-    const third = await getPricePositions(pricePositionFilterSchema.parse({ pageSize: 3, page: 3 }));
+    const first = await getPricePositions('shopee', pricePositionFilterSchema.parse({ pageSize: 3, page: 1 }));
+    const second = await getPricePositions('shopee', pricePositionFilterSchema.parse({ pageSize: 3, page: 2 }));
+    const third = await getPricePositions('shopee', pricePositionFilterSchema.parse({ pageSize: 3, page: 3 }));
 
     expect(first.total).toBe(7);
     const seen = [...first.rows, ...second.rows, ...third.rows].map((row) => row.id);
@@ -318,7 +362,7 @@ describe('price position', () => {
     await addProduct(rival, { name: 'LEGO 60411 Fire Heli', setCode: '60411', price: 199_000 });
     await addProduct(mine, { name: 'Bundle tanpa nomor', setCode: null, price: 100_000 });
 
-    const { summary } = await getPricePositions(pricePositionFilterSchema.parse({}));
+    const { summary } = await getPricePositions('shopee', pricePositionFilterSchema.parse({}));
     expect(summary.products).toBe(3);
     expect(summary.matched).toBe(2);
     expect(summary.overpriced).toBe(1);
@@ -366,6 +410,95 @@ describe('price position', () => {
     expect(shops.map((shop) => shop.username)).toEqual(['i_bricks']);
     expect(shops[0].products).toBe(1);
   });
+
+  test('a channel sees only its own listings, never the other shop\'s', async () => {
+    const shopeeMine = await addStore('i_bricks', { own: true, marketplace: 'shopee' });
+    const tokopediaMine = await addStore('i-bricks', { own: true, marketplace: 'tokopedia' });
+    const rival = await addStore('brickstore');
+    await addProduct(shopeeMine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 500_000 });
+    await addProduct(tokopediaMine, {
+      name: 'LEGO 10696 Brick Box',
+      setCode: '10696',
+      price: 520_000,
+      marketplace: 'tokopedia',
+    });
+    await addProduct(rival, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 400_000 });
+
+    const shopee = await getPricePositions('shopee', anyFilter);
+    const tokopedia = await getPricePositions('tokopedia', anyFilter);
+
+    expect(shopee.rows).toHaveLength(1);
+    expect(Number(shopee.rows[0].price)).toBe(500_000);
+    expect(tokopedia.rows).toHaveLength(1);
+    expect(Number(tokopedia.rows[0].price)).toBe(520_000);
+    // The set exists in both our shops; neither screen may report two.
+    expect(shopee.summary.products).toBe(1);
+    expect(tokopedia.summary.products).toBe(1);
+  });
+
+  test('our listing in the other channel is never counted as a rival', async () => {
+    const shopeeMine = await addStore('i_bricks', { own: true, marketplace: 'shopee' });
+    const tokopediaMine = await addStore('i-bricks', { own: true, marketplace: 'tokopedia' });
+    await addProduct(shopeeMine, { name: 'LEGO 21034 London', setCode: '21034', price: 700_000 });
+    await addProduct(tokopediaMine, {
+      name: 'LEGO 21034 London',
+      setCode: '21034',
+      price: 600_000,
+      marketplace: 'tokopedia',
+    });
+
+    const { rows } = await getPricePositions('shopee', anyFilter);
+
+    // Only the Shopee listing is ours in this channel. Asserting the count,
+    // not just rows[0]'s shape, is what makes this fail if `ourListings` ever
+    // reverted to unscoped `is_own`: the Tokopedia row would leak into `mine`
+    // as a second row, and — because `pairs` already excludes any `is_own`
+    // store from rivals regardless of channel — it too would show `rivals: 0`
+    // and pass the checks below without a length assertion to catch it.
+    expect(rows).toHaveLength(1);
+    // Cheaper, same set, but it is us. Our own shelf is not competition.
+    expect(rows[0].rivals).toBe(0);
+    expect(rows[0].cheapestPrice).toBeNull();
+  });
+
+  test('a product knows which of our shops it belongs to', async () => {
+    const tokopediaMine = await addStore('i-bricks', { own: true, marketplace: 'tokopedia' });
+    const rival = await addStore('brickstore');
+    const mine = await addProduct(tokopediaMine, {
+      name: 'LEGO 21034 London',
+      setCode: '21034',
+      price: 700_000,
+      marketplace: 'tokopedia',
+    });
+    const theirs = await addProduct(rival, {
+      name: 'LEGO 21034 London',
+      setCode: '21034',
+      price: 650_000,
+    });
+
+    expect(await channelOfOwnProduct(mine)).toBe('tokopedia');
+    // A rival's product is nobody's channel, and the detail page has to say so
+    // rather than render someone else's shelf as ours.
+    expect(await channelOfOwnProduct(theirs)).toBeNull();
+  });
+
+  test('a cheaper rival on the other marketplace still counts against us', async () => {
+    const mine = await addStore('i_bricks', { own: true, marketplace: 'shopee' });
+    const rival = await addStore('toko-brick-jkt', { marketplace: 'tokopedia' });
+    await addProduct(mine, { name: 'LEGO 42218 John Deere', setCode: '42218', price: 1_245_000 });
+    await addProduct(rival, {
+      name: 'LEGO 42218 John Deere',
+      setCode: '42218',
+      price: 1_089_000,
+      marketplace: 'tokopedia',
+    });
+
+    const { rows } = await getPricePositions('shopee', anyFilter);
+
+    expect(rows[0].rivals).toBe(1);
+    expect(Number(rows[0].cheapestPrice)).toBe(1_089_000);
+    expect(rows[0].cheapestMarketplace).toBe('tokopedia');
+  });
 });
 
 /**
@@ -397,15 +530,112 @@ describe('name matching', () => {
   });
 
   test('composes the shared query fragments, which belong to the outer handle', async () => {
-    // `rivalMatch`, `ourProducts` and `latestSnapshots` are built from `sql`, and
+    // `rivalMatch`, `ourListings` and `latestSnapshots` are built from `sql`, and
     // every wrapped query embeds them while running on a transaction handle.
     const mine = await addStore('i_bricks', { own: true });
     const theirs = await addStore('brickstore');
     await addProduct(mine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 500_000 });
     await addProduct(theirs, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 400_000 });
 
-    const { rows } = await getPricePositions(anyFilter);
+    const { rows } = await getPricePositions('shopee', anyFilter);
     expect(rows).toHaveLength(1);
     expect(Number(rows[0].cheapestPrice)).toBe(400_000);
+  });
+});
+
+describe('pairing snapshot', () => {
+  /**
+   * The overview scorecard and the analytics position mix are the same numbers
+   * shown twice. They are computed once for that reason, and these tests are
+   * what keep them from drifting apart again.
+   */
+  async function bothShopsWithOneRival() {
+    const shopeeMine = await addStore('i_bricks', { own: true, marketplace: 'shopee' });
+    const tokopediaMine = await addStore('i-bricks', { own: true, marketplace: 'tokopedia' });
+    const rival = await addStore('brickstore');
+    // One set in both our shops: cheapest on Shopee, dearest on Tokopedia.
+    await addProduct(shopeeMine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 380_000 });
+    await addProduct(tokopediaMine, {
+      name: 'LEGO 10696 Brick Box',
+      setCode: '10696',
+      price: 460_000,
+      marketplace: 'tokopedia',
+    });
+    await addProduct(rival, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 400_000 });
+    // A second Shopee listing nobody sells against.
+    await addProduct(shopeeMine, { name: 'Bundle Baseplate 3pcs', setCode: null, price: 145_000 });
+  }
+
+  test('counts each channel on its own, so a shared set is never counted twice', async () => {
+    await bothShopsWithOneRival();
+
+    const shopee = await computePairingSnapshot('shopee');
+    const tokopedia = await computePairingSnapshot('tokopedia');
+
+    expect(shopee.listings).toBe(2);
+    expect(shopee.withRivals).toBe(1);
+    expect(shopee.position).toEqual({ cheapest: 1, middle: 0, dearest: 0, unmatched: 1 });
+
+    expect(tokopedia.listings).toBe(1);
+    expect(tokopedia.withRivals).toBe(1);
+    expect(tokopedia.position).toEqual({ cheapest: 0, middle: 0, dearest: 1, unmatched: 0 });
+  });
+
+  test('money on the table is what this channel is leaving, not both', async () => {
+    await bothShopsWithOneRival();
+
+    // Shopee undercuts the rival, so nothing is on the table there.
+    expect(Number((await computePairingSnapshot('shopee')).atStake)).toBe(0);
+    // Tokopedia is Rp 60.000 above the cheapest rival.
+    expect(Number((await computePairingSnapshot('tokopedia')).atStake)).toBe(60_000);
+  });
+
+  test('the scorecard and the analytics page cannot disagree', async () => {
+    await bothShopsWithOneRival();
+    const shop = (await getOwnShops()).find((row) => row.marketplace === 'shopee')!;
+
+    const scorecard = await getOwnShopScorecard('shopee', shop);
+    const analytics = await getPricingAnalytics('shopee');
+
+    expect(scorecard.position).toEqual(analytics.position);
+    expect(scorecard.channel).toBe('shopee');
+    expect(scorecard.shopUsername).toBe('i_bricks');
+  });
+
+  test('a shop with no priced listing reports zeros rather than throwing', async () => {
+    const mine = await addStore('i_bricks', { own: true, marketplace: 'shopee' });
+    await addProduct(mine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: null });
+
+    const snapshot = await computePairingSnapshot('shopee');
+
+    expect(snapshot.listings).toBe(0);
+    expect(snapshot.position).toEqual({ cheapest: 0, middle: 0, dearest: 0, unmatched: 0 });
+    expect(Number(snapshot.atStake ?? 0)).toBe(0);
+    expect(snapshot.rivals).toEqual([]);
+  });
+});
+
+/**
+ * The `unstable_cache` stub above is a no-op, on purpose — but a no-op cache
+ * cannot tell "wrapped from outside, correctly" apart from "wrapped from
+ * inside, by mistake" unless something marks what passed through it. These
+ * two tests are that something: the brief's one hard requirement is that
+ * `computePairingSnapshot` stays plain and directly callable — what every
+ * test above calls — while `getPairingSnapshot` is the wrapped entry point
+ * every page calls instead. Collapse that distinction (wrap
+ * `computePairingSnapshot` itself, or make `getPairingSnapshot` an alias for
+ * it) and every test above would keep passing, silently, for the wrong
+ * reason — these are what would actually catch it.
+ */
+describe('cache boundary', () => {
+  test('getPairingSnapshot is the wrapped export; computePairingSnapshot is not', () => {
+    expect(Reflect.get(getPairingSnapshot, cacheStub.WRAPPED)).toBe(true);
+    expect(Reflect.get(computePairingSnapshot, cacheStub.WRAPPED)).toBeUndefined();
+  });
+
+  test('the cache is keyed, windowed and tagged the way both screens depend on', () => {
+    expect(cacheStub.calls).toHaveLength(1);
+    expect(cacheStub.calls[0].keyParts).toEqual(['pairing']);
+    expect(cacheStub.calls[0].options).toEqual({ revalidate: 300, tags: ['pairing'] });
   });
 });

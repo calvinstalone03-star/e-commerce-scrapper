@@ -3,6 +3,7 @@
 import { useRouter } from 'next/navigation';
 import { useEffect, useRef, useState, useTransition } from 'react';
 
+import { CHANNEL_PARAM, withChannel, type Channel } from '@/lib/channel';
 import { toSearchParams } from '@/lib/schemas';
 
 /**
@@ -36,11 +37,14 @@ const DEBOUNCE_MS = 250;
 export function PricingSearch({
   q,
   carried,
+  channel,
 }: {
   /** The term currently in the URL. */
   q: string;
   /** Every other filter, so a search does not silently clear them. */
   carried: Record<string, unknown>;
+  /** Which shop the results are about, so a search does not silently switch it. */
+  channel: Channel | null;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -56,7 +60,7 @@ export function PricingSearch({
     startTransition(() => {
       // `scroll: false`: the box is above the table, and jumping to the top of a
       // page you are already at the top of only makes the layout twitch.
-      router.replace(`/pricing?${params}`, { scroll: false });
+      router.replace(withChannel(`/pricing?${params}`, channel), { scroll: false });
       setDirty(false);
     });
   };
@@ -80,7 +84,12 @@ export function PricingSearch({
       className="flex flex-1 flex-wrap items-center gap-2"
     >
       {/* Carried as hidden fields too, for the submit that happens before this
-          component has hydrated. */}
+          component has hydrated. A GET form's query string comes entirely from
+          its fields when it submits — the `action="/pricing"` above never
+          contributes one of its own — so `kanal` needs its own hidden input
+          exactly like every other carried param, or that native submit lands
+          back on the default channel. */}
+      {channel ? <input type="hidden" name={CHANNEL_PARAM} value={channel} /> : null}
       {[...toSearchParams(carried)].map(([key, value]) => (
         <input key={key} type="hidden" name={key} value={value} />
       ))}

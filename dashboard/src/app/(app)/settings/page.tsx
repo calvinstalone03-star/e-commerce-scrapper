@@ -3,6 +3,7 @@ import type { Metadata } from 'next';
 import { CredentialsForm } from '@/components/CredentialsForm';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui';
 import { currentUsername, usingDefaultPassword } from '@/lib/auth';
+import { channelFromParams } from '@/lib/channel';
 import { getOwnShops } from '@/lib/queries';
 
 /**
@@ -24,12 +25,20 @@ export const metadata: Metadata = {
 /** Set by Vercel on every deployment, and by nothing on a laptop. */
 const isDeployed = Boolean(process.env.VERCEL);
 
-export default async function SettingsPage() {
-  const [shops, username, defaultPassword] = await Promise.all([
+export default async function SettingsPage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const [params, shops, username, defaultPassword] = await Promise.all([
+    searchParams,
     getOwnShops(),
     currentUsername(),
     usingDefaultPassword(),
   ]);
+  // Same resolution the rest of the app uses, so "kanal aktif" here always
+  // names the shop every other screen is currently reporting on.
+  const channel = channelFromParams(params, shops);
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -82,7 +91,14 @@ export default async function SettingsPage() {
             <ul className="divide-y divide-line text-sm">
               {shops.map((shop) => (
                 <li key={shop.id} className="flex items-center justify-between gap-3 py-2">
-                  <span className="font-medium text-foreground">{shop.username}</span>
+                  <span className="font-medium text-foreground">
+                    {shop.username}
+                    {shop.marketplace === channel ? (
+                      <span className="ml-2 rounded-md border border-accent/40 bg-accent/10 px-1.5 py-0.5 text-xs font-normal text-accent">
+                        kanal aktif
+                      </span>
+                    ) : null}
+                  </span>
                   <span className="text-muted">
                     {shop.marketplace} · {shop.products.toLocaleString('id-ID')} produk
                   </span>

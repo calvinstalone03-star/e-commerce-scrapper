@@ -214,6 +214,28 @@ export const pricingAnalyticsSchema = z.object({
 });
 export type PricingAnalytics = z.infer<typeof pricingAnalyticsSchema>;
 
+/**
+ * The overview's answer to "where do we stand in this channel".
+ *
+ * A subset of the pairing snapshot rather than its own query: two numbers that
+ * are supposed to be the same number must come from the same statement, or one
+ * of them is eventually wrong and nobody notices which.
+ */
+export const ownShopScorecardSchema = z.object({
+  channel: marketplaceSchema,
+  shopUsername: z.string(),
+  listings: z.coerce.number().int(),
+  withRivals: z.coerce.number().int(),
+  position: z.object({
+    cheapest: z.coerce.number().int(),
+    middle: z.coerce.number().int(),
+    dearest: z.coerce.number().int(),
+    unmatched: z.coerce.number().int(),
+  }),
+  atStake: moneySchema,
+});
+export type OwnShopScorecard = z.infer<typeof ownShopScorecardSchema>;
+
 export const overviewSchema = z.object({
   stores: z.coerce.number().int(),
   products: z.coerce.number().int(),
@@ -284,7 +306,6 @@ export const pricePositionFilterSchema = z.object({
    */
   extreme: z.enum(['hide', 'show']).default('hide').catch('hide'),
   minRivals: intFromQuery.nonnegative().max(50).optional().catch(undefined),
-  marketplace: marketplaceSchema.optional().catch(undefined),
   sort: z.enum(['gap', 'position', 'rivals', 'price', 'name']).default('gap').catch('gap'),
   dir: sortDirSchema.default('desc').catch('desc'),
   page: intFromQuery.min(1).default(1).catch(1),

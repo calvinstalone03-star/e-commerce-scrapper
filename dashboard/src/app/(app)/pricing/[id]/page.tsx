@@ -1,11 +1,12 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
-import { notFound } from 'next/navigation';
+import { notFound, redirect } from 'next/navigation';
 
 import { PriceChart } from '@/components/PriceChart';
 import { ProductImage } from '@/components/ProductImage';
 import { RivalPriceChart, type SellerDatum } from '@/components/RivalPriceChart';
 import { Badge, Card, CardContent, CardHeader, CardTitle, Stat, TBody, TD, TH, THead, TR, Table } from '@/components/ui';
+import { CHANNEL_PARAM, withChannel } from '@/lib/channel';
 import {
   MARKETPLACE_LABELS,
   formatDateTime,
@@ -47,8 +48,10 @@ export async function generateMetadata({
 
 export default async function PricingDetailPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const { id } = await params;
   const productId = Number(id);
@@ -56,6 +59,24 @@ export default async function PricingDetailPage({
 
   const detail = await getPricePositionDetail(productId);
   if (!detail) notFound();
+
+  // `getPricePositionDetail` already resolved this product's channel to build
+  // its `mine` CTE (`ourListings` filters on `s.marketplace = channel`), so
+  // `product.marketplace` *is* that channel by construction — a second
+  // `channelOfOwnProduct` call here would only re-pay for a value already in
+  // hand.
+  const channel = detail.product.marketplace;
+  const asked = (await searchParams)[CHANNEL_PARAM];
+
+  // The id already names a shop, so a link that arrives with the other channel
+  // (or none) is corrected rather than shown under the wrong heading. Not
+  // inside a try/catch: redirect() throws to signal Next, and a surrounding
+  // catch would swallow that throw and turn this into a normal render.
+  // withChannel() always sets a single query value, so the corrected URL's
+  // `asked` can only equal `channel` on the next request — one hop, not a loop.
+  if (asked !== channel) {
+    redirect(withChannel(`/pricing/${productId}`, channel));
+  }
 
   const { product, rivals } = detail;
   const history = await getPriceHistory(productId);
@@ -101,7 +122,7 @@ export default async function PricingDetailPage({
   return (
     <div className="space-y-6">
       <div className="text-sm">
-        <Link href="/pricing" className="text-muted underline-offset-4 hover:underline">
+        <Link href={withChannel('/pricing', channel)} className="text-muted underline-offset-4 hover:underline">
           ← Semua posisi harga
         </Link>
       </div>
