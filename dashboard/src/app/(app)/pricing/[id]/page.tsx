@@ -194,7 +194,15 @@ export default async function PricingDetailPage({
         </CardContent>
       </Card>
 
-      {product.gapPercent !== null && Math.abs(product.gapPercent) >= 100 ? (
+      {/*
+        Read from product.extreme rather than recomputed from gapPercent here:
+        the server already decided this, symmetrically, the same value the
+        worklist badge and its extreme:'hide' filter use. Re-deriving it from
+        the signed, rival-denominated gapPercent was a second, silently
+        different copy of the rule — it missed the gap entirely whenever the
+        rival was the dearer side, no matter how large.
+      */}
+      {product.extreme ? (
         <p className="rounded-md border border-line bg-surface-muted px-3 py-2.5 text-sm leading-relaxed text-muted">
           Selisihnya sangat besar. LEGO memakai satu nomor set untuk seluruh seri
           minifigure, jadi blind bag satuan, varian keychain, dan satu set penuh sama-sama

@@ -430,7 +430,7 @@ export async function getPricePositions(
       // mistake — one set number spans a single minifigure and a box of sixty.
       // A row with no rival has no gap and is not extreme, so it stays.
       filter.extreme === 'hide'
-        ? sql`AND (b.gap_ratio IS NULL OR b.gap_ratio < ${EXTREME_GAP})`
+        ? sql`AND NOT b.extreme`
         : sql``
     }
     ${
@@ -519,21 +519,25 @@ export async function getPricePositions(
           ELSE round(((m.price - g.cheapest_price) / g.cheapest_price) * 100, 1)
         END AS gap_percent,
         -- Precomputed so the filter reads a column instead of an expression over
-        -- an aggregate, which is the whole reason this query is fast now.
+        -- an aggregate, which is the whole reason this query is fast now. Also
+        -- the one place "is this extreme" is decided, sent to the client as
+        -- extreme (below) so pricing/page.tsx and pricing/[id]/page.tsx read
+        -- it rather than each re-deriving their own copy of this rule from
+        -- gap_percent — which is exactly how they used to disagree with this
+        -- filter and, on the rival-dearer side, with the truth.
         --
         -- Divided by the smaller of the two, not by cheapest_price alone —
         -- unlike gap_percent above. Dividing by the rival unconditionally only
         -- ever flags a gap when WE are the dearer side: when the rival is
         -- dearer the ratio is bounded below 1 for any positive pair, so no
         -- multiple, however large, trips a threshold of 1.0 in that direction.
-        -- least() catches both. gap_ratio never reaches the client — only
-        -- gap_percent is serialized, in "shaped" below — so this changes which
-        -- rows the extreme filter hides, not any number already displayed.
+        -- least() catches both, and leaves the WE-dearer case exactly as it
+        -- was: the rival's price was already the smaller one then.
         CASE
           WHEN m.price IS NULL OR g.cheapest_price IS NULL OR least(m.price, g.cheapest_price) = 0
-            THEN NULL
-          ELSE abs((m.price - g.cheapest_price) / least(m.price, g.cheapest_price))
-        END AS gap_ratio
+            THEN false
+          ELSE abs((m.price - g.cheapest_price) / least(m.price, g.cheapest_price)) >= ${EXTREME_GAP}
+        END AS extreme
       FROM mine m
       LEFT JOIN agg g ON g.mine_id = m.id
     ),
@@ -575,7 +579,8 @@ export async function getPricePositions(
                  cheapest_marketplace AS "cheapestMarketplace",
                  dearest_price AS "dearestPrice",
                  position,
-                 gap_percent AS "gapPercent"
+                 gap_percent AS "gapPercent",
+                 extreme
           FROM page
         ) shaped
       ) AS rows
@@ -864,6 +869,15 @@ export const getPricePositionDetail = cache(async (
         ours === null || cheapestPrice === null || cheapestPrice === 0
           ? null
           : Math.round(((ours - cheapestPrice) / cheapestPrice) * 1000) / 10,
+      // Same rule as getPricePositions's `extreme` column, in JS because this
+      // path computes cheapestPrice from the `rivals` array rather than from
+      // SQL. Divided by the smaller of the two prices, not cheapestPrice
+      // alone, for the same reason: dividing by the rival unconditionally
+      // only ever flags a gap when we are the dearer side.
+      extreme:
+        ours === null || cheapestPrice === null || Math.min(ours, cheapestPrice) === 0
+          ? false
+          : Math.abs(ours - cheapestPrice) / Math.min(ours, cheapestPrice) >= EXTREME_GAP,
     }),
     rivals: rivals.map((row) => rivalRowSchema.parse(row)),
   };

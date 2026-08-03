@@ -177,7 +177,7 @@ export default async function PricingPage({
                       ) : (
                         <Badge variant="muted">tanpa nomor set</Badge>
                       )}
-                      {isExtreme(row.gapPercent) ? (
+                      {row.extreme ? (
                         // A set number is one box, but LEGO gives a whole
                         // collectible series one number: the single blind bag,
                         // the keychain and the box of twelve all read 71049 and
@@ -185,6 +185,12 @@ export default async function PricingPage({
                         // is right and the percentage is meaningless, so say so
                         // where the number is, rather than letting someone
                         // reprice against a different package.
+                        //
+                        // Read from the row rather than recomputed here: the
+                        // server already decided this — the same value the
+                        // extreme:'hide' filter used — so this badge and that
+                        // filter can never again disagree about which rows
+                        // qualify.
                         <Badge variant="muted" title="selisih sebesar ini biasanya beda kemasan — satuan, keychain, atau satu set penuh">
                           periksa kemasan
                         </Badge>
@@ -443,18 +449,6 @@ function PageLinks({
       </div>
     </div>
   );
-}
-
-/**
- * A gap too large to be a pricing decision.
- *
- * Nobody sells the same box at four times a rival's price and keeps selling it,
- * so a number this size is almost always two different packages of one set
- * number rather than a real position. The threshold is deliberately blunt: this
- * asks for a look, it does not hide the row or claim the pairing is wrong.
- */
-function isExtreme(gapPercent: number | null): boolean {
-  return gapPercent !== null && Math.abs(gapPercent) >= 100;
 }
 
 /** `?a=1&a=2` is a bookmark oddity, not an error — take the first and move on. */

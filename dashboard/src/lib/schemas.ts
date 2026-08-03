@@ -121,6 +121,14 @@ export const pricePositionRowSchema = z.object({
   position: z.coerce.number().int().nullable(),
   /** Our price against the cheapest rival, in percent. Positive means dearer. */
   gapPercent: z.coerce.number().nullable(),
+  /**
+   * Gap too large to be a pricing decision — a packaging difference on the
+   * same set number, not a real position. Symmetric: true whichever side is
+   * dearer. The one place this is decided; the client reads it rather than
+   * re-deriving it from `gapPercent`, which is a different, signed figure
+   * with a different (rival-only) denominator that must not double as this.
+   */
+  extreme: z.boolean(),
 });
 export type PricePositionRow = z.infer<typeof pricePositionRowSchema>;
 

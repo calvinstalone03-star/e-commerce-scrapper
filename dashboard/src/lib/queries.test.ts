@@ -369,6 +369,94 @@ describe('price position', () => {
     });
   });
 
+  /**
+   * The worklist badge used to re-derive "is this extreme" client-side from
+   * gapPercent — the same asymmetric formula this file's gap_ratio fix
+   * corrected, reconstructed one query and one server-only import away from
+   * where EXTREME_GAP actually lives. Exposing gap_ratio's boolean form on
+   * the row, read by the client instead of recomputed by it, is what makes a
+   * second copy of the rule impossible rather than merely unlikely.
+   */
+  describe('the extreme field on each row', () => {
+    test('is true when we are the dearer side by just over the threshold', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-a');
+      const rivalPrice = 100_000;
+      const ourPrice = Math.round(rivalPrice * (1 + EXTREME_GAP)) + 1000;
+      await addProduct(mine, { name: 'LEGO 10341 pack', setCode: '10341', price: ourPrice });
+      await addProduct(rival, { name: 'LEGO 10341 lot', setCode: '10341', price: rivalPrice });
+
+      const { rows } = await getPricePositions('shopee', pricePositionFilterSchema.parse({ extreme: 'show' }));
+      expect(rows.find((row) => row.setCode === '10341')).toMatchObject({ extreme: true });
+    });
+
+    test('is false when we are the dearer side by just under the threshold', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-b');
+      const rivalPrice = 100_000;
+      const ourPrice = Math.round(rivalPrice * (1 + EXTREME_GAP)) - 1000;
+      await addProduct(mine, { name: 'LEGO 10342 pack', setCode: '10342', price: ourPrice });
+      await addProduct(rival, { name: 'LEGO 10342 lot', setCode: '10342', price: rivalPrice });
+
+      const { rows } = await getPricePositions('shopee', pricePositionFilterSchema.parse({}));
+      expect(rows.find((row) => row.setCode === '10342')).toMatchObject({ extreme: false });
+    });
+
+    test('is true when the rival is the dearer side by just over the threshold', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-c');
+      const ourPrice = 100_000;
+      const rivalPrice = Math.round(ourPrice * (1 + EXTREME_GAP)) + 1000;
+      await addProduct(mine, { name: 'LEGO 10343 pack', setCode: '10343', price: ourPrice });
+      await addProduct(rival, { name: 'LEGO 10343 lot', setCode: '10343', price: rivalPrice });
+
+      const { rows } = await getPricePositions('shopee', pricePositionFilterSchema.parse({ extreme: 'show' }));
+      expect(rows.find((row) => row.setCode === '10343')).toMatchObject({ extreme: true });
+    });
+
+    test('is false when the rival is the dearer side by just under the threshold', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-d');
+      const ourPrice = 100_000;
+      const rivalPrice = Math.round(ourPrice * (1 + EXTREME_GAP)) - 1000;
+      await addProduct(mine, { name: 'LEGO 10344 pack', setCode: '10344', price: ourPrice });
+      await addProduct(rival, { name: 'LEGO 10344 lot', setCode: '10344', price: rivalPrice });
+
+      const { rows } = await getPricePositions('shopee', pricePositionFilterSchema.parse({}));
+      expect(rows.find((row) => row.setCode === '10344')).toMatchObject({ extreme: false });
+    });
+
+    test('agrees with the hide filter on every row: hiding drops exactly the extreme ones', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-e');
+
+      // Ordinary.
+      await addProduct(mine, { name: 'LEGO 10696 Brick Box', setCode: '10696', price: 577_940 });
+      await addProduct(rival, { name: 'LEGO 10696 Classic Box', setCode: '10696', price: 449_300 });
+      // Extreme, we the dearer side.
+      await addProduct(mine, { name: 'LEGO 71049 box', setCode: '71049', price: 5_250_000 });
+      await addProduct(rival, { name: 'LEGO 71049 satuan', setCode: '71049', price: 25_000 });
+      // Extreme, the rival the dearer side.
+      await addProduct(mine, { name: 'LEGO 75059 pack', setCode: '75059', price: 350_000 });
+      await addProduct(rival, { name: 'LEGO 75059 lot', setCode: '75059', price: 12_500_000 });
+
+      const shown = await getPricePositions('shopee', pricePositionFilterSchema.parse({ extreme: 'show' }));
+      const extremeSetCodes = shown.rows
+        .filter((row) => row.extreme)
+        .map((row) => row.setCode)
+        .sort();
+      expect(extremeSetCodes).toEqual(['71049', '75059']);
+
+      const hidden = await getPricePositions('shopee', pricePositionFilterSchema.parse({}));
+      // Hiding removes exactly the rows the field marks extreme — nothing
+      // more, nothing less. The badge and the filter can no longer disagree,
+      // because they now read the same value instead of each computing their
+      // own.
+      expect(hidden.rows.map((row) => row.setCode).sort()).toEqual(['10696']);
+      expect(hidden.rows.every((row) => row.extreme === false)).toBe(true);
+    });
+  });
+
   test('a product with no rival is never hidden as extreme', async () => {
     const mine = await addStore('i_bricks', { own: true });
     await addProduct(mine, { name: 'LEGO 11024 Baseplate', setCode: '11024', price: 100_000 });
@@ -459,6 +547,63 @@ describe('price position', () => {
     expect(detail!.rivals.map((rival) => rival.storeUsername)).toEqual(['toko_mainan', 'brickstore']);
     expect(detail!.rivals.every((rival) => rival.matchKind === 'set')).toBe(true);
     expect(detail!.product.position).toBe(3);
+  });
+
+  /**
+   * The detail page's own explanatory paragraph (pricing/[id]/page.tsx) had
+   * the identical client-side re-derivation as the worklist badge, computed
+   * from this same `product`. Pinned here because getPricePositionDetail
+   * computes cheapestPrice and the gap in JS — a separate code path from
+   * getPricePositions's SQL, so a fix to one does not imply the other.
+   */
+  describe('the extreme field on the detail view', () => {
+    test('is true when we are the dearer side by just over the threshold', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-f');
+      const rivalPrice = 100_000;
+      const ourPrice = Math.round(rivalPrice * (1 + EXTREME_GAP)) + 1000;
+      const productId = await addProduct(mine, { name: 'LEGO 10345 pack', setCode: '10345', price: ourPrice });
+      await addProduct(rival, { name: 'LEGO 10345 lot', setCode: '10345', price: rivalPrice });
+
+      const detail = await getPricePositionDetail(productId);
+      expect(detail!.product.extreme).toBe(true);
+    });
+
+    test('is false when we are the dearer side by just under the threshold', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-g');
+      const rivalPrice = 100_000;
+      const ourPrice = Math.round(rivalPrice * (1 + EXTREME_GAP)) - 1000;
+      const productId = await addProduct(mine, { name: 'LEGO 10346 pack', setCode: '10346', price: ourPrice });
+      await addProduct(rival, { name: 'LEGO 10346 lot', setCode: '10346', price: rivalPrice });
+
+      const detail = await getPricePositionDetail(productId);
+      expect(detail!.product.extreme).toBe(false);
+    });
+
+    test('is true when the rival is the dearer side by just over the threshold', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-h');
+      const ourPrice = 100_000;
+      const rivalPrice = Math.round(ourPrice * (1 + EXTREME_GAP)) + 1000;
+      const productId = await addProduct(mine, { name: 'LEGO 10347 pack', setCode: '10347', price: ourPrice });
+      await addProduct(rival, { name: 'LEGO 10347 lot', setCode: '10347', price: rivalPrice });
+
+      const detail = await getPricePositionDetail(productId);
+      expect(detail!.product.extreme).toBe(true);
+    });
+
+    test('is false when the rival is the dearer side by just under the threshold', async () => {
+      const mine = await addStore('i_bricks', { own: true });
+      const rival = await addStore('rival-i');
+      const ourPrice = 100_000;
+      const rivalPrice = Math.round(ourPrice * (1 + EXTREME_GAP)) - 1000;
+      const productId = await addProduct(mine, { name: 'LEGO 10348 pack', setCode: '10348', price: ourPrice });
+      await addProduct(rival, { name: 'LEGO 10348 lot', setCode: '10348', price: rivalPrice });
+
+      const detail = await getPricePositionDetail(productId);
+      expect(detail!.product.extreme).toBe(false);
+    });
   });
 
   test('a product id that is not ours has no detail to show', async () => {
