@@ -56,10 +56,38 @@ export function priceChangeLink(change: PriceChange): string {
   // nothing to match them on. `/products` searches names and spans both
   // marketplaces.
   if (change.name) {
-    return `/products?${new URLSearchParams({ q: change.name }).toString()}`;
+    return `/products?${new URLSearchParams({ q: searchableName(change.name) }).toString()}`;
   }
 
   return '/products';
+}
+
+/**
+ * The longest name `/products?q=` will actually accept.
+ *
+ * `productFilterSchema.q` is `.max(200).catch(undefined)` (schemas.ts:269), and
+ * that `catch` is the problem: a longer name does not fail the request, it
+ * discards the filter and lands the reader on the unfiltered list — 17,451 rows
+ * for a link whose whole job was to name one of them. Marketplace listing titles
+ * run long enough for this to be ordinary rather than exotic.
+ *
+ * 180 rather than 200 leaves room for the trim the schema applies before it
+ * measures, and a prefix is a perfectly good search: `/products` matches names
+ * by substring, so the first 180 characters still find the listing.
+ */
+const MAX_QUERY_NAME = 180;
+
+function searchableName(name: string): string {
+  const trimmed = name.trim();
+  if (trimmed.length <= MAX_QUERY_NAME) return trimmed;
+
+  const cut = trimmed.slice(0, MAX_QUERY_NAME);
+  // Slicing counts UTF-16 units, so a cut can land between the halves of an
+  // emoji and leave a lone surrogate, which percent-encodes as U+FFFD and
+  // matches nothing. Drop the orphan instead.
+  const last = cut.charCodeAt(cut.length - 1);
+  const whole = last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+  return whole.trimEnd();
 }
 
 export function newStoreLink(store: NewStore): string {

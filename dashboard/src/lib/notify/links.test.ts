@@ -71,6 +71,45 @@ describe('priceChangeLink', () => {
   test('falls back to the product list when a rival has neither set number nor name', () => {
     expect(priceChangeLink(change({ setCode: null, name: null }))).toBe('/products');
   });
+
+  /**
+   * The link has to survive the schema at the other end.
+   *
+   * `productFilterSchema.q` is `.max(200).catch(undefined)`, and the `catch` is
+   * what makes this quiet: an over-long `q` is not rejected, it is dropped, and
+   * the reader arrives at the unfiltered 17,451-row list instead of the one
+   * listing the notification was about.
+   */
+  test('keeps the name short enough that the products filter does not discard it', () => {
+    const name = `Rak Display Akrilik Custom ${'Panjang Sekali '.repeat(30)}`;
+    expect(name.length).toBeGreaterThan(200);
+
+    const link = priceChangeLink(change({ setCode: null, name }));
+    const q = new URL(link, 'https://dash.example').searchParams.get('q');
+
+    expect(q).not.toBeNull();
+    expect(q!.length).toBeLessThanOrEqual(200);
+    // A prefix, not a mangled name: `/products` matches by substring, so this
+    // still finds the listing.
+    expect(name.startsWith(q!)).toBe(true);
+    expect(q!.length).toBeGreaterThan(100);
+  });
+
+  test('does not cut an emoji in half on the way', () => {
+    // The 180th UTF-16 unit lands inside the surrogate pair.
+    const name = `${'a'.repeat(179)}😀${'b'.repeat(60)}`;
+    const q = new URL(priceChangeLink(change({ setCode: null, name })), 'https://dash.example')
+      .searchParams.get('q');
+
+    expect(q).toBe('a'.repeat(179));
+    expect(q).not.toContain('�');
+  });
+
+  test('leaves an ordinary name exactly as it is', () => {
+    expect(priceChangeLink(change({ setCode: null, name: 'Rak Display Akrilik' }))).toBe(
+      '/products?q=Rak+Display+Akrilik',
+    );
+  });
 });
 
 describe('newStoreLink', () => {
