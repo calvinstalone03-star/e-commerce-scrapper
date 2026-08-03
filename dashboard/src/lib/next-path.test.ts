@@ -38,6 +38,27 @@ describe('safeNextPath', () => {
     expect(safeNextPath('\t//evil.example')).toBe('/');
   });
 
+  // Doubling the control character does not, by itself, discriminate a
+  // stripping regex that lost its `/g` flag: with only that line broken this
+  // still comes back `/`, because the same-origin check below independently
+  // re-parses whatever survives through the real `URL` constructor, which
+  // strips tab/CR/LF itself regardless of what our own regex left behind —
+  // verified by breaking each check alone and confirming the other still
+  // catches it. Under the correct implementation, this case is actually
+  // decided by the `//` check above (full stripping collapses it to
+  // `///evil.example` before the same-origin check ever runs); it only goes
+  // red when both checks are broken at once, which is what it proves instead:
+  // the same-origin check is not dead code, it is an independent layer.
+  test('refuses a doubled control character, and stays same-origin when resolved', () => {
+    const base = 'https://dashboard.example';
+    expect(safeNextPath('/\t\t//evil.example')).toBe('/');
+    expect(new URL(safeNextPath('/\t\t//evil.example'), base).origin).toBe(base);
+    expect(safeNextPath('/\n\n//evil.example')).toBe('/');
+    expect(new URL(safeNextPath('/\n\n//evil.example'), base).origin).toBe(base);
+    expect(safeNextPath('/\r\r//evil.example')).toBe('/');
+    expect(new URL(safeNextPath('/\r\r//evil.example'), base).origin).toBe(base);
+  });
+
   test('refuses an absolute URL', () => {
     expect(safeNextPath('https://evil.example')).toBe('/');
     expect(safeNextPath('http://evil.example')).toBe('/');
