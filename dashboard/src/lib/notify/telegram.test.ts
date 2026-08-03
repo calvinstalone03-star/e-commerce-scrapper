@@ -200,4 +200,16 @@ describe('sendMessages', () => {
     await expect(sendMessages(['x'], config(fetchImpl))).rejects.toThrow(/chat not found/);
     await expect(sendMessages(['x'], config(fetchImpl))).rejects.not.toThrow(/500/);
   });
+
+  test('rejects ok:true under error status — status veto', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ ok: true }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(sendMessages(['x'], config(fetchImpl))).rejects.toThrow(/500/);
+  });
 });
