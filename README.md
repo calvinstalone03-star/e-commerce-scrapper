@@ -601,6 +601,67 @@ default, which is what the per-transaction `SET LOCAL` is for. If those three
 seconds matter more than remote access, run the dashboard locally — it is the
 same code, and `scripts/dashboard-server.sh` already does it.
 
+## 8. Telegram notifications
+
+The dashboard tells you where you stand when you open it. This tells you when
+something moved without you opening anything: a price change, a shop you have
+never seen, or a new listing in a shop you already track.
+
+It runs **in the deployment**, not in the scraper — a notification is read on a
+phone, and a link to `127.0.0.1:3100` is not. The trigger comes from here,
+because Vercel's Hobby plan caps cron jobs at once per day.
+
+**1. A bot.** Message `@BotFather`, `/newbot`, keep the token. Message
+`@userinfobot` to get your own chat id.
+
+**2. Three variables on the deployment.**
+
+```bash
+vercel env add TELEGRAM_BOT_TOKEN production
+vercel env add TELEGRAM_CHAT_ID production
+vercel env add NOTIFY_SECRET production   # anything long and random
+```
+
+**3. Two variables here,** in the repo root `.env`:
+
+```bash
+NOTIFY_URL=https://<your-deployment>
+NOTIFY_SECRET=<the same value you gave Vercel>
+```
+
+**4. Trigger it after a scrape.**
+
+```cron
+0 6 * * * cd /path/to/ecom-scraper && .venv/bin/ecom-scraper run --mode store --pages 5 >> logs/store.log 2>&1
+5 7 * * * cd /path/to/ecom-scraper && scripts/notify.sh >> logs/notify.log 2>&1
+```
+
+The first run after setup sends nothing: the watermark is seeded to what is
+already in the database, because 12,000 listings you have had for weeks are not
+news.
+
+### What counts as a price change
+
+A snapshot is compared against the newest one at least `NOTIFY_MIN_GAP_HOURS`
+older (12 by default), not against whatever came immediately before it.
+
+Captures taken hours apart disagree about price without anything having been
+repriced. In this database, 37 of 38 snapshot pairs taken 1.5–3.5 hours apart
+differ, against 3 of 1,335 pairs taken a day apart — and `sold` is byte-identical
+across the near pairs, which no genuinely repriced listing would be. Comparing
+against the immediate predecessor reports mostly artefacts.
+
+Set `NOTIFY_MIN_GAP_HOURS=0` to turn the rule off and see the difference.
+
+### If it goes quiet
+
+Silence is correct when nothing changed. It is also what a notifier reading the
+wrong database looks like. So if the newest snapshot it can see is older than
+`NOTIFY_STALE_HOURS` (36), it says so instead — at most once a day.
+
+The usual cause is step 5 of section 7: the ingest server still writing to the
+laptop while the deployment reads Neon.
+
 ## Exit codes
 
 | Code | Meaning |
