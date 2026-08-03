@@ -13,11 +13,21 @@ import { EXTREME_GAP } from '@/lib/queries';
  * before `DISTINCT ON (product_ref)` picks the newest price, rather than
  * taking the newest price for the whole table and filtering after, is what
  * makes this cheap: measured at 28ms for every own set at once, against
- * 9.5ms asked per set (77 sets the naive way, so 9.5ms x 77). `latest` below
- * only ever walks `price_snapshots` for the candidate products, so
- * `ix_price_snapshots_product_ref_scraped_at` (migrations/001_init.sql:94)
- * answers each one with an index seek instead of the planner scanning for
- * distinct product_refs across the whole table.
+ * 9.5ms asked per set (77 sets the naive way, so 9.5ms x 77).
+ *
+ * What that scoping actually buys, checked with `EXPLAIN (ANALYZE, BUFFERS)`
+ * against production: Postgres answers `latest` with a sequential scan of
+ * the whole `price_snapshots` table (19,796 rows — cheap at this size)
+ * hashed and probed by `candidates` (6,681 rows), not an index or bitmap
+ * scan on `ix_price_snapshots_product_ref_scraped_at`
+ * (migrations/001_init.sql:94). That is the right plan today: reading a
+ * 19,796-row table once beats thousands of individual index probes. The win
+ * is not less I/O, it is less downstream work — the sort, dedup and
+ * grouping after `latest` process about 6,681 candidate rows, not one row
+ * per product in the whole catalogue. It also leaves the planner a way out
+ * as `price_snapshots` keeps growing and a full scan stops being the cheap
+ * choice: it can switch to the index without this query changing, an option
+ * an unscoped `DISTINCT ON` over every product's history would not have.
  *
  * No channel parameter, unlike `ourListings` in `queries.ts`. The dashboard
  * needs that split because the Shopee shop and the Tokopedia shop list the
