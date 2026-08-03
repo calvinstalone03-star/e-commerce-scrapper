@@ -20,8 +20,15 @@ fi
 
 # Only the two keys this needs, so a malformed line elsewhere in .env cannot be
 # executed by a blanket `source`.
-NOTIFY_URL="$(grep -E '^NOTIFY_URL=' "$ROOT/.env" | head -1 | cut -d= -f2-)"
-NOTIFY_SECRET="$(grep -E '^NOTIFY_SECRET=' "$ROOT/.env" | head -1 | cut -d= -f2-)"
+#
+# `|| true` on each: a key absent from .env (not merely empty) makes `grep`
+# exit 1, and `pipefail` carries that exit status into the assignment. Under
+# `set -e` that would abort the script on this line — before the `-z` check
+# below ever runs, and errexit prints nothing on its way out, so it would die
+# silently. Swallowing it here means "missing" and "present but empty" both
+# reach that check, which is the one place this script explains itself.
+NOTIFY_URL="$(grep -E '^NOTIFY_URL=' "$ROOT/.env" | head -1 | cut -d= -f2-)" || true
+NOTIFY_SECRET="$(grep -E '^NOTIFY_SECRET=' "$ROOT/.env" | head -1 | cut -d= -f2-)" || true
 
 if [ -z "${NOTIFY_URL:-}" ] || [ -z "${NOTIFY_SECRET:-}" ]; then
     echo "NOTIFY_URL or NOTIFY_SECRET missing from $ROOT/.env" >&2
