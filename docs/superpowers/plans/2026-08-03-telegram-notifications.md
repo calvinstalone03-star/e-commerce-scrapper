@@ -1259,7 +1259,7 @@ npm run test -- src/lib/notify/links.test.ts
 npx tsc --noEmit
 ```
 
-Expected: 11 tests pass.
+Expected: 12 tests pass (4 for `resolveBaseUrl`, 4 for `priceChangeLink`, 1 each for `newStoreLink` and `newProductLink`, 2 for `absolute`).
 
 - [ ] **Step 5: Commit**
 
