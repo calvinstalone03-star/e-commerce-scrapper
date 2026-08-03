@@ -49,7 +49,7 @@ async function addStore(id: number, username: string, isOwn = false): Promise<vo
     VALUES (${id}, 'shopee', ${id * 1000}, ${username}, ${isOwn}, ${BASE}, ${BASE})`;
 }
 
-async function addProduct(id: number, storeId: number, name: string): Promise<void> {
+async function addProduct(id: number, storeId: number | null, name: string): Promise<void> {
   await sql`
     INSERT INTO products (id, marketplace, item_id, shop_ref, name, set_code, url, first_seen, last_seen)
     VALUES (${id}, 'shopee', ${id * 100}, ${storeId}, ${name},
@@ -163,6 +163,30 @@ describe('price changes', () => {
     await addSnapshot(1, 236850, 2);
 
     expect((await collect(12)).priceChanges).toHaveLength(0);
+  });
+
+  test('still reports the change when the shop was never resolved', async () => {
+    // shop_ref IS NULL is real and expected (migrations/001_init.sql:50):
+    // keyword search results occasionally omit shop detail. The LEFT JOIN in
+    // selectPriceChanges then has no store row to read, so is_own, store_id
+    // and username all come back SQL NULL. An unresolved shop must not
+    // suppress a real price movement, and must not silently become "ours".
+    await addProduct(1, null, 'LEGO Technic 42218 John Deere');
+    await addSnapshot(1, 186850, 0);
+    await addSnapshot(1, 211850, 24);
+
+    const { priceChanges } = await collect(12);
+
+    expect(priceChanges).toHaveLength(1);
+    expect(priceChanges[0].previousPrice).toBe('186850');
+    expect(priceChanges[0].price).toBe('211850');
+    // Exact matches, not truthiness: `?? false` must produce the literal
+    // `false`, not merely something falsy, and the other two must be `null`
+    // rather than `undefined` — either would let `row.is_own` slip through
+    // unconverted if the `?? false` were ever dropped.
+    expect(priceChanges[0].isOwn).toBe(false);
+    expect(priceChanges[0].storeId).toBeNull();
+    expect(priceChanges[0].username).toBeNull();
   });
 });
 
