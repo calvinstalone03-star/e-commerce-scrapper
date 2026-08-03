@@ -116,7 +116,7 @@ curl -fsS -X POST \
   "$NOTIFY_URL/api/notify"
 ```
 
-Tidak ada `crons` di `vercel.json`. Konsekuensi yang diterima sadar: kalau
+Tidak ada `crons` di `dashboard/vercel.json`. Konsekuensi yang diterima sadar: kalau
 laptop mati, tidak ada notifikasi. Itu benar secara logika — kalau laptop mati,
 tidak ada yang men-scrape, jadi tidak ada yang perlu dinotifikasi. Dan karena
 watermark berbasis id (di bawah), tidak ada yang **terlewat**: kejadian yang
@@ -490,12 +490,26 @@ dashboard/src/lib/notify/links.ts            kejadian → URL dashboard
 dashboard/src/lib/notify/format.ts           kejadian → HTML, pelipatan, pemecahan
 dashboard/src/lib/notify/telegram.ts         klien Bot API
 dashboard/src/app/api/notify/route.ts        penjaga + orkestrasi
-dashboard/vercel.json                        maxDuration (tanpa crons)
 ```
 
 Pemisahannya mengikuti aturan yang sama dengan sisa app ini: `format.ts` dan
 `links.ts` tidak menyentuh jaringan maupun database, jadi keduanya dapat dites
 sebagai fungsi murni — dan justru di situ hampir semua bug format bersembunyi.
+
+**Tidak ada `vercel.json` yang disentuh.** Tanpa `crons`, tidak ada yang perlu
+dikonfigurasi: Fluid Compute memberi 300 detik sebagai default di semua plan, dan
+route ini mengerjakan tiga query lalu satu POST ke Telegram — hitungan sub-detik,
+bukan sesuatu yang butuh `maxDuration`. Berkas `dashboard/vercel.json` memang
+ada di branch `pin-vercel-framework` yang belum digabung, tapi ia menyelesaikan
+masalah lain (preset framework) dan tidak perlu diubah untuk fitur ini.
+
+Deployment-nya adalah projek Vercel milik Calvin, `e-commerce-scrapper`, ter-link
+ke repo GitHub `calvinstalone03-star/e-commerce-scrapper` dengan Root Directory
+`dashboard`. Konsekuensinya untuk alur kerja: **deploy terjadi saat merge ke
+`main`**, bukan lewat `vercel --prod` dari mesin ini. Direktori
+`dashboard/.vercel/` di laptop menunjuk projek lain bernama `mcl-dashboard` —
+sisa percobaan CLI, ter-gitignore, tidak pernah ikut ke repo, dan tidak
+memengaruhi deployment yang sebenarnya.
 
 ## Kasus tepi
 
@@ -579,7 +593,8 @@ migrasi.
   5), prasyarat agar fitur ini berguna, tapi bukan kode. Penjaga kebasian ada
   supaya kelalaian ini terlihat, bukan supaya tidak perlu dikerjakan.
 - **Cron Vercel.** Tidak dipasang; pemicunya laptop. Kalau nanti pindah ke plan
-  Pro, `vercel.json` tinggal ditambahi `crons` dan route-nya tidak berubah.
+  Pro, `dashboard/vercel.json` tinggal ditambahi `crons` dan route-nya tidak
+  berubah.
 - **Menemukan kenapa dua tangkapan berdekatan melaporkan harga berbeda.**
   Pekerjaan tersendiri, di `scraper/ingest.py`, dan lebih penting daripada spec
   ini — ia menyentuh kolom `price` yang dipakai seluruh dashboard posisi harga,
