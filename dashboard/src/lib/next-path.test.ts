@@ -24,6 +24,20 @@ describe('safeNextPath', () => {
     expect(safeNextPath('/\\evil.example')).toBe('/');
   });
 
+  // The URL spec strips ASCII tab, CR and LF from anywhere in its input
+  // before it ever looks at `//` — so a naive `startsWith('//')` sees
+  // `/<tab>//evil.example` as an ordinary relative path, while every browser
+  // sees it as protocol-relative the moment the tab is gone.
+  test('refuses a protocol-relative path hidden by a control character the URL spec strips', () => {
+    expect(safeNextPath('/\t//evil.example')).toBe('/');
+    expect(safeNextPath('/\n//evil.example')).toBe('/');
+    expect(safeNextPath('/\r//evil.example')).toBe('/');
+  });
+
+  test('refuses the same trick with the control character before the leading slash', () => {
+    expect(safeNextPath('\t//evil.example')).toBe('/');
+  });
+
   test('refuses an absolute URL', () => {
     expect(safeNextPath('https://evil.example')).toBe('/');
     expect(safeNextPath('http://evil.example')).toBe('/');
