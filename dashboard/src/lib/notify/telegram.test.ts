@@ -87,6 +87,53 @@ describe('sendMessages', () => {
     expect(calls).toHaveLength(2);
   });
 
+  /**
+   * The sleep between the two attempts runs inside `sql.begin`, holding
+   * `FOR UPDATE` on `notify_watermark`, and no AbortSignal covers it — the
+   * timeout in `postOnce` bounds a request, not a wait. Obeying a 42-second
+   * `retry_after` is therefore 42 seconds of a serverless function's budget
+   * spent holding a lock, and a run killed there rolls back: the watermark
+   * stays put and the next run rebuilds the same digest into the same limit.
+   * Walking away costs nothing precisely because the watermark did not move.
+   */
+  test('abandons the run rather than sleeping out a retry_after it cannot afford', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            ok: false,
+            description: 'Too Many Requests: retry after 42',
+            parameters: { retry_after: 42 },
+          }),
+          { status: 429, headers: { 'content-type': 'application/json' } },
+        ),
+    ) as unknown as typeof fetch;
+
+    const started = Date.now();
+    await expect(sendMessages(['x'], config(fetchImpl))).rejects.toThrow(/42s/);
+
+    // No retry, and no wait: both would mean the sleep happened.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test('still waits out a retry_after short enough to be worth it', async () => {
+    let call = 0;
+    const fetchImpl = vi.fn(async () => {
+      call += 1;
+      if (call === 1) {
+        return new Response(
+          JSON.stringify({ ok: false, description: 'Too Many Requests', parameters: { retry_after: 1 } }),
+          { status: 429, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return ok();
+    }) as unknown as typeof fetch;
+
+    expect(await sendMessages(['x'], config(fetchImpl))).toBe(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   test('stops at the first failure rather than sending the rest out of order', async () => {
     let call = 0;
     const fetchImpl = vi.fn(async () => {

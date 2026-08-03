@@ -18,6 +18,55 @@ export const TELEGRAM_MAX_CHARS = 4096;
 /** Below this, listings that moved by the same amount are a coincidence. */
 export const FOLD_MIN_GROUP = 3;
 
+/**
+ * How many entries a group prints before it says how many it left out.
+ *
+ * Promised by the design (spec lines 368-371) and, separately, needed: a group
+ * is as long as the events allow, and the events allow a lot. 400 price changes
+ * rendered in full are 22 messages; a shop whose 1,600 listings arrive after its
+ * own row passed the store watermark — `ingest.py:372` commits one transaction
+ * per captured page, so that split is the normal case rather than a race — are
+ * 63. Telegram accepts roughly 20 messages a minute to one chat, so an
+ * uncapped digest does not merely arrive slowly, it arrives as 429s.
+ *
+ * Twelve, measured rather than guessed: the widest entry this renders is a
+ * price change with a full listing name, its two prices and its link, about 240
+ * characters, and all four groups filled to twelve comes to 9,200 characters —
+ * three messages, one clear of the cap below. Twenty would be around 15,000,
+ * which is four or five, and at the cap the truncation stops being a count and
+ * starts being a whole group vanishing: the reader would lose "Produk baru"
+ * rather than see twelve of them and a remainder.
+ */
+export const MAX_ENTRIES_PER_GROUP = 12;
+
+/**
+ * How many messages one run may send, whatever the data does.
+ *
+ * The entry cap above already bounds the digest for realistic events; this
+ * bounds it for unrealistic ones, because a single listing name can be
+ * thousands of characters on its own and no per-entry count can see that.
+ *
+ * Four. Telegram's ceiling is about 20 messages a minute to one chat, and the
+ * cost of touching it is out of all proportion to the benefit: `sendMessages`
+ * would sleep off the 429 inside `sql.begin`, holding `FOR UPDATE` on
+ * `notify_watermark`, and a run killed by the function time limit while holding
+ * that lock rolls back — the watermark does not move, the next run rebuilds the
+ * same oversized digest, and the backlog only grows. Four leaves the run at a
+ * fifth of the ceiling even if the previous run's messages are still inside the
+ * same minute.
+ */
+export const MAX_MESSAGES = 4;
+
+/**
+ * What a message says when the digest itself, not just one group, was cut.
+ *
+ * The per-group remainder lines are the ordinary case and say exactly how many
+ * were dropped. This one cannot: what it truncates is whole groups, whose
+ * headings may not have been rendered at all. It says the counts already shown
+ * are still honest, and points at the place that has everything.
+ */
+const DIGEST_TRUNCATED = '<i>… sisanya dipotong. Angka di tiap judul tetap jumlah penuhnya.</i>';
+
 const rupiah = new Intl.NumberFormat('id-ID', {
   style: 'currency',
   currency: 'IDR',
@@ -58,10 +107,32 @@ function link(baseUrl: string, path: string, label: string): string {
   return `<a href="${escapeHtml(absolute(baseUrl, path))}">${escapeHtml(label)}</a>`;
 }
 
+/**
+ * A shop, named and escaped.
+ *
+ * Escaping is this function's own job rather than each caller's. The four call
+ * sites all wrapped it correctly, but the cost of the fifth one forgetting is
+ * the worst failure in this module: an unescaped `<` in a username is a
+ * Telegram 400 for the whole message, `sendMessages` throws, the transaction
+ * rolls back, and the watermark never advances again — the digest is rebuilt
+ * and rejected on every run after that, with no way out that does not involve a
+ * human. A function that returns Telegram HTML should return Telegram HTML.
+ */
 function shopLabel(username: string | null, marketplace: string): string {
   const shop = username ?? 'toko tak dikenal';
   const channel = marketplace === 'tokopedia' ? 'Tokopedia' : 'Shopee';
-  return `${shop} · ${channel}`;
+  return escapeHtml(`${shop} · ${channel}`);
+}
+
+/**
+ * The promised tail of a group that was cut (spec lines 368-371).
+ *
+ * Counts listings rather than printed entries, so that what is shown plus what
+ * this names always adds back up to the number in the heading — a folded entry
+ * stands for every listing folded into it.
+ */
+function remainder(dropped: number): string[] {
+  return dropped > 0 ? [`  … ${plain.format(dropped)} lainnya`] : [];
 }
 
 export type FoldedGroup =
@@ -128,13 +199,17 @@ function renderPriceGroup(
   if (changes.length === 0) return [];
 
   // The heading always states the true total, even when the body below it is
-  // later truncated for length. A count that shrinks with the message would be
-  // a lie about how much moved.
+  // truncated for length. A count that shrinks with the message would be a lie
+  // about how much moved.
   const lines = [`<b>${escapeHtml(heading)} — ${plain.format(changes.length)}</b>`, ''];
 
-  for (const entry of foldPriceChanges(changes)) {
+  const shown = foldPriceChanges(changes).slice(0, MAX_ENTRIES_PER_GROUP);
+  let printed = 0;
+
+  for (const entry of shown) {
     if (entry.kind === 'folded') {
-      lines.push(`  <b>${escapeHtml(shopLabel(entry.username, entry.marketplace))}</b>`);
+      printed += entry.members.length;
+      lines.push(`  <b>${shopLabel(entry.username, entry.marketplace)}</b>`);
       lines.push(
         `  ${escapeHtml(signedMoney(entry.delta))} serempak di ${plain.format(entry.members.length)} listing`,
       );
@@ -143,11 +218,12 @@ function renderPriceGroup(
       continue;
     }
 
+    printed += 1;
     const change = entry.change;
     const from = Number(change.previousPrice);
     const to = Number(change.price);
     lines.push(
-      `  • ${escapeHtml(change.name ?? 'tanpa nama')} — ${escapeHtml(shopLabel(change.username, change.marketplace))}`,
+      `  • ${escapeHtml(change.name ?? 'tanpa nama')} — ${shopLabel(change.username, change.marketplace)}`,
     );
     lines.push(`    ${escapeHtml(`${money(from)} → ${money(to)}`)}  (${escapeHtml(percent(from, to))})`);
     lines.push(
@@ -156,32 +232,38 @@ function renderPriceGroup(
     lines.push('');
   }
 
+  const tail = remainder(changes.length - printed);
+  if (tail.length > 0) lines.push(...tail, '');
   return lines;
 }
 
 function renderNewStores(stores: NewStore[], baseUrl: string): string[] {
   if (stores.length === 0) return [];
   const lines = [`<b>Toko baru — ${plain.format(stores.length)}</b>`, ''];
-  for (const store of stores) {
+  const shown = stores.slice(0, MAX_ENTRIES_PER_GROUP);
+  for (const store of shown) {
     lines.push(
-      `  • ${escapeHtml(store.name ?? store.username)} — ${escapeHtml(shopLabel(store.username, store.marketplace))}`,
+      `  • ${escapeHtml(store.name ?? store.username)} — ${shopLabel(store.username, store.marketplace)}`,
     );
     lines.push(`    ${plain.format(store.products)} listing`);
     lines.push(`    ${link(baseUrl, newStoreLink(store), 'buka toko')}`);
     lines.push('');
   }
+  const tail = remainder(stores.length - shown.length);
+  if (tail.length > 0) lines.push(...tail, '');
   return lines;
 }
 
 function renderNewProducts(products: NewProduct[], baseUrl: string): string[] {
   if (products.length === 0) return [];
   const lines = [`<b>Produk baru di toko lama — ${plain.format(products.length)}</b>`, ''];
-  for (const product of products) {
+  const shown = products.slice(0, MAX_ENTRIES_PER_GROUP);
+  for (const product of shown) {
     lines.push(
-      `  • ${escapeHtml(product.name ?? 'tanpa nama')} — ${escapeHtml(shopLabel(product.username, product.marketplace))}  ${link(baseUrl, newProductLink(product), 'lihat')}`,
+      `  • ${escapeHtml(product.name ?? 'tanpa nama')} — ${shopLabel(product.username, product.marketplace)}  ${link(baseUrl, newProductLink(product), 'lihat')}`,
     );
   }
-  lines.push('');
+  lines.push(...remainder(products.length - shown.length), '');
   return lines;
 }
 
@@ -215,7 +297,7 @@ function dropDanglingAnchor(sliced: string): string {
  * land inside the line's trailing anchor, so `dropDanglingAnchor` backs it up
  * far enough to leave nothing but a closed `<a>` or none at all.
  */
-function paginate(lines: string[]): string[] {
+function pack(lines: string[]): string[] {
   const messages: string[] = [];
   let current: string[] = [];
   let length = 0;
@@ -240,6 +322,31 @@ function paginate(lines: string[]): string[] {
 
   flush();
   return messages;
+}
+
+/**
+ * Close the last message this run is allowed to send with the notice.
+ *
+ * Whole lines are dropped to make room, never characters: every line here is
+ * anchor-balanced already, so removing one cannot leave the unbalanced tag a
+ * mid-line cut would.
+ */
+function closeWithNotice(message: string): string {
+  const lines = [...message.split('\n'), DIGEST_TRUNCATED];
+  while (lines.join('\n').length > TELEGRAM_MAX_CHARS && lines.length > 1) {
+    lines.splice(lines.length - 2, 1);
+  }
+  return lines.join('\n');
+}
+
+/** Pack, then hold the result to `MAX_MESSAGES` — see the constant for why. */
+function paginate(lines: string[]): string[] {
+  const messages = pack(lines);
+  if (messages.length <= MAX_MESSAGES) return messages;
+
+  const kept = messages.slice(0, MAX_MESSAGES);
+  kept[kept.length - 1] = closeWithNotice(kept[kept.length - 1]);
+  return kept;
 }
 
 export function renderDigest(
