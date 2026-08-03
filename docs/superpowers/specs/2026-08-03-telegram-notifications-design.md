@@ -255,6 +255,9 @@ CROSS JOIN LATERAL (
   FROM price_snapshots ps
   WHERE ps.product_ref = b.product_ref
     AND ps.price IS NOT NULL
+    -- Tanpa ini, pada ambang 0 baris itu sendiri lolos predikat waktu dan
+    -- ORDER BY memilihnya sebagai pembanding terdekat. Hasilnya nol, selalu.
+    AND ps.id <> b.id
     AND ps.scraped_at <= b.scraped_at - make_interval(hours => $2)
   ORDER BY ps.scraped_at DESC, ps.id DESC
   LIMIT 1
@@ -574,22 +577,31 @@ yang benar harus mereproduksinya persis. Watermark disetel ke keadaan akhir
 29 Juli — `last_snapshot_id = 12508`, `last_product_id = 12950`,
 `last_store_id = 248` — lalu notifier dijalankan:
 
-| Keluaran | Harus |
-|---|---|
-| Perubahan harga (`NOTIFY_MIN_GAP_HOURS = 12`) | **3** |
-| Perubahan harga (`NOTIFY_MIN_GAP_HOURS = 0`) | **40** |
-| Toko baru | **0** |
-| Produk baru di toko lama | **4** |
-| Produk baru di toko baru (tidak dikirim) | **0** |
+| Watermark | Keluaran | Harus |
+|---|---|---|
+| 12508 / 12950 / 248 | Perubahan harga (ambang 12 jam) | **3** |
+| 12508 / 12950 / 248 | Toko baru | **0** |
+| 12508 / 12950 / 248 | Produk baru di toko lama | **4** |
+| 12508 / 12950 / 248 | Produk baru di toko baru (tidak dikirim) | **0** |
+| snapshot 0 | Perubahan harga (ambang **0** jam) | **40** |
+| snapshot 0 | Perubahan harga (ambang 12 jam) | **3** |
 
-Baris kedua adalah tes regresi untuk aturan jarak minimum: kalau angkanya bukan
-40 saat ambang dimatikan, query-nya tidak setara dengan `lag()` polos dan
-selisihnya ada di tempat lain. Kalau angkanya bukan 3 saat ambang 12 jam,
-aturannya tidak bekerja.
+Dua baris terakhir yang membuktikan aturan jarak minimum, dan keduanya harus
+memakai watermark **nol** — bukan 12508. Alasannya terukur: ke-37 pasangan
+artefak punya baris barunya di id snapshot 2718–3012, sedangkan ketiga
+perubahan asli di 13656–13840. Watermark 12508 berada di atas seluruh artefak,
+jadi tidak ada ambang yang bisa memunculkannya kembali; di sana ambang 0 dan
+ambang 12 sama-sama menghasilkan 3, dan itu benar.
 
-Watermark **nol** bukan patokan yang berguna: ia membuat 32 toko dan seluruh
-12.468 produk terhitung baru, yang justru keadaan yang dicegah oleh baris awal
-migrasi.
+Ambang **0** adalah tes kesetaraan: dengan penyaring dimatikan, query ini harus
+sepakat persis dengan `lag()` polos atas seluruh tabel, yang menghitung 40
+secara independen. Kalau tidak 40, LATERAL-nya memilih pendahulu yang berbeda
+dari yang `lag()` pilih, dan selisih itu bug — bukan ambang.
+
+Satu jebakan yang sudah memakan korban sekali: pada ambang 0, predikat
+`scraped_at <= scraped_at` memasukkan baris itu sendiri, dan `ORDER BY ... DESC
+LIMIT 1` lalu memilihnya. Tanpa `AND ps.id <> latest_new.id` setiap produk
+dibandingkan dengan dirinya sendiri dan hasilnya selalu nol.
 
 ## Di luar lingkup
 

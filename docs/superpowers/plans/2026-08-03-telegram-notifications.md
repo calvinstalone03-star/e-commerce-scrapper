@@ -805,6 +805,11 @@ async function selectPriceChanges(
           FROM price_snapshots ps
          WHERE ps.product_ref = latest_new.product_ref
            AND ps.price IS NOT NULL
+           -- Excluding the row itself matters only at minGapHours = 0, where
+           -- `scraped_at <= scraped_at` admits it and the ORDER BY then makes it
+           -- the nearest match — every product would compare against itself and
+           -- nothing would ever be reported.
+           AND ps.id <> latest_new.id
            AND ps.scraped_at <= latest_new.scraped_at - make_interval(hours => ${minGapHours})
          ORDER BY ps.scraped_at DESC, ps.id DESC
          LIMIT 1
@@ -981,7 +986,19 @@ SELECT (SELECT count(*) FROM latest_new l
 
 Expected: `gap_12 = 3`, `new_stores = 0`, `new_products = 4`.
 
-`gap_0` is the regression check on the other side: it must be **larger** than `gap_12` (the artefact pairs reappear once the threshold is off). If `gap_0` equals `gap_12`, the interval is not being applied and the LATERAL is picking the same row either way.
+**`gap_0` is not a useful check at this watermark, and an earlier draft of this plan wrongly required it to exceed `gap_12`.** Measured against the production data, the 37 artefact pairs have their newer row at snapshot ids 2718–3012 and the 3 genuine pairs at 13656–13840. Watermark 12508 sits above every artefact, so no threshold can bring them back: `gap_0 = gap_12 = 3` here is correct.
+
+The watermark that exercises the rule is **0**. Run the same query with `ps.id > 0` for both thresholds:
+
+| Watermark | `NOTIFY_MIN_GAP_HOURS` | Price changes |
+|---|---|---|
+| 0 | 0 | **40** |
+| 0 | 12 | **3** |
+| 12508 | 12 | **3** |
+
+The first row is the equivalence check: with the threshold off, this query must agree exactly with a plain `lag()` over the whole table, which independently counts 40. If it does not, the LATERAL is selecting a different predecessor than `lag()` would and the difference is a bug, not a threshold.
+
+The second row is the rule working: the same 40 candidates, minus the 37 whose only comparison is hours old.
 
 - [ ] **Step 6: Commit**
 
