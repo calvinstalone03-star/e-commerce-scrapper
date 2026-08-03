@@ -151,4 +151,53 @@ describe('sendMessages', () => {
     await expect(sendMessages(['x'], { ...config(fetchImpl), timeoutMs: 50 })).rejects.toThrow();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
+
+  test('rejects 200 with {"result":{}} — no ok field', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ result: {} }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(sendMessages(['x'], config(fetchImpl))).rejects.toThrow();
+  });
+
+  test('rejects 200 with {"ok":null}', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ ok: null }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(sendMessages(['x'], config(fetchImpl))).rejects.toThrow();
+  });
+
+  test('rejects 500 with {"error":"Internal Server Error"} and names the status', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ error: 'Internal Server Error' }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(sendMessages(['x'], config(fetchImpl))).rejects.toThrow(/500/);
+  });
+
+  test('uses Telegram description when present, even for error status', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ ok: false, description: 'Bad Request: chat not found' }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(sendMessages(['x'], config(fetchImpl))).rejects.toThrow(/chat not found/);
+    await expect(sendMessages(['x'], config(fetchImpl))).rejects.not.toThrow(/500/);
+  });
 });

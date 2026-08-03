@@ -33,7 +33,7 @@ type ParseBodyResult =
 async function readBody(response: Response): Promise<ParseBodyResult> {
   try {
     const body = (await response.json()) as TelegramResponse;
-    if (body.ok !== false) {
+    if (body.ok === true) {
       return { parsed: true, ok: true };
     }
     return {
@@ -88,25 +88,37 @@ async function postOnce(
 
   const body = await readBody(response);
 
+  // 1. Body did not parse.
   if (!body.parsed) {
     // The response was not valid JSON. Telegram always answers JSON, so this
     // is a proxy, gateway, or other non-Telegram failure. Do not advance.
     return {
       ok: false,
-      description: 'Telegram response was not JSON',
+      description: `Telegram response was not JSON (HTTP ${response.status})`,
       retryAfter: null,
     };
   }
 
-  if (body.ok) {
-    return { ok: true };
+  // 2. Body parsed and says failure.
+  if (!body.ok) {
+    return {
+      ok: false,
+      description: body.description,
+      retryAfter: body.retryAfter,
+    };
   }
 
-  return {
-    ok: false,
-    description: body.description,
-    retryAfter: body.retryAfter,
-  };
+  // 3. Body says success but HTTP status disagrees.
+  if (!response.ok) {
+    return {
+      ok: false,
+      description: `HTTP ${response.status}`,
+      retryAfter: null,
+    };
+  }
+
+  // 4. Success.
+  return { ok: true };
 }
 
 function sleep(ms: number): Promise<void> {
