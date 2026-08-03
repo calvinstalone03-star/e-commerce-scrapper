@@ -2402,6 +2402,14 @@ npm run test -- src/lib/notify/run.test.ts
 
 Expected: FAIL — `Failed to resolve import "@/lib/notify/run"`.
 
+> **The reference code below types `resolveSettings` against `NodeJS.ProcessEnv`, which does not compile. Read the shipped `dashboard/src/lib/notify/run.ts` instead.**
+>
+> Next 16's `global.d.ts` declares `NODE_ENV` as a **required** field on `NodeJS.ProcessEnv`, so the object literals the tests cast to it are `TS2352`. The spec already said this function "mirrors `resolveConnectionString` in `db.ts`" — and that one takes a narrow local `Env` type precisely so it is callable with a literal. The plan mirrored the idea and missed the detail that made it work.
+>
+> The shipped version declares a narrow `NotifyEnv` with all-optional fields, and types `required()`'s name parameter as `keyof NotifyEnv`, which turns a mistyped variable name into a compile error rather than a runtime throw.
+>
+> One consequence is not obvious and was verified rather than assumed: `resolveSettings(process.env)` does **not** compile against that narrow type either. TypeScript's weak-type check fires when every field is optional, and it compares only the properties *declared* on `ProcessEnv`, ignoring its index signature. `db.ts`'s `Env` escapes this by coincidence — it happens to declare `NODE_ENV`, the one property Next adds directly. The shipped code uses a single scoped `process.env as NotifyEnv` cast at the one call site. The two alternatives were tested in an isolated `tsc` repro and are worse: an index signature widens `keyof` to `string` and silently destroys the typo protection, and a `NODE_ENV?: string` field is dead weight that re-couples the type to a Next-version coincidence.
+
 - [ ] **Step 3: Write the run module**
 
 Create `dashboard/src/lib/notify/run.ts`:
