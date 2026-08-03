@@ -1,6 +1,12 @@
 import type { NextRequest } from 'next/server';
 
-import { resolveSettings, runNotify, secretMatches, type NotifyEnv } from '@/lib/notify/run';
+import {
+  resolveSecret,
+  resolveSettings,
+  runNotify,
+  secretMatches,
+  type NotifyEnv,
+} from '@/lib/notify/run';
 
 /**
  * The notifier's trigger.
@@ -19,28 +25,50 @@ export const dynamic = 'force-dynamic';
 
 const NO_STORE = { 'Cache-Control': 'private, no-store' };
 
+/** Misconfiguration, not a bad request. Names the variable, echoes no values. */
+function notConfigured(error: unknown): Response {
+  return Response.json(
+    { error: error instanceof Error ? error.message : 'Notifier is not configured.' },
+    { status: 500, headers: NO_STORE },
+  );
+}
+
 export async function POST(request: NextRequest): Promise<Response> {
-  let settings;
+  // The cast is required, not decorative: `NotifyEnv`'s keys don't appear on
+  // `ProcessEnv` itself (only through its index signature), so plain
+  // assignment trips TypeScript's weak-type "no properties in common" check.
+  // The cast bypasses only that heuristic — `ProcessEnv`'s index signature
+  // already makes every field here a legal string key at runtime.
+  const env = process.env as NotifyEnv;
+
+  // Authorisation before configuration, and that order is the point. Resolving
+  // every setting first means an unauthenticated POST to a half-configured
+  // deployment is answered with a 500 naming the variable that is missing —
+  // anyone who finds the URL learns which of the notifier's environment
+  // variables this deployment does and does not have set, for free.
+  //
+  // The secret is the one setting the 401 itself needs, so it is the only one
+  // resolved this side of the check. Its own absence is still reported, because
+  // without it no request can ever authorise and the operator has to be able to
+  // see why; every other variable waits until the caller has proved who it is.
+  let secret: string;
   try {
-    // The cast is required, not decorative: `NotifyEnv`'s keys don't appear on
-    // `ProcessEnv` itself (only through its index signature), so plain
-    // assignment trips TypeScript's weak-type "no properties in common" check.
-    // The cast bypasses only that heuristic — `ProcessEnv`'s index signature
-    // already makes every field here a legal string key at runtime.
-    settings = resolveSettings(process.env as NotifyEnv);
+    secret = resolveSecret(env);
   } catch (error) {
-    // Misconfiguration, not a bad request. The message names the missing
-    // variable and nothing else — no values are echoed.
-    return Response.json(
-      { error: error instanceof Error ? error.message : 'Notifier is not configured.' },
-      { status: 500, headers: NO_STORE },
-    );
+    return notConfigured(error);
   }
 
   const header = request.headers.get('authorization');
   const supplied = header?.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!secretMatches(supplied, settings.secret)) {
+  if (!secretMatches(supplied, secret)) {
     return Response.json({ error: 'Unauthorized' }, { status: 401, headers: NO_STORE });
+  }
+
+  let settings;
+  try {
+    settings = resolveSettings(env);
+  } catch (error) {
+    return notConfigured(error);
   }
 
   try {
