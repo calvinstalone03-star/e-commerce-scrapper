@@ -1,9 +1,11 @@
+import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 import type { ReactNode } from 'react';
 
 import { AppShell } from '@/components/shell/AppShell';
 import { signOut } from '@/app/actions/auth';
 import { currentUsername, isSignedIn, usingDefaultPassword } from '@/lib/auth';
+import { PATH_HEADER, safeNextPath } from '@/lib/next-path';
 import { getOwnShops } from '@/lib/queries';
 
 /**
@@ -15,7 +17,13 @@ import { getOwnShops } from '@/lib/queries';
  * apply. `/login` sits outside the group and renders with no shell at all.
  */
 export default async function AppLayout({ children }: { children: ReactNode }) {
-  if (!(await isSignedIn())) redirect('/login');
+  if (!(await isSignedIn())) {
+    // Where they were going, so the login can put them back there. Clicking a
+    // notification on a phone with an expired cookie is exactly the case this
+    // exists for.
+    const attempted = safeNextPath((await headers()).get(PATH_HEADER));
+    redirect(attempted === '/' ? '/login' : `/login?next=${encodeURIComponent(attempted)}`);
+  }
 
   // The topbar names the shops every "kita" on every page refers to. Cheap
   // enough to read per request, and it changes the moment `own-shop` runs.

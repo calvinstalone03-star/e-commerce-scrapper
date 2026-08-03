@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 
 import { LoginForm } from '@/components/LoginForm';
 import { isSignedIn } from '@/lib/auth';
+import { safeNextPath } from '@/lib/next-path';
 
 /**
  * The only page outside the shell.
@@ -29,6 +30,7 @@ export default async function LoginPage({
 
   const params = await searchParams;
   const changed = params.changed !== undefined;
+  const next = safeNextPath(params.next);
 
   return (
     <main className="flex min-h-screen items-center justify-center px-4 py-10">
@@ -54,7 +56,7 @@ export default async function LoginPage({
           </p>
         ) : null}
 
-        <LoginForm />
+        <LoginForm next={next} />
       </div>
     </main>
   );

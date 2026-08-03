@@ -3,6 +3,7 @@
 import { redirect } from 'next/navigation';
 
 import { createSession, destroySession, updateCredentials, verifyPassword } from '@/lib/auth';
+import { safeNextPath } from '@/lib/next-path';
 
 /**
  * The three things a session can do: start, end, and change what starts it.
@@ -25,7 +26,9 @@ export async function signIn(_previous: FormState, formData: FormData): Promise<
   }
 
   await createSession();
-  redirect('/');
+  // Validated again here: the hidden field travelled through the browser, so it
+  // is input, not state.
+  redirect(safeNextPath(String(formData.get('next') ?? '/')));
 }
 
 export async function signOut(): Promise<void> {
