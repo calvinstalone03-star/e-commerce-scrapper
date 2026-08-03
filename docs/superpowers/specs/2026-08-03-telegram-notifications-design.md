@@ -179,9 +179,13 @@ Komprominya menjaga alasan aslinya tetap utuh:
   memigrasi apapun.
 - **Tulisannya satu tabel, satu baris.** Dashboard tidak pernah menulis ke
   `stores`, `products`, `price_snapshots`, atau `scrape_runs`.
-- **Koneksinya terpisah.** `db.ts` mengekspor klien read-only yang dipakai
-  seluruh layar; notifier memakai modulnya sendiri, supaya kemampuan menulis
-  tidak menyebar ke query dashboard lewat impor yang tidak sengaja.
+- **Tulisannya terkurung di satu modul,** `notify/watermark.ts`. Isolasinya di
+  tingkat modul, bukan koneksi: klien `sql` dari `db.ts` tetap dipakai bersama.
+  Klien kedua akan menggandakan koneksi per instance, dan `db.ts:80` menjelaskan
+  kenapa angka itu sengaja 1 di Vercel — delapan koneksi per instance terhadap
+  endpoint pooled adalah cara dashboard menjatuhkan dirinya sendiri. Klien
+  terpisah juga tidak membeli apa-apa: ia memakai peran Postgres yang sama, jadi
+  "read-only" di `db.ts` selalu berupa disiplin, bukan izin.
 
 ## Bentuk data
 
