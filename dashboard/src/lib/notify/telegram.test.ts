@@ -98,4 +98,57 @@ describe('sendMessages', () => {
     await expect(sendMessages(['a', 'b', 'c'], config(fetchImpl))).rejects.toThrow(/boom/);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
+
+  test('never puts the bot token in the error when fetchImpl rejects', async () => {
+    const fetchImpl = vi.fn(
+      async () => {
+        const error = new Error('FetchError: request to https://api.telegram.org/botSECRET-TOKEN/sendMessage failed');
+        throw error;
+      },
+    ) as unknown as typeof fetch;
+
+    await expect(sendMessages(['x'], config(fetchImpl))).rejects.toSatisfy(
+      (error: Error) => !error.message.includes('SECRET-TOKEN'),
+    );
+  });
+
+  test('rejects on 2xx with non-JSON body (HTML)', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response('<html><body>Gateway Error</body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(sendMessages(['x'], config(fetchImpl))).rejects.toThrow(/not JSON/);
+  });
+
+  test('rejects on 2xx with empty body', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response('', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(sendMessages(['x'], config(fetchImpl))).rejects.toThrow(/not JSON/);
+  });
+
+  test('aborts when AbortSignal.timeout fires', async () => {
+    const fetchImpl = vi.fn(
+      async (url, init) => {
+        // Wait for the abort signal to fire
+        await new Promise((resolve, reject) => {
+          (init.signal as AbortSignal).addEventListener('abort', () => reject(new DOMException('The operation was aborted', 'AbortError')));
+          // Fallback in case abort doesn't fire
+          setTimeout(() => reject(new Error('timeout did not fire')), 5000);
+        });
+      },
+    ) as unknown as typeof fetch;
+
+    await expect(sendMessages(['x'], { ...config(fetchImpl), timeoutMs: 50 })).rejects.toThrow();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
 });

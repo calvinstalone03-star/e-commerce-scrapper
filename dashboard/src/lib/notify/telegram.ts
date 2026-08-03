@@ -25,12 +25,26 @@ type TelegramResponse = {
   parameters?: { retry_after?: number };
 };
 
-async function readBody(response: Response): Promise<TelegramResponse> {
+type ParseBodyResult =
+  | { parsed: true; ok: true }
+  | { parsed: true; ok: false; description: string; retryAfter: number | null }
+  | { parsed: false };
+
+async function readBody(response: Response): Promise<ParseBodyResult> {
   try {
-    return (await response.json()) as TelegramResponse;
+    const body = (await response.json()) as TelegramResponse;
+    if (body.ok !== false) {
+      return { parsed: true, ok: true };
+    }
+    return {
+      parsed: true,
+      ok: false,
+      description: body.description ?? `HTTP ${response.status}`,
+      retryAfter: body.parameters?.retry_after ?? null,
+    };
   } catch {
     // Telegram answers JSON, but a proxy or a gateway error may not.
-    return {};
+    return { parsed: false };
   }
 }
 
@@ -43,30 +57,55 @@ async function postOnce(
   // transaction holds the watermark row's lock. Bound it.
   const signal = AbortSignal.timeout(config.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
-  const response = await fetchImpl(
-    `https://api.telegram.org/bot${config.botToken}/sendMessage`,
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: config.chatId,
-        text: message,
-        parse_mode: 'HTML',
-        // The links point at a login-protected dashboard, so a preview would be
-        // a screenshot of the login page under every message.
-        disable_web_page_preview: true,
-      }),
-      signal,
-    },
-  );
+  let response: Response;
+  try {
+    response = await fetchImpl(
+      `https://api.telegram.org/bot${config.botToken}/sendMessage`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: config.chatId,
+          text: message,
+          parse_mode: 'HTML',
+          // The links point at a login-protected dashboard, so a preview would be
+          // a screenshot of the login page under every message.
+          disable_web_page_preview: true,
+        }),
+        signal,
+      },
+    );
+  } catch (error) {
+    // fetchImpl may reject with an error that embeds the URL. Never let that
+    // error escape with the token in it.
+    const errorName = error instanceof Error ? error.name : 'Error';
+    return {
+      ok: false,
+      description: `Telegram request failed before a response arrived (${errorName})`,
+      retryAfter: null,
+    };
+  }
 
   const body = await readBody(response);
-  if (response.ok && body.ok !== false) return { ok: true };
+
+  if (!body.parsed) {
+    // The response was not valid JSON. Telegram always answers JSON, so this
+    // is a proxy, gateway, or other non-Telegram failure. Do not advance.
+    return {
+      ok: false,
+      description: 'Telegram response was not JSON',
+      retryAfter: null,
+    };
+  }
+
+  if (body.ok) {
+    return { ok: true };
+  }
 
   return {
     ok: false,
-    description: body.description ?? `HTTP ${response.status}`,
-    retryAfter: body.parameters?.retry_after ?? null,
+    description: body.description,
+    retryAfter: body.retryAfter,
   };
 }
 
