@@ -365,10 +365,30 @@ berbeda. Ia tetap ada karena penetapan harga borongan itu nyata — toko yang
 menaikkan seluruh katalognya serempak akan menghasilkannya — dan karena tanpa
 itu satu kejadian semacam itu jadi tembok teks yang menenggelamkan sisanya.
 
-Batas 4.096 karakter Telegram dipecah per kelompok, bukan di tengah baris. Kalau
-satu kelompok sendiri melebihi batas, ia dipotong dengan "… N lainnya" dan
-jumlah penuhnya tetap ada di judul kelompok — angka di judul tidak pernah bohong
-soal berapa yang sebenarnya berubah.
+Batas 4.096 karakter Telegram dipecah per kelompok, bukan di tengah baris.
+
+Pemotongannya **tidak** menunggu satu kelompok melewati batas karakter, seperti
+draf pertama spec ini menuliskannya. Ia tegas di **12 entri per kelompok**, dan
+seluruh digest dibatasi **4 pesan**. Alasannya muncul di review menyeluruh:
+tanpa batas, 1.600 produk baru menghasilkan 63 pesan, sementara Telegram
+membatasi satu chat sekitar 20 pesan per menit. Setiap 429 membeli satu tidur
+`retry_after` **di dalam transaksi** yang memegang `FOR UPDATE`; lewat batas
+waktu fungsi, transaksinya rollback, watermark tidak maju, dan jalan berikutnya
+menyusun digest yang sama tapi lebih besar. Macet tanpa jalan keluar otomatis.
+Dan 1.600 itu bukan angka karangan — `scraper/ingest.py:372` commit satu
+transaksi per halaman tangkapan, jadi baris tokonya bisa lewat watermark di satu
+putaran sementara sisa listing-nya menyusul di putaran berikutnya.
+
+Sisanya diringkas "… N lainnya", dan angka itu menghitung **listing**, bukan
+baris terlipat — jadi yang ditampilkan ditambah sisanya selalu sama dengan angka
+di judul kelompok. Judul tidak pernah bohong soal berapa yang sebenarnya
+berubah, dan itu tetap berlaku setelah pelipatan menggabungkan banyak listing
+jadi satu baris.
+
+Konsekuensi yang diterima sadar: pemotongan ini **permanen, bukan ditunda**.
+Watermark tetap maju, jadi entri yang terbuang tidak dikirim ulang di putaran
+berikutnya. Digest yang membuat notifier macet selamanya lebih buruk daripada
+digest yang memberi tahu 12 gerakan terbesar dan menyebutkan sisanya ada.
 
 ### Link
 
