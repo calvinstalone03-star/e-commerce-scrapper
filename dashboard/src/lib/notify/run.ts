@@ -73,23 +73,55 @@ function required(env: NotifyEnv, name: keyof NotifyEnv): string {
   return value;
 }
 
-function positiveNumber(raw: string | undefined, fallback: number): number {
-  const value = Number(raw);
-  // Covers undefined, '', 'banyak' and negatives in one condition.
-  return Number.isFinite(value) && value >= 0 ? value : fallback;
+/**
+ * A whole, non-negative number of hours — or the documented default.
+ *
+ * The blankness check has to come before `Number()`, not be folded into the
+ * condition after it: `Number('')` is `0`, and `Number('   ')` is `0` too. Both
+ * are finite and non-negative, so a "covers everything in one condition" test
+ * accepts them silently. A key present with an empty value is the ordinary
+ * shape of a half-finished Vercel environment variable, and the two ways it
+ * lands here are both quiet disasters — `NOTIFY_MIN_GAP_HOURS=` would set the
+ * gap to zero and switch off the rule the whole feature is built on, and
+ * `NOTIFY_STALE_HOURS=` would make `ageHours < 0` false for every quiet run, so
+ * a healthy database gets a daily "Data tidak bergerak" and stops advancing its
+ * watermark on quiet runs.
+ *
+ * Whole numbers only, because `make_interval(hours => $)` takes an `int`
+ * (events.ts:133) and Postgres answers `1.5` with `22P02` — every run fails,
+ * not just an edge case. A fraction falls back rather than being floored: the
+ * floor of anything under 1 is 0, which is the same silent disabling as the
+ * blank case, and someone who typed a fraction is better served by the
+ * documented default than by a rule they did not ask for and cannot see.
+ */
+function wholeHours(raw: string | undefined, fallback: number): number {
+  const text = raw?.trim();
+  if (!text) return fallback;
+  const value = Number(text);
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+/**
+ * The one setting the 401 needs, resolvable on its own.
+ *
+ * Split out so `route.ts` can check the bearer token before resolving anything
+ * else — see the ordering note there.
+ */
+export function resolveSecret(env: NotifyEnv): string {
+  return required(env, 'NOTIFY_SECRET');
 }
 
 export function resolveSettings(env: NotifyEnv): NotifySettings {
   return {
     botToken: required(env, 'TELEGRAM_BOT_TOKEN'),
     chatId: required(env, 'TELEGRAM_CHAT_ID'),
-    secret: required(env, 'NOTIFY_SECRET'),
+    secret: resolveSecret(env),
     baseUrl: resolveBaseUrl({
       NOTIFY_BASE_URL: env.NOTIFY_BASE_URL,
       VERCEL_PROJECT_PRODUCTION_URL: env.VERCEL_PROJECT_PRODUCTION_URL,
     }),
-    minGapHours: positiveNumber(env.NOTIFY_MIN_GAP_HOURS, DEFAULT_MIN_GAP_HOURS),
-    staleHours: positiveNumber(env.NOTIFY_STALE_HOURS, DEFAULT_STALE_HOURS),
+    minGapHours: wholeHours(env.NOTIFY_MIN_GAP_HOURS, DEFAULT_MIN_GAP_HOURS),
+    staleHours: wholeHours(env.NOTIFY_STALE_HOURS, DEFAULT_STALE_HOURS),
   };
 }
 

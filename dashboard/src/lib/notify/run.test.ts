@@ -138,6 +138,84 @@ describe('resolveSettings', () => {
 
     expect(settings.minGapHours).toBe(12);
   });
+
+  /**
+   * The shape a half-finished Vercel variable actually has: the key exists, the
+   * value was never pasted. `Number('')` and `Number('   ')` are both `0`, which
+   * is finite and non-negative, so the condition that rejects `'banyak'` waves
+   * these straight through — and a zero here is not a smaller setting, it is the
+   * rule switched off. Gap 0 compares a capture against the capture before it,
+   * which is exactly the artefact the minimum gap exists to suppress: measured
+   * against the live database, 3 real price changes become 40.
+   */
+  test.each([
+    ['empty', ''],
+    ['whitespace', '   '],
+  ])('treats a %s NOTIFY_MIN_GAP_HOURS as unset rather than as zero', (_name, raw) => {
+    const settings = resolveSettings({
+      TELEGRAM_BOT_TOKEN: 'token',
+      TELEGRAM_CHAT_ID: 'chat',
+      NOTIFY_SECRET: 'secret',
+      NOTIFY_BASE_URL: 'https://x',
+      NOTIFY_MIN_GAP_HOURS: raw,
+    });
+
+    expect(settings.minGapHours).toBe(12);
+  });
+
+  /**
+   * Same blank, other variable, different disaster: `staleHours` of 0 makes
+   * `ageHours < 0` false however fresh the data is, so every quiet run takes the
+   * stale branch — a daily "Data tidak bergerak" about a database that is
+   * working, and no `advanceWatermark` on quiet runs.
+   */
+  test.each([
+    ['empty', ''],
+    ['whitespace', '   '],
+  ])('treats a %s NOTIFY_STALE_HOURS as unset rather than as zero', (_name, raw) => {
+    const settings = resolveSettings({
+      TELEGRAM_BOT_TOKEN: 'token',
+      TELEGRAM_CHAT_ID: 'chat',
+      NOTIFY_SECRET: 'secret',
+      NOTIFY_BASE_URL: 'https://x',
+      NOTIFY_STALE_HOURS: raw,
+    });
+
+    expect(settings.staleHours).toBe(36);
+  });
+
+  /**
+   * `make_interval(hours => $)` takes an `int`. A fraction is not a finer
+   * setting, it is `22P02` on every single run — so it falls back, and it falls
+   * back rather than flooring because `floor(0.5)` is `0`, the disabled rule
+   * again.
+   */
+  test('falls back rather than sending Postgres a fractional hour', () => {
+    const base = {
+      TELEGRAM_BOT_TOKEN: 'token',
+      TELEGRAM_CHAT_ID: 'chat',
+      NOTIFY_SECRET: 'secret',
+      NOTIFY_BASE_URL: 'https://x',
+    };
+
+    expect(resolveSettings({ ...base, NOTIFY_MIN_GAP_HOURS: '1.5' }).minGapHours).toBe(12);
+    expect(resolveSettings({ ...base, NOTIFY_MIN_GAP_HOURS: '0.5' }).minGapHours).toBe(12);
+    expect(resolveSettings({ ...base, NOTIFY_STALE_HOURS: '36.5' }).staleHours).toBe(36);
+  });
+
+  test('still honours a whole-number override, including a deliberate zero', () => {
+    const base = {
+      TELEGRAM_BOT_TOKEN: 'token',
+      TELEGRAM_CHAT_ID: 'chat',
+      NOTIFY_SECRET: 'secret',
+      NOTIFY_BASE_URL: 'https://x',
+    };
+
+    expect(resolveSettings({ ...base, NOTIFY_MIN_GAP_HOURS: '6' }).minGapHours).toBe(6);
+    // Written out, `0` is a choice rather than an accident, and the difference
+    // between the two is the whole point of the blankness check above.
+    expect(resolveSettings({ ...base, NOTIFY_MIN_GAP_HOURS: '0' }).minGapHours).toBe(0);
+  });
 });
 
 describe('secretMatches', () => {
