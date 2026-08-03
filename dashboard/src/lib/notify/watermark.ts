@@ -5,12 +5,13 @@ import type { TransactionSql } from 'postgres';
 import { sql } from '@/lib/db';
 
 /**
- * Where the notifier left off, and the only place this app writes.
+ * Where the notifier left off.
  *
- * `db.ts` states that the dashboard never writes. This module is the stated
- * exception, and it is kept to one table so the rule still holds everywhere it
- * matters: nothing here touches `stores`, `products`, `price_snapshots` or
- * `scrape_runs`, and the schema is still created by a Python migration.
+ * `notify_watermark` is one of the two tables this app writes to —
+ * `app_credentials` (`lib/auth.ts`) is the other — and both are its own. The
+ * rule `db.ts` sets out still holds everywhere it matters: nothing here touches
+ * `stores`, `products`, `price_snapshots` or `scrape_runs`, and the schema is
+ * still created by a Python migration.
  *
  * Ids rather than timestamps throughout. `price_snapshots.id` is bigserial and
  * the other two are serial, so "larger than the watermark" is a total order
@@ -75,13 +76,32 @@ export async function readWatermarkForUpdate(tx: Sql): Promise<Watermark> {
 }
 
 /**
- * The largest id in each source table, read once per run.
+ * The largest committed id in each source table, read once per run.
  *
  * Every query below bounds itself by these rather than by "whatever is in the
- * table now", and the watermark advances to exactly these. That closes the race
- * a bare `max(id)` at the end would open: a row inserted while the run is in
- * flight sits above the ceiling, is not examined, and is not skipped either —
- * the next run starts precisely where this one stopped looking.
+ * table now", and the watermark advances to exactly these. That is what stops a
+ * row from being examined twice, and it closes the race a bare `max(id)` at the
+ * end would open: a row that arrives while the run is in flight sits above the
+ * ceiling and waits for the next run, which starts precisely where this one
+ * stopped looking.
+ *
+ * What it does not promise is that nothing is ever skipped, and the word
+ * "committed" above is where the gap is. A sequence hands out ids before the
+ * transaction holding one commits, so a writer can be sitting on id 500 while
+ * `max(id)` answers 499. This run then advances the watermark to 499, that
+ * writer commits, and its row is below the watermark for good: never examined,
+ * never reported. Both writers are real — `runner.py:1202` and
+ * `ingest.py:396`, and ingest commits once per captured page — so the window is
+ * genuinely open, not theoretical.
+ *
+ * It is left open deliberately. Closing it properly means reading the ceilings
+ * from `pg_snapshot_xmin(pg_current_snapshot())` rather than `max(id)`, or
+ * taking a lock the scraper would then have to respect, and the cost of the
+ * failure does not justify either: the window is the moment between one
+ * `max(id)` and one `UPDATE`, the loss is one run's worth of one page's rows,
+ * and the same product's next price change is reported normally. A missed
+ * notification is recoverable by opening the dashboard. Blocking the scraper to
+ * prevent it is not.
  */
 export async function readCeilings(tx: Sql): Promise<Ceilings> {
   const [row] = await tx<{ snapshot_id: string; product_id: number; store_id: number }[]>`

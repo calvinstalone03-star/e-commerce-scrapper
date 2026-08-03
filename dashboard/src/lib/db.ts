@@ -3,12 +3,18 @@ import 'server-only';
 import postgres from 'postgres';
 
 /**
- * Read-only Postgres access for the dashboard.
+ * Postgres access for the dashboard: read-only over everything it did not make.
  *
- * The Python side owns the schema and the migrations. This app never writes and
- * never migrates — two migration authorities over one database is how schemas
- * drift apart, and the scraper is the one that has to stay correct. Everything
- * here is a SELECT.
+ * The Python side owns the schema and the migrations. This app never migrates —
+ * two migration authorities over one database is how schemas drift apart, and
+ * the scraper is the one that has to stay correct — and it never writes to what
+ * the scraper owns: every query it runs over `stores`, `products`,
+ * `price_snapshots`, `product_keywords` and `scrape_runs` is a SELECT.
+ *
+ * It does write, to exactly two tables, both of them its own and both still
+ * created by a Python migration: `app_credentials` (`lib/auth.ts`, the login)
+ * and `notify_watermark` (`lib/notify/watermark.ts`, where the notifier left
+ * off). Neither is scraped data. That is the whole list.
  *
  * Raw SQL rather than an ORM for the same reason: an ORM here would mean a
  * second model definition to keep in step with `scraper/db.py`, for queries that

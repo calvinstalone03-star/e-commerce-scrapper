@@ -5,8 +5,11 @@ import type { Ceilings, Sql, Watermark } from '@/lib/notify/watermark';
 /**
  * What has happened since the watermark.
  *
- * Three questions, three queries, all bounded above by the ceilings so that a
- * row arriving mid-run is neither examined twice nor skipped.
+ * Three questions, three queries, all bounded above by the ceilings so that no
+ * row is examined twice and a row arriving mid-run waits for the next run
+ * instead. The one thing that bound does not promise is that nothing is ever
+ * skipped — see `readCeilings` in `watermark.ts` for the window that leaves
+ * open and why it is left open.
  */
 
 export type PriceChange = {
