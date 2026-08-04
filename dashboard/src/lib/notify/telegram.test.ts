@@ -131,6 +131,48 @@ describe('sendMessages', () => {
     await expect(sendMessages(['x'], config(fetchImpl))).rejects.toThrow(/parse entities/);
   });
 
+  /**
+   * A group that gets upgraded to a supergroup changes its chat id, and every
+   * send to the old one fails from then on. Telegram's rejection carries the
+   * replacement in `parameters.migrate_to_chat_id` — the one thing needed to
+   * fix it — and this used to read only `description`, so the operator was told
+   * "group chat was upgraded to a supergroup chat" and left to find the new id
+   * by hand. Observed against the real bot on 2026-08-04.
+   */
+  test('names the new chat id, and the variable to put it in, after a supergroup migration', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            ok: false,
+            error_code: 400,
+            description: 'Bad Request: group chat was upgraded to a supergroup chat',
+            parameters: { migrate_to_chat_id: -1004305121496 },
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        ),
+    ) as unknown as typeof fetch;
+
+    const send = sendMessages(['x'], config(fetchImpl));
+
+    await expect(send).rejects.toThrow(/-1004305121496/);
+    await expect(send).rejects.toThrow(/TELEGRAM_CHAT_ID/);
+  });
+
+  test('says nothing about migration when Telegram did not offer one', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ ok: false, description: 'Bad Request: chat not found' }), {
+          status: 400,
+          headers: { 'content-type': 'application/json' },
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(sendMessages(['x'], config(fetchImpl))).rejects.toThrow(
+      /chat not found(?!.*TELEGRAM_CHAT_ID)/,
+    );
+  });
+
   test('never puts the bot token in the error it throws', async () => {
     const fetchImpl = vi.fn(
       async () => new Response('nope', { status: 500 }),

@@ -25,13 +25,17 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 type TelegramResponse = {
   ok?: boolean;
   description?: string;
-  parameters?: { retry_after?: number };
+  parameters?: { retry_after?: number; migrate_to_chat_id?: number };
 };
 
-type ParseBodyResult =
-  | { parsed: true; ok: true }
-  | { parsed: true; ok: false; description: string; retryAfter: number | null }
-  | { parsed: false };
+type Failure = {
+  description: string;
+  retryAfter: number | null;
+  /** The replacement chat id, when a group has become a supergroup. */
+  migrateTo: number | null;
+};
+
+type ParseBodyResult = { parsed: true; ok: true } | ({ parsed: true; ok: false } & Failure) | { parsed: false };
 
 async function readBody(response: Response): Promise<ParseBodyResult> {
   try {
@@ -44,6 +48,7 @@ async function readBody(response: Response): Promise<ParseBodyResult> {
       ok: false,
       description: body.description ?? `HTTP ${response.status}`,
       retryAfter: body.parameters?.retry_after ?? null,
+      migrateTo: body.parameters?.migrate_to_chat_id ?? null,
     };
   } catch {
     // Telegram answers JSON, but a proxy or a gateway error may not.
@@ -54,7 +59,7 @@ async function readBody(response: Response): Promise<ParseBodyResult> {
 async function postOnce(
   message: string,
   config: TelegramConfig,
-): Promise<{ ok: true } | { ok: false; description: string; retryAfter: number | null }> {
+): Promise<{ ok: true } | ({ ok: false } & Failure)> {
   const fetchImpl = config.fetchImpl ?? fetch;
   // A hung request would hold the surrounding transaction open, and that
   // transaction holds the watermark row's lock. Bound it.
@@ -86,6 +91,7 @@ async function postOnce(
       ok: false,
       description: `Telegram request failed before a response arrived (${errorName})`,
       retryAfter: null,
+      migrateTo: null,
     };
   }
 
@@ -99,6 +105,7 @@ async function postOnce(
       ok: false,
       description: `Telegram response was not JSON (HTTP ${response.status})`,
       retryAfter: null,
+      migrateTo: null,
     };
   }
 
@@ -108,6 +115,7 @@ async function postOnce(
       ok: false,
       description: body.description,
       retryAfter: body.retryAfter,
+      migrateTo: body.migrateTo,
     };
   }
 
@@ -117,6 +125,7 @@ async function postOnce(
       ok: false,
       description: `HTTP ${response.status}`,
       retryAfter: null,
+      migrateTo: null,
     };
   }
 
@@ -151,20 +160,20 @@ const MAX_RETRY_AFTER_SECONDS = 5;
  * Telegram allows roughly 20 messages a minute to one group — three seconds
  * apart. Until the per-product stream existed this did not bind: a whole run
  * was at most `MAX_MESSAGES` (4) messages, and four sent flat out is not a
- * burst. It is now `NOTIFY_PER_PRODUCT_MAX` + 4, which is 34 by default, and
- * 34 messages with no wait between them is a near-certain flood-wait.
+ * burst. It is now `NOTIFY_PER_PRODUCT_MAX` + 4.
  *
- * What makes that specifically bad rather than merely slow is the interaction
- * with `MAX_RETRY_AFTER_SECONDS` above: a group flood-wait is tens of seconds,
- * so the retry is not taken, `sendMessages` throws, the transaction rolls back
- * with the watermark unmoved, and the next trigger rebuilds the same 34
- * messages into the same limit. Nothing about that clears on its own.
+ * What makes exceeding it specifically bad rather than merely slow is the
+ * interaction with `MAX_RETRY_AFTER_SECONDS` above: a group flood-wait is tens
+ * of seconds, so the retry is not taken, `sendMessages` throws, the transaction
+ * rolls back with the watermark unmoved, and the next trigger rebuilds the same
+ * burst into the same limit. Nothing about that clears on its own.
  *
- * The design already counted on this pacing — it justified the cap of 30 by
- * calling 34 messages "~1,7 menit mengirim", which is exactly this interval —
- * so this is the wait that number always assumed, not a new cost. At the caps,
- * 33 waits is 99 seconds, inside the 300-second function limit with room for
- * the requests themselves.
+ * The design already counted on this pacing — it justified its original cap of
+ * 30 by calling 34 messages "~1,7 menit mengirim", which is exactly this
+ * interval — so this is the wait that number always assumed, not a new cost.
+ * `DEFAULT_PER_PRODUCT_MAX` is what makes the total fit
+ * `FUNCTION_BUDGET_SECONDS`, and a test in this suite holds the four numbers
+ * together.
  */
 export const SEND_INTERVAL_MS = 3_000;
 
@@ -202,8 +211,15 @@ export async function sendMessages(messages: string[], config: TelegramConfig): 
     }
 
     if (!attempt.ok) {
+      // A migrated group is the one rejection that names its own fix: Telegram
+      // returns the replacement chat id, and without it the operator is told
+      // the id is wrong but not what the right one is.
+      const remedy =
+        attempt.migrateTo === null
+          ? ''
+          : ` — TELEGRAM_CHAT_ID must become ${attempt.migrateTo}`;
       throw new Error(
-        `Telegram rejected message ${sent + 1} of ${messages.length}: ${attempt.description}`,
+        `Telegram rejected message ${sent + 1} of ${messages.length}: ${attempt.description}${remedy}`,
       );
     }
 
