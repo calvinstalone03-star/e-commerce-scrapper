@@ -27,6 +27,7 @@ const SETTINGS = {
   baseUrl: 'https://dash.example',
   minGapHours: 12,
   staleHours: 36,
+  perProductMax: 30,
 };
 
 const okFetch = () =>
@@ -37,6 +38,25 @@ const okFetch = () =>
         headers: { 'content-type': 'application/json' },
       }),
   ) as unknown as typeof fetch;
+
+/**
+ * A Telegram that accepts everything and remembers what it was told.
+ *
+ * The two streams are only distinguishable by what was sent and in what order,
+ * so a fetch that merely counts calls cannot tell a per-product message from a
+ * digest — and the ordering is the property that matters when the cap bites.
+ */
+function capturingFetch(): { impl: typeof fetch; texts: string[] } {
+  const texts: string[] = [];
+  const impl = vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
+    texts.push(JSON.parse(String(init?.body)).text);
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as unknown as typeof fetch;
+  return { impl, texts };
+}
 
 beforeAll(async () => {
   for (const file of readdirSync(MIGRATIONS)
@@ -72,6 +92,61 @@ async function seedPriceChange(): Promise<void> {
     VALUES (1, 211850, ${new Date(BASE.getTime() + 24 * HOUR)})`;
   // The store is already known, so this run is about the price, not the shop.
   await sql`UPDATE notify_watermark SET last_store_id = 1, last_product_id = 1 WHERE id = 1`;
+}
+
+/** A rival price change on each of these sets, one product apiece. */
+async function seedRivalChanges(setCodes: string[]): Promise<void> {
+  await sql`
+    INSERT INTO stores (id, marketplace, shop_id, username, is_own, first_seen, last_seen)
+    VALUES (1, 'shopee', 111, 'rival-a', false, ${BASE}, ${BASE})
+    ON CONFLICT (id) DO NOTHING`;
+
+  let id = 0;
+  for (const setCode of setCodes) {
+    id += 1;
+    await sql`
+      INSERT INTO products (id, marketplace, item_id, shop_ref, name, set_code, first_seen, last_seen)
+      VALUES (${id}, 'shopee', ${100 + id}, 1, ${`LEGO ${setCode}`}, ${setCode}, ${BASE}, ${BASE})`;
+    await sql`INSERT INTO price_snapshots (product_ref, price, scraped_at) VALUES (${id}, 186850, ${BASE})`;
+    await sql`
+      INSERT INTO price_snapshots (product_ref, price, scraped_at)
+      VALUES (${id}, ${150100 + id * 1000}, ${new Date(BASE.getTime() + 24 * HOUR)})`;
+  }
+}
+
+/** Our own shop, carrying each of these sets at a price of its own. */
+async function seedOwnShop(setCodes: string[]): Promise<void> {
+  await sql`
+    INSERT INTO stores (id, marketplace, shop_id, username, is_own, first_seen, last_seen)
+    VALUES (900, 'shopee', 900, 'i_bricks', true, ${BASE}, ${BASE})`;
+
+  let id = 900;
+  for (const setCode of setCodes) {
+    id += 1;
+    await sql`
+      INSERT INTO products (id, marketplace, item_id, shop_ref, name, set_code, first_seen, last_seen)
+      VALUES (${id}, 'shopee', ${id}, 900, ${`Punya kita ${setCode}`}, ${setCode}, ${BASE}, ${BASE})`;
+    // One snapshot only: a single price is a position, not a change, so our own
+    // listings never become events of their own here.
+    await sql`INSERT INTO price_snapshots (product_ref, price, scraped_at) VALUES (${id}, 165000, ${BASE})`;
+  }
+}
+
+/**
+ * Put every store and product already seeded behind the watermark.
+ *
+ * Without this the shops and listings a test seeds to create a *price change*
+ * arrive as "new store" and "new product" events too, and the digest they
+ * produce hides whether the price change went where the test says it did.
+ * `last_snapshot_id` is deliberately left alone — the price changes are the
+ * point.
+ */
+async function coverStoresAndProducts(): Promise<void> {
+  await sql`
+    UPDATE notify_watermark
+       SET last_store_id   = (SELECT coalesce(max(id), 0) FROM stores),
+           last_product_id = (SELECT coalesce(max(id), 0) FROM products)
+     WHERE id = 1`;
 }
 
 /**
@@ -215,6 +290,44 @@ describe('resolveSettings', () => {
     // Written out, `0` is a choice rather than an accident, and the difference
     // between the two is the whole point of the blankness check above.
     expect(resolveSettings({ ...base, NOTIFY_MIN_GAP_HOURS: '0' }).minGapHours).toBe(0);
+  });
+
+  /**
+   * The cap gets the same parser, because it has the same blank-string defect
+   * waiting for it: `NOTIFY_PER_PRODUCT_MAX=` would be read as a cap of zero,
+   * which sends every per-product message back into the digest and silently
+   * switches off the feature the variable exists to size.
+   */
+  test.each([
+    ['unset', undefined],
+    ['empty', ''],
+    ['whitespace', '   '],
+    ['not a number', 'banyak'],
+    ['fractional', '7.5'],
+    ['negative', '-1'],
+  ])('treats a %s NOTIFY_PER_PRODUCT_MAX as unset', (_name, raw) => {
+    const settings = resolveSettings({
+      TELEGRAM_BOT_TOKEN: 'token',
+      TELEGRAM_CHAT_ID: 'chat',
+      NOTIFY_SECRET: 'secret',
+      NOTIFY_BASE_URL: 'https://x',
+      NOTIFY_PER_PRODUCT_MAX: raw,
+    });
+
+    expect(settings.perProductMax).toBe(30);
+  });
+
+  test('honours a per-product cap that was actually chosen', () => {
+    const base = {
+      TELEGRAM_BOT_TOKEN: 'token',
+      TELEGRAM_CHAT_ID: 'chat',
+      NOTIFY_SECRET: 'secret',
+      NOTIFY_BASE_URL: 'https://x',
+    };
+
+    expect(resolveSettings({ ...base, NOTIFY_PER_PRODUCT_MAX: '5' }).perProductMax).toBe(5);
+    // Zero written out is a choice: digest only, no per-product messages.
+    expect(resolveSettings({ ...base, NOTIFY_PER_PRODUCT_MAX: '0' }).perProductMax).toBe(0);
   });
 });
 
@@ -375,5 +488,147 @@ describe('runNotify', () => {
     // watermark ids, and not a fresh stale-warning stamp either.
     const after = await readWatermarkRow();
     expect(after).toEqual(before);
+  });
+});
+
+describe('runNotify — the two streams', () => {
+  test('gives a change on a set we sell a message of its own, not a digest line', async () => {
+    await seedRivalChanges(['42218']);
+    await seedOwnShop(['42218']);
+    await coverStoresAndProducts();
+    const telegram = capturingFetch();
+
+    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: telegram.impl });
+
+    expect(outcome).toMatchObject({ priceChanges: 1, perProduct: 1 });
+    // One message, and it is the per-product one: `rest` is empty, so there is
+    // no digest left to render.
+    expect(telegram.texts).toHaveLength(1);
+    expect(outcome.sent).toBe(1);
+    expect(telegram.texts[0]).toContain('posisi kita di 42218');
+    expect(telegram.texts[0]).toContain('i_bricks');
+    expect(telegram.texts[0]).not.toContain('📊');
+  });
+
+  test('leaves a change on a set we do not sell in the digest', async () => {
+    await seedRivalChanges(['42218']);
+    await seedOwnShop(['10321']);
+    await coverStoresAndProducts();
+    const telegram = capturingFetch();
+
+    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: telegram.impl });
+
+    expect(outcome).toMatchObject({ priceChanges: 1, perProduct: 0 });
+    expect(telegram.texts).toHaveLength(1);
+    // The digest, not a per-product message. "posisi kita di" is no use as the
+    // discriminator — it is also the digest's own link label
+    // (renderPriceGroup) — so this checks the header and the position block,
+    // which only the per-product renderer produces.
+    expect(telegram.texts[0].startsWith('<b>📊')).toBe(true);
+    expect(telegram.texts[0]).not.toContain('Termurah');
+    expect(telegram.texts[0]).not.toContain('belum berharga');
+  });
+
+  test('spills past the cap into the digest, and says how many spilled', async () => {
+    await seedRivalChanges(['1', '2', '3', '4']);
+    await seedOwnShop(['1', '2', '3', '4']);
+    await coverStoresAndProducts();
+    const telegram = capturingFetch();
+
+    const outcome = await runNotify({
+      settings: { ...SETTINGS, perProductMax: 2 },
+      now: NOW,
+      fetchImpl: telegram.impl,
+    });
+
+    expect(outcome).toMatchObject({ priceChanges: 4, perProduct: 2 });
+    // Two per-product messages, then one digest carrying the other two.
+    expect(telegram.texts).toHaveLength(3);
+    expect(telegram.texts[0]).toContain('posisi kita di');
+    expect(telegram.texts[1]).toContain('posisi kita di');
+
+    const digest = telegram.texts[2];
+    expect(digest).toContain('📊');
+    // Named, not merely present: a reader who gets two messages and a digest
+    // needs to know the digest is holding the overflow of the same stream.
+    expect(digest).toContain('2');
+    expect(digest).toMatch(/batas|melewati/i);
+  });
+
+  test('sends the most significant moves first when the cap bites', async () => {
+    await seedRivalChanges(['1', '2', '3', '4']);
+    await seedOwnShop(['1', '2', '3', '4']);
+    await coverStoresAndProducts();
+    // seedRivalChanges moves each set from 186.850 to 150.100 + 1.000 x n, so
+    // set 1 falls furthest and set 4 least. A cap of 1 must keep set 1.
+    const telegram = capturingFetch();
+
+    await runNotify({
+      settings: { ...SETTINGS, perProductMax: 1 },
+      now: NOW,
+      fetchImpl: telegram.impl,
+    });
+
+    expect(telegram.texts[0]).toContain('posisi kita di 1');
+  });
+
+  test('sends no per-product message when the cap is a deliberate zero', async () => {
+    await seedRivalChanges(['42218']);
+    await seedOwnShop(['42218']);
+    await coverStoresAndProducts();
+    const telegram = capturingFetch();
+
+    const outcome = await runNotify({
+      settings: { ...SETTINGS, perProductMax: 0 },
+      now: NOW,
+      fetchImpl: telegram.impl,
+    });
+
+    expect(outcome.perProduct).toBe(0);
+    expect(telegram.texts).toHaveLength(1);
+    expect(telegram.texts[0]).toContain('📊');
+  });
+
+  test('advances the watermark past both streams together', async () => {
+    await seedRivalChanges(['42218', '10321']);
+    await seedOwnShop(['42218']);
+    await coverStoresAndProducts();
+    const ceilings = await readCeilings(sql);
+
+    await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: okFetch() });
+
+    // One event set, one watermark: the split is a rendering decision and must
+    // not leave half the changes to be found again next run.
+    const after = await readWatermarkRow();
+    expect(after.lastSnapshotId).toBe(String(ceilings.snapshotId));
+
+    const second = okFetch();
+    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: second });
+    expect(outcome.priceChanges).toBe(0);
+    expect(second).not.toHaveBeenCalled();
+  });
+
+  test('leaves the watermark alone when a per-product message is refused', async () => {
+    await seedRivalChanges(['42218']);
+    await seedOwnShop(['42218']);
+    await coverStoresAndProducts();
+    const before = await readWatermarkRow();
+
+    const refuse = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ ok: false, description: 'Bad Request' }), {
+          status: 400,
+          headers: { 'content-type': 'application/json' },
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      runNotify({ settings: SETTINGS, now: NOW, fetchImpl: refuse }),
+    ).rejects.toThrow(/Telegram/);
+
+    // The per-product stream is inside the same transaction as everything else,
+    // so a rejection there rolls the watermark back exactly as a digest
+    // rejection does — duplicates next run, never a silent loss.
+    expect(await readWatermarkRow()).toEqual(before);
   });
 });

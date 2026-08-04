@@ -354,9 +354,26 @@ function paginate(lines: string[]): string[] {
   return kept;
 }
 
+/**
+ * Why some of these rows are here rather than in a message of their own.
+ *
+ * Without it the reader sees the cap as an inconsistency — a change on one of
+ * our sets got its own message, an identical-looking one did not — and has no
+ * way to tell that from the notifier having missed it.
+ */
+function spilledNotice(spilled: number): string[] {
+  if (spilled <= 0) return [];
+  return [
+    `<i>${escapeHtml(
+      `${plain.format(spilled)} perubahan di set kita melewati batas pesan per-produk dan ikut di sini.`,
+    )}</i>`,
+    '',
+  ];
+}
+
 export function renderDigest(
   events: Events,
-  options: { baseUrl: string; now: Date },
+  options: { baseUrl: string; now: Date; spilled?: number },
 ): string[] {
   const rises = events.priceChanges.filter((change) => Number(change.price) > Number(change.previousPrice));
   const falls = events.priceChanges.filter((change) => Number(change.price) < Number(change.previousPrice));
@@ -364,6 +381,7 @@ export function renderDigest(
   const lines = [
     `<b>📊 ${escapeHtml(stamp.format(options.now))}</b>`,
     '',
+    ...spilledNotice(options.spilled ?? 0),
     ...renderPriceGroup('📈 Naik harga', rises, options.baseUrl),
     ...renderPriceGroup('📉 Turun harga', falls, options.baseUrl),
     ...renderNewStores(events.newStores, options.baseUrl),

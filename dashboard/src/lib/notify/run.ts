@@ -4,8 +4,14 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 
 import { sql } from '@/lib/db';
 import { collectEvents, hasAny, latestScrapedAt } from '@/lib/notify/events';
-import { renderDigest, renderStaleWarning } from '@/lib/notify/format';
+import {
+  renderDigest,
+  renderProductMessage,
+  renderStaleWarning,
+  splitByOwnSets,
+} from '@/lib/notify/format';
 import { resolveBaseUrl } from '@/lib/notify/links';
+import { ownSetPositions } from '@/lib/notify/positions';
 import { sendMessages } from '@/lib/notify/telegram';
 import {
   advanceWatermark,
@@ -30,6 +36,7 @@ export type NotifySettings = {
   baseUrl: string;
   minGapHours: number;
   staleHours: number;
+  perProductMax: number;
 };
 
 /**
@@ -59,11 +66,28 @@ export type NotifyEnv = {
   VERCEL_PROJECT_PRODUCTION_URL?: string;
   NOTIFY_MIN_GAP_HOURS?: string;
   NOTIFY_STALE_HOURS?: string;
+  NOTIFY_PER_PRODUCT_MAX?: string;
 };
 
 const DEFAULT_MIN_GAP_HOURS = 12;
 const DEFAULT_STALE_HOURS = 36;
 const STALE_WARNING_COOLDOWN_HOURS = 24;
+
+/**
+ * How many changes may get a message of their own in one run.
+ *
+ * Thirty, from Telegram's ceiling rather than from taste: at roughly 20
+ * messages a minute, thirty per-product messages plus at most four digest
+ * messages is about 1.7 minutes of sending inside a function whose limit is
+ * 300 seconds. Comfortable margin.
+ *
+ * Raising it is supported, but the consequence has to be legible: the higher
+ * it goes the longer the transaction holds the watermark lock, and passing the
+ * function's time limit means the transaction is rolled back, the watermark
+ * does not move, and the next run queues the same backlog only longer. That is
+ * a jam that does not clear itself.
+ */
+const DEFAULT_PER_PRODUCT_MAX = 30;
 
 function required(env: NotifyEnv, name: keyof NotifyEnv): string {
   const value = env[name]?.trim();
@@ -74,7 +98,13 @@ function required(env: NotifyEnv, name: keyof NotifyEnv): string {
 }
 
 /**
- * A whole, non-negative number of hours — or the documented default.
+ * A whole, non-negative number — or the documented default.
+ *
+ * Used for the two hour settings and for the per-product cap. One parser, not
+ * three: the defect it guards against is a property of the environment, not of
+ * any one variable, and `NOTIFY_PER_PRODUCT_MAX=` read as a cap of zero would
+ * send every per-product message back into the digest — the feature switched
+ * off by the variable that exists to size it.
  *
  * The blankness check has to come before `Number()`, not be folded into the
  * condition after it: `Number('')` is `0`, and `Number('   ')` is `0` too. Both
@@ -94,7 +124,7 @@ function required(env: NotifyEnv, name: keyof NotifyEnv): string {
  * blank case, and someone who typed a fraction is better served by the
  * documented default than by a rule they did not ask for and cannot see.
  */
-function wholeHours(raw: string | undefined, fallback: number): number {
+function wholeNumber(raw: string | undefined, fallback: number): number {
   const text = raw?.trim();
   if (!text) return fallback;
   const value = Number(text);
@@ -120,8 +150,9 @@ export function resolveSettings(env: NotifyEnv): NotifySettings {
       NOTIFY_BASE_URL: env.NOTIFY_BASE_URL,
       VERCEL_PROJECT_PRODUCTION_URL: env.VERCEL_PROJECT_PRODUCTION_URL,
     }),
-    minGapHours: wholeHours(env.NOTIFY_MIN_GAP_HOURS, DEFAULT_MIN_GAP_HOURS),
-    staleHours: wholeHours(env.NOTIFY_STALE_HOURS, DEFAULT_STALE_HOURS),
+    minGapHours: wholeNumber(env.NOTIFY_MIN_GAP_HOURS, DEFAULT_MIN_GAP_HOURS),
+    staleHours: wholeNumber(env.NOTIFY_STALE_HOURS, DEFAULT_STALE_HOURS),
+    perProductMax: wholeNumber(env.NOTIFY_PER_PRODUCT_MAX, DEFAULT_PER_PRODUCT_MAX),
   };
 }
 
@@ -142,6 +173,8 @@ export function secretMatches(supplied: string | null | undefined, expected: str
 export type NotifyOutcome = {
   sent: number;
   priceChanges: number;
+  /** How many of those changes got a message of their own. */
+  perProduct: number;
   newStores: number;
   newProducts: number;
   stale: boolean;
@@ -178,14 +211,43 @@ export async function runNotify(options: {
     };
 
     if (hasAny(events)) {
-      const messages = renderDigest(events, { baseUrl: settings.baseUrl, now });
-      const sent = await sendMessages(messages, {
+      // Read once for the whole run: the map's keys are the membership the
+      // split filters on, and its values are the position each per-product
+      // message states. Asking per change would be the 9.5ms x 77 this query
+      // exists to avoid.
+      const positions = await ownSetPositions(tx);
+      const { perProduct, rest } = splitByOwnSets(
+        events.priceChanges,
+        new Set(positions.keys()),
+      );
+
+      // Ordered by proportional move, so the cap keeps the changes that most
+      // demand a decision and spills the rest — into the digest, never away.
+      const taken = perProduct.slice(0, settings.perProductMax);
+      const spilled = perProduct.slice(settings.perProductMax);
+
+      const productMessages = taken.map((change) =>
+        renderProductMessage(
+          change,
+          change.setCode === null ? undefined : positions.get(change.setCode),
+          { baseUrl: settings.baseUrl },
+        ),
+      );
+
+      const digest = renderDigest(
+        { ...events, priceChanges: [...rest, ...spilled] },
+        { baseUrl: settings.baseUrl, now, spilled: spilled.length },
+      );
+
+      // One call, per-product first: if the cap bit, the most significant moves
+      // are the ones already delivered when a rejection ends the run.
+      const sent = await sendMessages([...productMessages, ...digest], {
         botToken: settings.botToken,
         chatId: settings.chatId,
         fetchImpl,
       });
       await advanceWatermark(tx, ceilings);
-      return { sent, ...counts, stale: false };
+      return { sent, ...counts, perProduct: taken.length, stale: false };
     }
 
     // Nothing happened. Before accepting that as the answer, check whether this
@@ -197,7 +259,7 @@ export async function runNotify(options: {
       // Genuinely quiet. Advance anyway so the rows examined this run are not
       // re-examined next run.
       await advanceWatermark(tx, ceilings);
-      return { sent: 0, ...counts, stale: false };
+      return { sent: 0, ...counts, perProduct: 0, stale: false };
     }
 
     const warnedAgoHours =
@@ -208,7 +270,7 @@ export async function runNotify(options: {
     if (warnedAgoHours < STALE_WARNING_COOLDOWN_HOURS) {
       // Already warned recently. A database frozen for a fortnight must not
       // become the source of its own spam.
-      return { sent: 0, ...counts, stale: true };
+      return { sent: 0, ...counts, perProduct: 0, stale: true };
     }
 
     const sent = await sendMessages([renderStaleWarning({ latest, hours: ageHours })], {
@@ -219,6 +281,6 @@ export async function runNotify(options: {
     await stampStaleWarning(tx, now);
     // The watermark deliberately does not move: there was nothing to report,
     // and moving it would hide the gap if the database starts moving again.
-    return { sent, ...counts, stale: true };
+    return { sent, ...counts, perProduct: 0, stale: true };
   });
 }

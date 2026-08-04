@@ -653,6 +653,25 @@ against the immediate predecessor reports mostly artefacts.
 
 Set `NOTIFY_MIN_GAP_HOURS=0` to turn the rule off and see the difference.
 
+### Which changes get a message of their own
+
+A change on a `set_code` one of our own shops carries gets its own message,
+carrying where we stand on that set: our price and shop, the cheapest rival and
+how many rivals there are, and which side we are on. Everything else stays in
+the digest, because "a shop we do not compete with moved a price" has no
+position to state.
+
+Where the two sides of a set are not comparable — `8827` is a sealed box of
+sixty in our shop and a single loose minifigure in someone else's — the message
+still goes out, but the position line is replaced by a note saying so. A
+confidently wrong "kita lebih mahal Rp 8,1 juta" costs the reader their trust in
+every other message that was right.
+
+`NOTIFY_PER_PRODUCT_MAX` (30) caps how many of these one run sends. The order is
+by proportional move, largest first, so a cap that bites keeps the changes that
+most demand a decision; the remainder drops into the digest, which says how many
+it is holding. Set 0 for digest only.
+
 ### If it goes quiet
 
 Silence is correct when nothing changed. It is also what a notifier reading the
