@@ -47,6 +47,15 @@ export type SetPosition = {
   extreme: boolean;
 };
 
+function extremeGap(ourPrice: string | null, cheapestRival: string | null): boolean {
+  if (ourPrice === null || cheapestRival === null) return false;
+  const ours = Number(ourPrice);
+  const rival = Number(cheapestRival);
+  const smaller = Math.min(ours, rival);
+  if (smaller === 0) return false;
+  return Math.abs(ours - rival) / smaller >= EXTREME_GAP;
+}
+
 export async function ownSetPositions(tx: Sql): Promise<Map<string, SetPosition>> {
   const rows = await tx<
     {
@@ -117,7 +126,14 @@ export async function ownSetPositions(tx: Sql): Promise<Map<string, SetPosition>
       cheapestRival,
       rivalCount: Number(row.rival_count),
       // Both sides must exist to say anything about the gap between them: a
-      // set where we have no recorded price is unpriced, not extreme.
+      // set where we have no recorded price is unpriced, not extreme. A zero
+      // on either side is the same kind of non-answer, and it has to be
+      // excluded before the division rather than after: `price` is a plain
+      // numeric with no CHECK (migrations/001_init.sql:78), and in JS a
+      // positive numerator over zero is Infinity, which clears any threshold.
+      // A free listing would report as an extreme gap. The three copies of
+      // this rule in queries.ts guard the zero and answer false; this agrees
+      // with them.
       //
       // Divided by the smaller of the two, not by cheapestRival alone.
       // Dividing by the rival unconditionally only ever fires when WE are the
@@ -126,12 +142,7 @@ export async function ownSetPositions(tx: Sql): Promise<Map<string, SetPosition>
       // trips a threshold of 1.0 in that direction. least() catches both
       // directions and leaves the case that already worked unchanged: when we
       // are the dearer side, our price was never the smaller one anyway.
-      extreme:
-        ourPrice !== null &&
-        cheapestRival !== null &&
-        Math.abs(Number(ourPrice) - Number(cheapestRival)) /
-          Math.min(Number(ourPrice), Number(cheapestRival)) >=
-          EXTREME_GAP,
+      extreme: extremeGap(ourPrice, cheapestRival),
     });
   }
   return positions;

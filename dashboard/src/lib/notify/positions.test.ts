@@ -285,3 +285,64 @@ describe('ownSetPositions — extreme gap is symmetric', () => {
     expect(positions.get('10323')).toMatchObject({ extreme: false });
   });
 });
+
+describe('ownSetPositions — a zero price is not an extreme gap', () => {
+  /**
+   * `price` is a plain `numeric` with no CHECK (migrations/001_init.sql:78), so
+   * a scrape that reads 0 stores 0. Dividing by `least()` then divides by zero,
+   * and in JS that is `Infinity`, which clears any threshold — a free listing
+   * would be reported as an extreme gap rather than as the bad datum it is.
+   *
+   * The three sibling copies of this rule in `queries.ts` all guard the zero
+   * explicitly and answer `false`. This one must agree with them: the point of
+   * deciding "is this extreme" in one place is lost if the four places that
+   * still express the rule disagree about its edges.
+   */
+
+  test('does not flag a set where our price is zero', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'rival-l', false);
+    await addProduct(1, 1, '10324');
+    await addSnapshot(1, 0);
+    await addProduct(2, 2, '10324');
+    await addSnapshot(2, 250_000);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('10324')).toMatchObject({
+      ourPrice: '0',
+      cheapestRival: '250000',
+      extreme: false,
+    });
+  });
+
+  test('does not flag a set where the cheapest rival is zero', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'rival-m', false);
+    await addProduct(1, 1, '10325');
+    await addSnapshot(1, 250_000);
+    await addProduct(2, 2, '10325');
+    await addSnapshot(2, 0);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('10325')).toMatchObject({
+      ourPrice: '250000',
+      cheapestRival: '0',
+      extreme: false,
+    });
+  });
+
+  test('does not flag a set where both sides are zero', async () => {
+    await addStore(1, 'i_bricks', true);
+    await addStore(2, 'rival-n', false);
+    await addProduct(1, 1, '10326');
+    await addSnapshot(1, 0);
+    await addProduct(2, 2, '10326');
+    await addSnapshot(2, 0);
+
+    const positions = await ownSetPositions(sql);
+
+    expect(positions.get('10326')).toMatchObject({ extreme: false });
+  });
+});
