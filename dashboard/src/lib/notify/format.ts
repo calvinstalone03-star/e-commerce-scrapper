@@ -1,5 +1,10 @@
 import type { Events, NewProduct, NewStore, PriceChange } from '@/lib/notify/events';
 import { absolute, newProductLink, newStoreLink, priceChangeLink } from '@/lib/notify/links';
+// `import type`, deliberately: positions.ts imports `server-only` at its top,
+// and a value import would pull that into this module's runtime graph. This
+// file is pure and stays that way — the type is erased at compile time, so
+// nothing is imported at all.
+import type { SetPosition } from '@/lib/notify/positions';
 
 /**
  * The digest, as Telegram HTML.
@@ -371,6 +376,178 @@ export function renderDigest(
   if (!hasBody) return [];
 
   return paginate(lines);
+}
+
+/**
+ * Which changes are worth a message of their own.
+ *
+ * Membership, not interest: a change joins the per-product stream when it
+ * happened on a `set_code` one of our own shops carries, because that is
+ * exactly the case where "what does this do to us" has an answer. Everything
+ * else is news about a market we are not in, which is what the digest is for.
+ *
+ * A change with no `set_code` can never qualify — accessories, bundles and
+ * knock-offs carry none, and there is no set for them to belong to.
+ */
+export function splitByOwnSets(
+  changes: PriceChange[],
+  ownSetCodes: ReadonlySet<string>,
+): { perProduct: PriceChange[]; rest: PriceChange[] } {
+  const perProduct: PriceChange[] = [];
+  const rest: PriceChange[] = [];
+
+  for (const change of changes) {
+    if (change.setCode !== null && ownSetCodes.has(change.setCode)) perProduct.push(change);
+    else rest.push(change);
+  }
+
+  // Biggest proportional move first. `run.ts` caps this list at
+  // NOTIFY_PER_PRODUCT_MAX and spills the remainder into the digest, so this
+  // order is not presentation — it decides which changes keep a message of
+  // their own when the cap bites.
+  perProduct.sort((left, right) => magnitude(right) - magnitude(left));
+  return { perProduct, rest };
+}
+
+/**
+ * How far a price moved, as a fraction of where it started.
+ *
+ * A previous price of zero is not an infinite rise, it is a listing whose old
+ * price was never real. Dividing by it gives Infinity, which would put that row
+ * at the head of the order and spend a capped per-product slot on it, so it
+ * ranks as no movement instead — last, where a reader can still find it in the
+ * digest if the cap pushed it there.
+ */
+function magnitude(change: PriceChange): number {
+  const from = Number(change.previousPrice);
+  if (from === 0) return 0;
+  return Math.abs(delta(change) / from);
+}
+
+/** What the position block says when we have no price of our own on the set. */
+const NO_OWN_PRICE = 'Kita belum berharga di set ini.';
+
+/** And when we do, but nobody else does. */
+const NO_RIVAL_PRICE = 'Belum ada rival berharga di set ini.';
+
+/**
+ * What replaces the position block when the two sides are not comparable.
+ *
+ * The message still goes out — a rival did move, and that is a fact — but the
+ * position line does not, because on a `set_code` like `8827` it would read
+ * "kita lebih mahal Rp 8,1 juta" comparing a sealed box of sixty against one
+ * loose minifigure. Confidently wrong once costs the reader their trust in the
+ * seventy-one messages that were right.
+ */
+const INCOMPARABLE = [
+  'Pembanding tidak sebanding — set ini memuat',
+  'barang berbeda di bawah satu nomor.',
+];
+
+/**
+ * Where we stand on this set, in the three lines the design specifies.
+ *
+ * Every branch here ends with a link, because every branch is a claim the
+ * reader may want to check, and the collapsed ones most of all.
+ */
+function positionBlock(
+  change: PriceChange,
+  position: SetPosition | undefined,
+  baseUrl: string,
+): string[] {
+  const target = priceChangeLink(change);
+  const label = change.setCode ? `posisi kita di ${change.setCode}` : 'lihat di dashboard';
+
+  if (position?.extreme) {
+    return [
+      ...INCOMPARABLE.map(escapeHtml),
+      link(baseUrl, target, 'periksa di dashboard'),
+    ];
+  }
+
+  // A set missing from the map is a set no own shop carries a priced listing
+  // on, which is the same thing the reader needs told as `ourPrice` null.
+  if (position === undefined || position.ourPrice === null) {
+    return [escapeHtml(NO_OWN_PRICE), '', link(baseUrl, target, label)];
+  }
+
+  const ours = Number(position.ourPrice);
+  const lines = [
+    escapeHtml(`Kita        ${money(ours)}  (${position.ourShop ?? 'toko kita'})`),
+  ];
+
+  if (position.cheapestRival === null) {
+    lines.push(escapeHtml(NO_RIVAL_PRICE));
+  } else {
+    const rival = Number(position.cheapestRival);
+    const shops = `${plain.format(position.rivalCount)} toko`;
+    lines.push(escapeHtml(`Termurah    ${money(rival)}  dari ${shops}`));
+    // At or below the cheapest rival is TERMURAH: a tie is not being beaten.
+    const standing = ours <= rival ? 'TERMURAH' : 'TERMAHAL';
+    lines.push(escapeHtml(`→ kita ${standing}, selisih ${money(Math.abs(ours - rival))}`));
+  }
+
+  return [...lines, '', link(baseUrl, target, label)];
+}
+
+/**
+ * One change, one message.
+ *
+ * Never split: `pack()` exists because a digest is as long as the events make
+ * it, but a single change has a bounded shape — except for the listing name,
+ * which marketplaces let run to thousands of characters. That one unbounded
+ * part is cut to fit rather than spilled into a second message.
+ */
+export function renderProductMessage(
+  change: PriceChange,
+  position: SetPosition | undefined,
+  options: { baseUrl: string },
+): string {
+  const from = Number(change.previousPrice);
+  const to = Number(change.price);
+  const pct = percent(from, to);
+
+  const build = (name: string): string =>
+    [
+      `${to > from ? '📈' : '📉'} <b>${escapeHtml(name)}</b>`,
+      shopLabel(change.username, change.marketplace),
+      '',
+      `${escapeHtml(`${money(from)} → ${money(to)}`)}${pct ? `   (${escapeHtml(pct)})` : ''}`,
+      '',
+      ...positionBlock(change, position, options.baseUrl),
+    ].join('\n');
+
+  let name = change.name ?? 'tanpa nama';
+  let message = build(name);
+
+  // Cut the raw name, not the rendered message: a cut through the middle of
+  // `&amp;` leaves `&am`, which Telegram rejects for the whole message, and a
+  // cut through an `<a href=...>` leaves the unbalanced tag `pack()` goes to
+  // such lengths to avoid. Escaping after the cut cannot produce either.
+  //
+  // Terminates: escaping only ever expands, so dropping one raw character
+  // drops at least one rendered character. Removing `over + 1` of them makes
+  // room for the ellipsis and the overflow both.
+  while (message.length > TELEGRAM_MAX_CHARS && name.length > 0) {
+    const over = message.length - TELEGRAM_MAX_CHARS;
+    name = `${trimTail(name, name.length - over - 1)}…`;
+    message = build(name);
+  }
+
+  return message;
+}
+
+/**
+ * Cut to a length without leaving half a character behind.
+ *
+ * `slice` counts UTF-16 units, so a cut can land between the halves of an emoji
+ * and leave a lone surrogate — which is not a character, renders as U+FFFD, and
+ * is one more thing for Telegram to object to. Drop the orphan.
+ */
+function trimTail(value: string, length: number): string {
+  const cut = value.slice(0, Math.max(0, length));
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 }
 
 /**

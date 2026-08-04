@@ -8,8 +8,11 @@ import {
   escapeHtml,
   foldPriceChanges,
   renderDigest,
+  renderProductMessage,
   renderStaleWarning,
+  splitByOwnSets,
 } from '@/lib/notify/format';
+import type { SetPosition } from '@/lib/notify/positions';
 
 /**
  * The message itself.
@@ -399,5 +402,243 @@ describe('renderStaleWarning', () => {
   test('handles a database with no snapshots at all', () => {
     const message = renderStaleWarning({ latest: null, hours: 0 });
     expect(message).toContain('belum ada snapshot');
+  });
+});
+
+const position = (over: Partial<SetPosition> = {}): SetPosition => ({
+  setCode: '42218',
+  ourPrice: '165000',
+  ourShop: 'i_bricks',
+  cheapestRival: '150100',
+  rivalCount: 4,
+  extreme: false,
+  ...over,
+});
+
+describe('splitByOwnSets', () => {
+  test('sends a change on a set we sell to the per-product stream', () => {
+    const mine = change({ setCode: '42218' });
+    const split = splitByOwnSets([mine], new Set(['42218']));
+    expect(split.perProduct).toEqual([mine]);
+    expect(split.rest).toEqual([]);
+  });
+
+  test('leaves a change on a set we do not sell in the digest', () => {
+    const theirs = change({ setCode: '10321' });
+    const split = splitByOwnSets([theirs], new Set(['42218']));
+    expect(split.perProduct).toEqual([]);
+    expect(split.rest).toEqual([theirs]);
+  });
+
+  test('puts a change with no set code in the digest, never per-product', () => {
+    // An accessory or a knock-off carries no set number, so there is no set for
+    // it to belong to and no position to state — the whole premise of the
+    // per-product message is missing.
+    const nameless = change({ setCode: null });
+    const split = splitByOwnSets([nameless], new Set(['42218']));
+    expect(split.perProduct).toEqual([]);
+    expect(split.rest).toEqual([nameless]);
+  });
+
+  test('orders the per-product stream by percentage, largest first', () => {
+    // The cap in run.ts bites from the bottom, so this ordering decides which
+    // changes survive it: the biggest proportional move demands a decision
+    // most.
+    const small = change({ productId: 1, setCode: '1', previousPrice: '100000', price: '103000' });
+    const big = change({ productId: 2, setCode: '2', previousPrice: '100000', price: '160000' });
+    const middling = change({ productId: 3, setCode: '3', previousPrice: '100000', price: '120000' });
+
+    const split = splitByOwnSets([small, big, middling], new Set(['1', '2', '3']));
+
+    expect(split.perProduct.map((entry) => entry.productId)).toEqual([2, 3, 1]);
+  });
+
+  test('ranks a fall by its size, not its sign', () => {
+    const rise = change({ productId: 1, setCode: '1', previousPrice: '100000', price: '110000' });
+    const fall = change({ productId: 2, setCode: '2', previousPrice: '100000', price: '50000' });
+
+    const split = splitByOwnSets([rise, fall], new Set(['1', '2']));
+
+    expect(split.perProduct.map((entry) => entry.productId)).toEqual([2, 1]);
+  });
+
+  test('ranks a change from a zero price last rather than first', () => {
+    // previousPrice 0 makes the percentage a division by zero, which is
+    // Infinity — it would top the order and spend a capped per-product slot on
+    // a listing whose old price was never real. It is not a reprice worth
+    // ranking, so it sorts as no movement at all.
+    const fromZero = change({ productId: 1, setCode: '1', previousPrice: '0', price: '150000' });
+    const ordinary = change({ productId: 2, setCode: '2', previousPrice: '100000', price: '101000' });
+
+    const split = splitByOwnSets([fromZero, ordinary], new Set(['1', '2']));
+
+    expect(split.perProduct.map((entry) => entry.productId)).toEqual([2, 1]);
+  });
+});
+
+describe('renderProductMessage', () => {
+  test('renders the spec message for a fall, with our position under it', () => {
+    const message = renderProductMessage(
+      change({
+        name: 'LEGO Technic 42218 John Deere 1470H',
+        username: 'lego.indonesia',
+        previousPrice: '186850',
+        price: '150100',
+      }),
+      position(),
+      { baseUrl: BASE_URL },
+    );
+
+    expect(message).toContain('📉');
+    expect(message).toContain('LEGO Technic 42218 John Deere 1470H');
+    expect(message).toContain('lego.indonesia · Shopee');
+    expect(message).toContain('−19,7%');
+    expect(message).toContain('i_bricks');
+    expect(message).toContain('dari 4 toko');
+    expect(message).toContain('posisi kita di 42218');
+  });
+
+  test('marks a rise with the rising arrow', () => {
+    const message = renderProductMessage(
+      change({ previousPrice: '150100', price: '186850' }),
+      position(),
+      { baseUrl: BASE_URL },
+    );
+    expect(message).toContain('📈');
+    expect(message).toContain('+24,5%');
+  });
+
+  test('says TERMAHAL, and by how much, when we are the dearer side', () => {
+    const message = renderProductMessage(
+      change(),
+      position({ ourPrice: '165000', cheapestRival: '150100' }),
+      { baseUrl: BASE_URL },
+    );
+    expect(message).toContain('TERMAHAL');
+    expect(message).not.toContain('TERMURAH');
+    expect(message).toContain('14.900');
+  });
+
+  test('says TERMURAH when our price is at or below the cheapest rival', () => {
+    const message = renderProductMessage(
+      change(),
+      position({ ourPrice: '140000', cheapestRival: '150100' }),
+      { baseUrl: BASE_URL },
+    );
+    expect(message).toContain('TERMURAH');
+    expect(message).not.toContain('TERMAHAL');
+  });
+
+  test('counts a tie as TERMURAH, not TERMAHAL', () => {
+    const message = renderProductMessage(
+      change(),
+      position({ ourPrice: '150100', cheapestRival: '150100' }),
+      { baseUrl: BASE_URL },
+    );
+    expect(message).toContain('TERMURAH');
+  });
+
+  test('collapses the position block when we have no price on the set', () => {
+    const message = renderProductMessage(change(), position({ ourPrice: null, ourShop: null }), {
+      baseUrl: BASE_URL,
+    });
+    expect(message).toContain('belum berharga');
+    expect(message).not.toContain('TERMAHAL');
+    expect(message).not.toContain('TERMURAH');
+    // Still a message: the rival did move, and that is a fact worth sending.
+    expect(message).toContain('posisi kita di 42218');
+  });
+
+  test('treats a set missing from the map the same as having no price', () => {
+    const message = renderProductMessage(change(), undefined, { baseUrl: BASE_URL });
+    expect(message).toContain('belum berharga');
+    expect(message).not.toContain('TERMAHAL');
+  });
+
+  test('replaces the position block with the incomparable notice when extreme', () => {
+    // Set 8827: a sealed box of sixty against a single loose minifigure. The
+    // pairing is real and the arithmetic is right, but "kita lebih mahal Rp 8,1
+    // juta" is nonsense that costs the reader their trust in the other 71.
+    const message = renderProductMessage(
+      change({ setCode: '8827' }),
+      position({ setCode: '8827', ourPrice: '8500000', cheapestRival: '397000', extreme: true }),
+      { baseUrl: BASE_URL },
+    );
+
+    expect(message).toContain('tidak sebanding');
+    expect(message).not.toContain('TERMAHAL');
+    expect(message).not.toContain('TERMURAH');
+    expect(message).not.toContain('Termurah');
+    expect(message).toContain('periksa di dashboard');
+  });
+
+  test('states the position when the only priced listing is ours', () => {
+    const message = renderProductMessage(
+      change(),
+      position({ cheapestRival: null, rivalCount: 0 }),
+      { baseUrl: BASE_URL },
+    );
+    expect(message).toContain('165.000');
+    expect(message).not.toContain('TERMAHAL');
+    expect(message).not.toContain('TERMURAH');
+  });
+
+  test('escapes a listing name that would otherwise break the parse', () => {
+    const message = renderProductMessage(
+      change({ name: 'Batman & Robin <set> 76224' }),
+      position(),
+      { baseUrl: BASE_URL },
+    );
+    expect(message).toContain('Batman &amp; Robin &lt;set&gt; 76224');
+    expect(message).not.toContain('<set>');
+  });
+
+  test('escapes a shop username too', () => {
+    const message = renderProductMessage(change({ username: 'toko<&>x' }), position(), {
+      baseUrl: BASE_URL,
+    });
+    expect(message).toContain('toko&lt;&amp;&gt;x');
+  });
+
+  test('makes the link absolute', () => {
+    const message = renderProductMessage(change(), position(), { baseUrl: BASE_URL });
+    expect(message).toContain(`href="${BASE_URL}/pricing?`);
+  });
+
+  test('fits one Telegram message even when the name is absurd', () => {
+    // There is no splitting here — a per-product message is one message by
+    // definition — so an overlong name has to be cut rather than spilled.
+    const message = renderProductMessage(change({ name: 'L'.repeat(20_000) }), position(), {
+      baseUrl: BASE_URL,
+    });
+
+    expect(message.length).toBeLessThanOrEqual(TELEGRAM_MAX_CHARS);
+    expect(message).toContain('posisi kita di 42218');
+  });
+
+  test('fits one message when every character of the name escapes to five', () => {
+    const message = renderProductMessage(change({ name: '&'.repeat(20_000) }), position(), {
+      baseUrl: BASE_URL,
+    });
+
+    expect(message.length).toBeLessThanOrEqual(TELEGRAM_MAX_CHARS);
+    expect(message).toContain('posisi kita di 42218');
+  });
+
+  test('leaves no half-escaped entity where an overlong name was cut', () => {
+    const message = renderProductMessage(change({ name: '&'.repeat(20_000) }), position(), {
+      baseUrl: BASE_URL,
+    });
+
+    // A cut through `&amp;` leaves `&am`, which Telegram rejects for the whole
+    // message. Every `&` that survives must still be a complete entity.
+    expect(message.replace(/&(amp|lt|gt);/g, '')).not.toContain('&');
+  });
+
+  test('handles a listing with no name at all', () => {
+    const message = renderProductMessage(change({ name: null }), position(), {
+      baseUrl: BASE_URL,
+    });
+    expect(message).toContain('tanpa nama');
   });
 });
