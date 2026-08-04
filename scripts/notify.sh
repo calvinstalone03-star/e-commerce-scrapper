@@ -41,6 +41,11 @@ fi
 # run with `detail`, carrying Postgres's or Telegram's own words — and without
 # it the operator's log reads `curl: (22) ... 503` and nothing else.
 #
+# Stamped, because launchd runs this unattended every half hour and appends to
+# one log: without a date, a run that sent nothing is indistinguishable from a
+# run that never happened, which is the first thing anyone checks.
+printf '[%s] ' "$(date -Iseconds)"
+
 # No -v, ever: the Authorization header is on this request.
 curl -sS --fail-with-body -X POST \
      -H "Authorization: Bearer ${NOTIFY_SECRET}" \

@@ -629,12 +629,37 @@ NOTIFY_URL=https://<your-deployment>
 NOTIFY_SECRET=<the same value you gave Vercel>
 ```
 
-**4. Trigger it after a scrape.**
+**4. Trigger it.** Nothing about a scrape sends a notification on its own — the
+notifier is a separate step, and something has to run it. Either shape works:
 
 ```cron
 0 6 * * * cd /path/to/ecom-scraper && .venv/bin/ecom-scraper run --mode store --pages 5 >> logs/store.log 2>&1
 5 7 * * * cd /path/to/ecom-scraper && scripts/notify.sh >> logs/notify.log 2>&1
 ```
+
+Or a launchd agent, which is what this laptop actually runs:
+`~/Library/LaunchAgents/com.ecomscraper.notify.plist`, `StartInterval` 1800,
+`RunAtLoad` true, and deliberately **not** `KeepAlive` — the script exits by
+design, and keeping it alive would restart it in a loop. It is a sibling of the
+`com.ecomscraper.ingest` and `.dashboard` agents, whose launchers are
+`scripts/ingest-server.sh` and `scripts/dashboard-server.sh`. Half an hour is
+not arbitrary: a change only counts once its comparison snapshot is
+`NOTIFY_MIN_GAP_HOURS` (12) older, so a shorter interval does not report more,
+it only finds nothing more often.
+
+Note what `NOTIFY_URL` points at in that arrangement. The scrape data lives in
+Postgres on this laptop, and a Vercel deployment cannot reach `127.0.0.1`, so
+the notifier runs against the local dashboard — `http://127.0.0.1:3100` —
+rather than against the deployment. Pointing it at a deployment means moving
+the database somewhere both can reach first.
+
+Two things silently produce no notification, and both look identical from the
+outside. `scripts/dashboard-server.sh` serves a build and does not make one, so
+a dashboard started before the notifier existed has no `/api/notify` to call —
+`curl -X POST http://127.0.0.1:3100/api/notify` answers 401 when the route is
+there and 404 when it is not. And `next start` reads `.env.local` once at boot,
+so a corrected `TELEGRAM_CHAT_ID` needs `launchctl kickstart -k
+gui/$(id -u)/com.ecomscraper.dashboard` before it takes effect.
 
 The first run after setup sends nothing: the watermark is seeded to what is
 already in the database, because 12,000 listings you have had for weeks are not
