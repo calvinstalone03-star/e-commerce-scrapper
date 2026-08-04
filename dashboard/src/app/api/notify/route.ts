@@ -23,6 +23,17 @@ import {
 
 export const dynamic = 'force-dynamic';
 
+/**
+ * How long the run is allowed to take.
+ *
+ * A literal because Next reads this statically, but it is not a free choice:
+ * it must equal `FUNCTION_BUDGET_SECONDS` in `lib/notify/run.ts`, which is
+ * what the send pacing and the per-product cap are sized against, and
+ * `route.test.ts` asserts the two agree. Unset, the platform picks the limit
+ * and the notifier's arithmetic is reasoning about a number nobody declared.
+ */
+export const maxDuration = 60;
+
 const NO_STORE = { 'Cache-Control': 'private, no-store' };
 
 /** Misconfiguration, not a bad request. Names the variable, echoes no values. */

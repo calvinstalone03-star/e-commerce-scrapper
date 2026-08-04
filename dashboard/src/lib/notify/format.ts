@@ -155,6 +155,26 @@ function delta(change: PriceChange): number {
 }
 
 /**
+ * How far a price moved, as a fraction of where it started.
+ *
+ * Both orderings in this module use it — the digest's groups and the
+ * per-product stream — so a change cannot be the bigger move in one and the
+ * smaller in the other.
+ *
+ * A previous price of zero is not an infinite rise, it is a listing whose old
+ * price was never real. Dividing by it gives Infinity, which would put that row
+ * at the head of both orders: in the digest it would take one of the twelve
+ * printed slots, and in the per-product stream one of the capped messages. It
+ * ranks as no movement instead — last, where it is still readable but costs
+ * nothing that a genuine reprice wanted.
+ */
+function magnitude(change: PriceChange): number {
+  const from = Number(change.previousPrice);
+  if (from === 0) return 0;
+  return Math.abs(delta(change) / from);
+}
+
+/**
  * Collapse a store's simultaneous identical moves into one line.
  *
  * A shop that repriced its whole catalogue made one decision, and printing it
@@ -187,11 +207,12 @@ export function foldPriceChanges(changes: PriceChange[]): FoldedGroup[] {
   }
 
   // Biggest proportional move first, whether folded or not: a listing that
-  // moved 66,7% deserves to be read before one that moved 1,3%.
+  // moved 66,7% deserves to be read before one that moved 1,3%. Through the
+  // same `magnitude` the per-product split orders by, so the two streams
+  // cannot disagree about which move is the bigger one — and so the zero-price
+  // guard is stated once rather than twice.
   const weight = (entry: FoldedGroup): number =>
-    entry.kind === 'folded'
-      ? Math.abs(delta(entry.members[0]) / Number(entry.members[0].previousPrice))
-      : Math.abs(delta(entry.change) / Number(entry.change.previousPrice));
+    magnitude(entry.kind === 'folded' ? entry.members[0] : entry.change);
 
   return folded.sort((left, right) => weight(right) - weight(left));
 }
@@ -425,21 +446,6 @@ export function splitByOwnSets(
   // their own when the cap bites.
   perProduct.sort((left, right) => magnitude(right) - magnitude(left));
   return { perProduct, rest };
-}
-
-/**
- * How far a price moved, as a fraction of where it started.
- *
- * A previous price of zero is not an infinite rise, it is a listing whose old
- * price was never real. Dividing by it gives Infinity, which would put that row
- * at the head of the order and spend a capped per-product slot on it, so it
- * ranks as no movement instead — last, where a reader can still find it in the
- * digest if the cap pushed it there.
- */
-function magnitude(change: PriceChange): number {
-  const from = Number(change.previousPrice);
-  if (from === 0) return 0;
-  return Math.abs(delta(change) / from);
 }
 
 /** What the position block says when we have no price of our own on the set. */

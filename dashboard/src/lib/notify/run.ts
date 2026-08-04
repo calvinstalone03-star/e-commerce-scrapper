@@ -74,20 +74,46 @@ const DEFAULT_STALE_HOURS = 36;
 const STALE_WARNING_COOLDOWN_HOURS = 24;
 
 /**
+ * How long this run may take, declared rather than assumed.
+ *
+ * `route.ts` sets `maxDuration` to this number, and a test holds the two
+ * together. Everything else in the notifier that reasons about time — the send
+ * pacing, the cap below, the refusal to wait out a long `retry_after` — spends
+ * this budget, and until it was declared nothing checked that the total fit.
+ *
+ * Sixty, because `scripts/notify.sh` documents this deployment as Vercel's
+ * Hobby plan, where sixty seconds is the ceiling. The design's own arithmetic
+ * assumed 300 — the Pro ceiling — and that is where the cap of 30 came from.
+ * On Hobby a 30-message run does not merely run late, it is killed
+ * mid-transaction, and a killed run rolls back with the watermark unmoved so
+ * the next one rebuilds the same backlog into the same wall.
+ *
+ * If this deployment is on Pro, raise this to 300 and
+ * `NOTIFY_PER_PRODUCT_MAX` to 30 and the design's numbers are back.
+ */
+export const FUNCTION_BUDGET_SECONDS = 60;
+
+/**
  * How many changes may get a message of their own in one run.
  *
- * Thirty, from Telegram's ceiling rather than from taste: at roughly 20
- * messages a minute, thirty per-product messages plus at most four digest
- * messages is about 1.7 minutes of sending inside a function whose limit is
- * 300 seconds. Comfortable margin.
+ * Ten, which is what `FUNCTION_BUDGET_SECONDS` pays for. Telegram allows about
+ * 20 messages a minute to one group, so `SEND_INTERVAL_MS` spaces them three
+ * seconds apart: ten per-product messages plus at most `MAX_MESSAGES` (4) of
+ * digest is 14 messages, 39 seconds of pacing, plus the requests themselves
+ * and the queries either side. That fits sixty seconds; the design's 30 does
+ * not, and would need the 300 it was costed against.
  *
- * Raising it is supported, but the consequence has to be legible: the higher
- * it goes the longer the transaction holds the watermark lock, and passing the
- * function's time limit means the transaction is rolled back, the watermark
- * does not move, and the next run queues the same backlog only longer. That is
- * a jam that does not clear itself.
+ * Raising it via `NOTIFY_PER_PRODUCT_MAX` is supported and is the right move
+ * the moment the budget above allows it — but the consequence has to be
+ * legible: the higher it goes the longer the transaction holds the watermark
+ * lock, and passing the function's limit means the transaction is rolled back,
+ * the watermark does not move, and the next run queues the same backlog only
+ * longer. That is a jam that does not clear itself.
+ *
+ * What is lost meanwhile is only how many changes get their own message. The
+ * rest are not dropped: they spill into the digest, which says how many.
  */
-const DEFAULT_PER_PRODUCT_MAX = 30;
+export const DEFAULT_PER_PRODUCT_MAX = 10;
 
 function required(env: NotifyEnv, name: keyof NotifyEnv): string {
   const value = env[name]?.trim();
@@ -183,11 +209,20 @@ export type NotifyOutcome = {
 /**
  * Read, send, advance — in one transaction.
  *
- * The transaction spans the Telegram call, which the scraper's own doctrine
- * warns against (`runner.py:976`). The difference is duration: that warning is
- * about a fetch measured in minutes, this is one POST bounded by a 10-second
- * abort. Holding it is what makes the `FOR UPDATE` on the watermark row mean
- * anything — release it before sending and two concurrent triggers both send.
+ * The transaction spans the Telegram calls, which the scraper's own doctrine
+ * warns against (`runner.py:976`). Holding it is what makes the `FOR UPDATE` on
+ * the watermark row mean anything — release it before sending and two
+ * concurrent triggers both send.
+ *
+ * What it costs has grown, and is worth stating plainly rather than leaving as
+ * the single 10-second POST this comment used to describe. A run is now up to
+ * `perProductMax` + 4 messages, each request bounded by `postOnce`'s 10-second
+ * abort and separated by `SEND_INTERVAL_MS` so the burst does not become its
+ * own 429. At the defaults that is 34 messages and 99 seconds of pacing — the
+ * ~1.7 minutes the design costed when it chose 30 — against a 300-second
+ * function limit. The lock is held for all of it. Raising
+ * `NOTIFY_PER_PRODUCT_MAX` spends that margin, and running out of it means a
+ * rollback with the watermark unmoved and a longer backlog next run.
  *
  * The order is deliberate: send first, advance second. A crash between them
  * re-sends next run; the reverse would lose the digest silently.
@@ -196,8 +231,10 @@ export async function runNotify(options: {
   settings: NotifySettings;
   now: Date;
   fetchImpl?: typeof fetch;
+  /** Injected by tests so the send pacing does not cost them real seconds. */
+  sleepImpl?: (ms: number) => Promise<void>;
 }): Promise<NotifyOutcome> {
-  const { settings, now, fetchImpl } = options;
+  const { settings, now, fetchImpl, sleepImpl } = options;
 
   return sql.begin(async (tx) => {
     const watermark = await readWatermarkForUpdate(tx);
@@ -245,6 +282,7 @@ export async function runNotify(options: {
         botToken: settings.botToken,
         chatId: settings.chatId,
         fetchImpl,
+        sleepImpl,
       });
       await advanceWatermark(tx, ceilings);
       return { sent, ...counts, perProduct: taken.length, stale: false };
@@ -277,6 +315,7 @@ export async function runNotify(options: {
       botToken: settings.botToken,
       chatId: settings.chatId,
       fetchImpl,
+      sleepImpl,
     });
     await stampStaleWarning(tx, now);
     // The watermark deliberately does not move: there was nothing to report,

@@ -4,7 +4,12 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import { sql } from '@/lib/db';
-import { resolveSettings, runNotify, secretMatches } from '@/lib/notify/run';
+import {
+  DEFAULT_PER_PRODUCT_MAX,
+  resolveSettings,
+  runNotify,
+  secretMatches,
+} from '@/lib/notify/run';
 import { readCeilings } from '@/lib/notify/watermark';
 
 /**
@@ -38,6 +43,13 @@ const okFetch = () =>
         headers: { 'content-type': 'application/json' },
       }),
   ) as unknown as typeof fetch;
+
+/**
+ * `sendMessages` paces itself so a run cannot become its own 429. That wait is
+ * real seconds, and none of it is what these cases are about — telegram.test.ts
+ * asserts the pacing itself.
+ */
+const noSleep = async (): Promise<void> => {};
 
 /**
  * A Telegram that accepts everything and remembers what it was told.
@@ -314,7 +326,7 @@ describe('resolveSettings', () => {
       NOTIFY_PER_PRODUCT_MAX: raw,
     });
 
-    expect(settings.perProductMax).toBe(30);
+    expect(settings.perProductMax).toBe(DEFAULT_PER_PRODUCT_MAX);
   });
 
   test('honours a per-product cap that was actually chosen', () => {
@@ -348,7 +360,7 @@ describe('runNotify', () => {
     await seedPriceChange();
     const fetchImpl = okFetch();
 
-    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl });
+    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl, sleepImpl: noSleep });
 
     expect(outcome).toMatchObject({ priceChanges: 1, newStores: 0, newProducts: 0, stale: false });
     expect(outcome.sent).toBe(1);
@@ -359,9 +371,9 @@ describe('runNotify', () => {
 
   test('finds nothing on an immediate second run', async () => {
     await seedPriceChange();
-    await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: okFetch() });
+    await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: okFetch(), sleepImpl: noSleep });
 
-    const second = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: okFetch() });
+    const second = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: okFetch(), sleepImpl: noSleep });
     expect(second).toMatchObject({ sent: 0, priceChanges: 0 });
   });
 
@@ -386,7 +398,7 @@ describe('runNotify', () => {
     expect(before.lastSnapshotId).not.toBe(ceilings.snapshotId);
 
     const fetchImpl = okFetch();
-    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl });
+    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl, sleepImpl: noSleep });
 
     expect(outcome.sent).toBe(0);
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -405,7 +417,7 @@ describe('runNotify', () => {
       async () => new Response(JSON.stringify({ ok: false, description: 'boom' }), { status: 400 }),
     ) as unknown as typeof fetch;
 
-    await expect(runNotify({ settings: SETTINGS, now: NOW, fetchImpl: failing })).rejects.toThrow(/boom/);
+    await expect(runNotify({ settings: SETTINGS, now: NOW, fetchImpl: failing, sleepImpl: noSleep })).rejects.toThrow(/boom/);
 
     const [row] = await sql`SELECT last_snapshot_id FROM notify_watermark WHERE id = 1`;
     expect(String(row.last_snapshot_id)).toBe('0');
@@ -416,9 +428,9 @@ describe('runNotify', () => {
     const failing = vi.fn(
       async () => new Response(JSON.stringify({ ok: false, description: 'boom' }), { status: 400 }),
     ) as unknown as typeof fetch;
-    await expect(runNotify({ settings: SETTINGS, now: NOW, fetchImpl: failing })).rejects.toThrow();
+    await expect(runNotify({ settings: SETTINGS, now: NOW, fetchImpl: failing, sleepImpl: noSleep })).rejects.toThrow();
 
-    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: okFetch() });
+    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: okFetch(), sleepImpl: noSleep });
     expect(outcome.priceChanges).toBe(1);
   });
 
@@ -439,7 +451,7 @@ describe('runNotify', () => {
 
     const fetchImpl = okFetch();
     // NOW is 48h after the only snapshot; the threshold is 36h.
-    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl });
+    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl, sleepImpl: noSleep });
 
     expect(outcome.stale).toBe(true);
     expect(outcome.sent).toBe(1);
@@ -470,7 +482,7 @@ describe('runNotify', () => {
     // ceiling so a spurious write on the second call below is observable.
     await sql`UPDATE notify_watermark SET last_store_id = 1, last_product_id = 1 WHERE id = 1`;
 
-    await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: okFetch() });
+    await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: okFetch(), sleepImpl: noSleep });
     const before = await readWatermarkRow();
 
     const second = okFetch();
@@ -478,6 +490,7 @@ describe('runNotify', () => {
       settings: SETTINGS,
       now: new Date(NOW.getTime() + 2 * HOUR),
       fetchImpl: second,
+      sleepImpl: noSleep,
     });
 
     expect(outcome.stale).toBe(true);
@@ -498,7 +511,7 @@ describe('runNotify — the two streams', () => {
     await coverStoresAndProducts();
     const telegram = capturingFetch();
 
-    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: telegram.impl });
+    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: telegram.impl, sleepImpl: noSleep });
 
     expect(outcome).toMatchObject({ priceChanges: 1, perProduct: 1 });
     // One message, and it is the per-product one: `rest` is empty, so there is
@@ -516,7 +529,7 @@ describe('runNotify — the two streams', () => {
     await coverStoresAndProducts();
     const telegram = capturingFetch();
 
-    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: telegram.impl });
+    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: telegram.impl, sleepImpl: noSleep });
 
     expect(outcome).toMatchObject({ priceChanges: 1, perProduct: 0 });
     expect(telegram.texts).toHaveLength(1);
@@ -539,6 +552,7 @@ describe('runNotify — the two streams', () => {
       settings: { ...SETTINGS, perProductMax: 2 },
       now: NOW,
       fetchImpl: telegram.impl,
+      sleepImpl: noSleep,
     });
 
     expect(outcome).toMatchObject({ priceChanges: 4, perProduct: 2 });
@@ -567,6 +581,7 @@ describe('runNotify — the two streams', () => {
       settings: { ...SETTINGS, perProductMax: 1 },
       now: NOW,
       fetchImpl: telegram.impl,
+      sleepImpl: noSleep,
     });
 
     expect(telegram.texts[0]).toContain('posisi kita di 1');
@@ -582,6 +597,7 @@ describe('runNotify — the two streams', () => {
       settings: { ...SETTINGS, perProductMax: 0 },
       now: NOW,
       fetchImpl: telegram.impl,
+      sleepImpl: noSleep,
     });
 
     expect(outcome.perProduct).toBe(0);
@@ -595,7 +611,7 @@ describe('runNotify — the two streams', () => {
     await coverStoresAndProducts();
     const ceilings = await readCeilings(sql);
 
-    await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: okFetch() });
+    await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: okFetch(), sleepImpl: noSleep });
 
     // One event set, one watermark: the split is a rendering decision and must
     // not leave half the changes to be found again next run.
@@ -603,7 +619,7 @@ describe('runNotify — the two streams', () => {
     expect(after.lastSnapshotId).toBe(String(ceilings.snapshotId));
 
     const second = okFetch();
-    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: second });
+    const outcome = await runNotify({ settings: SETTINGS, now: NOW, fetchImpl: second, sleepImpl: noSleep });
     expect(outcome.priceChanges).toBe(0);
     expect(second).not.toHaveBeenCalled();
   });
@@ -623,7 +639,7 @@ describe('runNotify — the two streams', () => {
     ) as unknown as typeof fetch;
 
     await expect(
-      runNotify({ settings: SETTINGS, now: NOW, fetchImpl: refuse }),
+      runNotify({ settings: SETTINGS, now: NOW, fetchImpl: refuse, sleepImpl: noSleep }),
     ).rejects.toThrow(/Telegram/);
 
     // The per-product stream is inside the same transaction as everything else,

@@ -1,6 +1,8 @@
 import { describe, expect, test, vi } from 'vitest';
 
-import { sendMessages } from '@/lib/notify/telegram';
+import { MAX_MESSAGES } from '@/lib/notify/format';
+import { DEFAULT_PER_PRODUCT_MAX, FUNCTION_BUDGET_SECONDS } from '@/lib/notify/run';
+import { SEND_INTERVAL_MS, sendMessages } from '@/lib/notify/telegram';
 
 /**
  * The Bot API call.
@@ -10,11 +12,21 @@ import { sendMessages } from '@/lib/notify/telegram';
  * message nobody received), and that the bot token never appears in an error.
  */
 
-const config = (fetchImpl: typeof fetch) => ({
+/**
+ * Every case here injects a sleep that does not sleep.
+ *
+ * `sendMessages` paces itself, so without this the suite would spend the real
+ * interval between every message it sends — and the pacing is asserted below
+ * by what it was *asked* to wait, which is the part that matters anyway.
+ */
+const config = (fetchImpl: typeof fetch, waits: number[] = []) => ({
   botToken: 'SECRET-TOKEN',
   chatId: '12345',
   fetchImpl,
   timeoutMs: 1000,
+  sleepImpl: async (ms: number) => {
+    waits.push(ms);
+  },
 });
 
 const ok = () =>
@@ -42,6 +54,63 @@ describe('sendMessages', () => {
       parse_mode: 'HTML',
       disable_web_page_preview: true,
     });
+  });
+
+  /**
+   * The per-product stream made this load-bearing.
+   *
+   * Telegram allows roughly 20 messages a minute to one group. Until this
+   * branch the whole run was at most 4 messages (`MAX_MESSAGES`), so a burst
+   * could not reach that; now it is `NOTIFY_PER_PRODUCT_MAX` + 4, which is 34
+   * by default. Sent flat out that is a near-certain 429, and a group
+   * flood-wait is tens of seconds — past `MAX_RETRY_AFTER_SECONDS`, so
+   * `sendMessages` abandons the run, the watermark stays put, and the next
+   * trigger rebuilds the same 34 messages into the same wall. That is the
+   * self-perpetuating jam this module's own comments exist to avoid.
+   *
+   * The design already assumed this pacing: it sized the cap of 30 by calling
+   * 34 messages "~1,7 menit mengirim", which is 34 messages three seconds
+   * apart. The number was right; nothing was doing the waiting.
+   */
+  test('waits between messages so a burst cannot trip the group flood limit', async () => {
+    const waits: number[] = [];
+    const fetchImpl = vi.fn(async () => ok()) as unknown as typeof fetch;
+
+    await sendMessages(['satu', 'dua', 'tiga'], config(fetchImpl, waits));
+
+    // Between the messages, not before the first: three messages, two waits.
+    expect(waits).toEqual([SEND_INTERVAL_MS, SEND_INTERVAL_MS]);
+  });
+
+  test('does not wait at all for a single message', async () => {
+    const waits: number[] = [];
+    const fetchImpl = vi.fn(async () => ok()) as unknown as typeof fetch;
+
+    await sendMessages(['satu'], config(fetchImpl, waits));
+
+    expect(waits).toEqual([]);
+  });
+
+  /**
+   * The three constants have to be read together or not at all.
+   *
+   * `DEFAULT_PER_PRODUCT_MAX` + `MAX_MESSAGES` is how many messages a run can
+   * send; `SEND_INTERVAL_MS` is what each one costs; `FUNCTION_BUDGET_SECONDS`
+   * is what there is to spend. Any one of them can be changed in good faith and
+   * leave the run unable to finish — and a run that cannot finish rolls back
+   * with the watermark unmoved, so the next one rebuilds the same backlog into
+   * the same wall. This is the arithmetic that keeps them honest.
+   */
+  test('a worst-case run fits the function budget, with room for the requests', () => {
+    const messages = DEFAULT_PER_PRODUCT_MAX + MAX_MESSAGES;
+    const pacing = (messages - 1) * SEND_INTERVAL_MS;
+    // Each request is bounded by postOnce's abort, but the realistic cost is a
+    // round trip. Half a second apiece, plus ten seconds for the queries and
+    // the transaction either side of the sending.
+    const requests = messages * 500;
+    const overhead = 10_000;
+
+    expect(pacing + requests + overhead).toBeLessThan(FUNCTION_BUDGET_SECONDS * 1000);
   });
 
   test('sends nothing and calls nothing for an empty list', async () => {

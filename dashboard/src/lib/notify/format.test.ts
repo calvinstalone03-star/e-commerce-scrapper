@@ -74,6 +74,21 @@ describe('foldPriceChanges', () => {
     expect(folded.filter((entry) => entry.kind === 'folded')).toHaveLength(0);
   });
 
+  test('ranks a change from a zero price last, not at the head of the digest', () => {
+    // Same defect the per-product split guards against, in the digest's own
+    // ordering: previousPrice 0 makes the weight a division by zero, which is
+    // Infinity, so a listing whose old price was never real would sort above
+    // every genuine reprice and take one of the twelve printed slots.
+    const fromZero = change({ productId: 1, previousPrice: '0', price: '150000' });
+    const ordinary = change({ productId: 2, previousPrice: '100000', price: '101000' });
+
+    const folded = foldPriceChanges([fromZero, ordinary]);
+
+    expect(folded.map((entry) => (entry.kind === 'single' ? entry.change.productId : 0))).toEqual([
+      2, 1,
+    ]);
+  });
+
   test('does not fold a rise into a fall of the same magnitude', () => {
     const changes = [
       change({ productId: 1, previousPrice: '100000', price: '125000' }),

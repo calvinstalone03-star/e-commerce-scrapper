@@ -667,10 +667,25 @@ still goes out, but the position line is replaced by a note saying so. A
 confidently wrong "kita lebih mahal Rp 8,1 juta" costs the reader their trust in
 every other message that was right.
 
-`NOTIFY_PER_PRODUCT_MAX` (30) caps how many of these one run sends. The order is
+`NOTIFY_PER_PRODUCT_MAX` (10) caps how many of these one run sends. The order is
 by proportional move, largest first, so a cap that bites keeps the changes that
 most demand a decision; the remainder drops into the digest, which says how many
 it is holding. Set 0 for digest only.
+
+Ten is not a taste judgement, it is what the function budget pays for. Telegram
+accepts about 20 messages a minute to one group, so the notifier spaces them
+three seconds apart — without that spacing a backlog run is a burst, Telegram
+answers with a flood-wait of tens of seconds, and the run is abandoned. Ten
+per-product messages plus at most four of digest is 39 seconds of spacing, plus
+the requests and the queries either side, inside the 60 seconds `maxDuration`
+declares in `dashboard/src/app/api/notify/route.ts`.
+
+That 60 is Vercel's Hobby ceiling, the plan `scripts/notify.sh` documents. On
+Pro it is 300, and then `FUNCTION_BUDGET_SECONDS`, `maxDuration` and
+`NOTIFY_PER_PRODUCT_MAX` can go back to the 300 and 30 the design was costed
+against. Raise them together: a run that overshoots the limit is killed
+mid-transaction, so the watermark never advances and the next run rebuilds the
+same backlog into the same wall.
 
 ### If it goes quiet
 

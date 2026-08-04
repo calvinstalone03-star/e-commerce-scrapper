@@ -15,6 +15,9 @@ export type TelegramConfig = {
   chatId: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /** Injectable for the same reason as `fetchImpl`: tests must not really wait. */
+  sleepImpl?: (ms: number) => Promise<void>;
+  intervalMs?: number;
 };
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -143,6 +146,29 @@ function sleep(ms: number): Promise<void> {
 const MAX_RETRY_AFTER_SECONDS = 5;
 
 /**
+ * How long to wait between messages, so a run does not become its own 429.
+ *
+ * Telegram allows roughly 20 messages a minute to one group — three seconds
+ * apart. Until the per-product stream existed this did not bind: a whole run
+ * was at most `MAX_MESSAGES` (4) messages, and four sent flat out is not a
+ * burst. It is now `NOTIFY_PER_PRODUCT_MAX` + 4, which is 34 by default, and
+ * 34 messages with no wait between them is a near-certain flood-wait.
+ *
+ * What makes that specifically bad rather than merely slow is the interaction
+ * with `MAX_RETRY_AFTER_SECONDS` above: a group flood-wait is tens of seconds,
+ * so the retry is not taken, `sendMessages` throws, the transaction rolls back
+ * with the watermark unmoved, and the next trigger rebuilds the same 34
+ * messages into the same limit. Nothing about that clears on its own.
+ *
+ * The design already counted on this pacing — it justified the cap of 30 by
+ * calling 34 messages "~1,7 menit mengirim", which is exactly this interval —
+ * so this is the wait that number always assumed, not a new cost. At the caps,
+ * 33 waits is 99 seconds, inside the 300-second function limit with room for
+ * the requests themselves.
+ */
+export const SEND_INTERVAL_MS = 3_000;
+
+/**
  * Send every message in order.
  *
  * @returns how many were delivered.
@@ -152,9 +178,15 @@ const MAX_RETRY_AFTER_SECONDS = 5;
  *   persisted.
  */
 export async function sendMessages(messages: string[], config: TelegramConfig): Promise<number> {
+  const pause = config.sleepImpl ?? sleep;
+  const interval = config.intervalMs ?? SEND_INTERVAL_MS;
   let sent = 0;
 
-  for (const message of messages) {
+  for (const [index, message] of messages.entries()) {
+    // Between messages, never before the first: a run that sends one message
+    // should not pay for a limit it cannot reach.
+    if (index > 0) await pause(interval);
+
     let attempt = await postOnce(message, config);
 
     if (!attempt.ok && attempt.retryAfter !== null) {
@@ -165,7 +197,7 @@ export async function sendMessages(messages: string[], config: TelegramConfig): 
             `transaction open that long. The next trigger will pick these up.`,
         );
       }
-      await sleep(attempt.retryAfter * 1000);
+      await pause(attempt.retryAfter * 1000);
       attempt = await postOnce(message, config);
     }
 

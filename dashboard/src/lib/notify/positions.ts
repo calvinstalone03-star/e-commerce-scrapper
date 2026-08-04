@@ -1,7 +1,7 @@
 import 'server-only';
 
 import type { Sql } from '@/lib/notify/watermark';
-import { EXTREME_GAP } from '@/lib/queries';
+import { isExtremeGap } from '@/lib/queries';
 
 /**
  * Where we stand on every set an own shop sells, computed once for all of
@@ -46,15 +46,6 @@ export type SetPosition = {
   rivalCount: number;
   extreme: boolean;
 };
-
-function extremeGap(ourPrice: string | null, cheapestRival: string | null): boolean {
-  if (ourPrice === null || cheapestRival === null) return false;
-  const ours = Number(ourPrice);
-  const rival = Number(cheapestRival);
-  const smaller = Math.min(ours, rival);
-  if (smaller === 0) return false;
-  return Math.abs(ours - rival) / smaller >= EXTREME_GAP;
-}
 
 export async function ownSetPositions(tx: Sql): Promise<Map<string, SetPosition>> {
   const rows = await tx<
@@ -125,24 +116,14 @@ export async function ownSetPositions(tx: Sql): Promise<Map<string, SetPosition>
       ourShop: row.our_shop,
       cheapestRival,
       rivalCount: Number(row.rival_count),
-      // Both sides must exist to say anything about the gap between them: a
-      // set where we have no recorded price is unpriced, not extreme. A zero
-      // on either side is the same kind of non-answer, and it has to be
-      // excluded before the division rather than after: `price` is a plain
-      // numeric with no CHECK (migrations/001_init.sql:78), and in JS a
-      // positive numerator over zero is Infinity, which clears any threshold.
-      // A free listing would report as an extreme gap. The three copies of
-      // this rule in queries.ts guard the zero and answer false; this agrees
-      // with them.
-      //
-      // Divided by the smaller of the two, not by cheapestRival alone.
-      // Dividing by the rival unconditionally only ever fires when WE are the
-      // dearer side — when the rival is dearer the ratio is `1 - ours/rival`,
-      // bounded below 1 for any positive pair, so no multiple, however large,
-      // trips a threshold of 1.0 in that direction. least() catches both
-      // directions and leaves the case that already worked unchanged: when we
-      // are the dearer side, our price was never the smaller one anyway.
-      extreme: extremeGap(ourPrice, cheapestRival),
+      // The shared rule, not a copy of it — see `isExtremeGap` for why the
+      // denominator is the smaller price and why a zero is excluded before
+      // the division. The dashboard's own JS caller decides it the same way,
+      // through the same function.
+      extreme: isExtremeGap(
+        ourPrice === null ? null : Number(ourPrice),
+        cheapestRival === null ? null : Number(cheapestRival),
+      ),
     });
   }
   return positions;

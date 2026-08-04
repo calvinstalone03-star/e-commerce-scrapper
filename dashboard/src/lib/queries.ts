@@ -290,6 +290,39 @@ const NAME_MATCH_THRESHOLD = 0.45;
 export const EXTREME_GAP = 1.0;
 
 /**
+ * The extreme-gap rule, for the callers that decide it in JavaScript.
+ *
+ * There are two — `getPricePositionDetail` below, which derives its cheapest
+ * rival from an array rather than from SQL, and `notify/positions.ts` — and
+ * before this they each wrote the comparison out. They drifted exactly where
+ * you would expect: one guarded the zero denominator and the other did not, so
+ * a listing recorded at 0 was not extreme on the dashboard and was extreme in
+ * Telegram. Sharing the constant was never enough; the rule has to be shared
+ * too.
+ *
+ * Divided by the smaller of the two prices, not by the rival unconditionally.
+ * Dividing by the rival only ever fires when we are the dearer side: when the
+ * rival is dearer the ratio is `1 - ours/rival`, bounded below 1 for any
+ * positive pair, so no multiple however large trips a threshold of 1.0 in that
+ * direction. `Math.min` catches both and leaves the case that already worked
+ * unchanged — when we are the dearer side, our price was never the smaller one.
+ *
+ * A zero on either side is not a gap, it is a missing price wearing a number.
+ * It has to be excluded before the division: in JavaScript a positive
+ * numerator over zero is `Infinity`, which clears any threshold.
+ *
+ * The two SQL copies — `getPricePositions`'s `extreme` column and
+ * `computePairingSnapshot`'s `gapVolume` filter — cannot call this, and are
+ * kept in step by hand. They are the remaining places this rule can drift.
+ */
+export function isExtremeGap(ourPrice: number | null, rivalPrice: number | null): boolean {
+  if (ourPrice === null || rivalPrice === null) return false;
+  const smaller = Math.min(ourPrice, rivalPrice);
+  if (smaller === 0) return false;
+  return Math.abs(ourPrice - rivalPrice) / smaller >= EXTREME_GAP;
+}
+
+/**
  * Our products beside their rivals'.
  *
  * The join is on `set_code` wherever both sides have one. That is the whole
@@ -869,15 +902,10 @@ export const getPricePositionDetail = cache(async (
         ours === null || cheapestPrice === null || cheapestPrice === 0
           ? null
           : Math.round(((ours - cheapestPrice) / cheapestPrice) * 1000) / 10,
-      // Same rule as getPricePositions's `extreme` column, in JS because this
-      // path computes cheapestPrice from the `rivals` array rather than from
-      // SQL. Divided by the smaller of the two prices, not cheapestPrice
-      // alone, for the same reason: dividing by the rival unconditionally
-      // only ever flags a gap when we are the dearer side.
-      extreme:
-        ours === null || cheapestPrice === null || Math.min(ours, cheapestPrice) === 0
-          ? false
-          : Math.abs(ours - cheapestPrice) / Math.min(ours, cheapestPrice) >= EXTREME_GAP,
+      // Same rule as getPricePositions's `extreme` column, decided in JS
+      // because this path computes cheapestPrice from the `rivals` array
+      // rather than from SQL — through the shared helper, not a second copy.
+      extreme: isExtremeGap(ours, cheapestPrice),
     }),
     rivals: rivals.map((row) => rivalRowSchema.parse(row)),
   };

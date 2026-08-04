@@ -1,7 +1,8 @@
 import { NextRequest } from 'next/server';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 
-import { POST } from '@/app/api/notify/route';
+import { POST, maxDuration } from '@/app/api/notify/route';
+import { FUNCTION_BUDGET_SECONDS } from '@/lib/notify/run';
 
 /**
  * What the trigger tells a caller who has not proved who it is.
@@ -32,6 +33,20 @@ function post(authorization?: string): NextRequest {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+});
+
+describe('the function budget', () => {
+  /**
+   * Every duration argument in the notifier — the send pacing, the cap on
+   * per-product messages, the refusal to wait out a long `retry_after` — is
+   * reasoned against how long this function may run. Until now that number was
+   * only ever stated in comments, so nothing checked it and nothing enforced
+   * it: unconfigured, the platform picks, and the run is killed mid-transaction
+   * if it picks lower than the comments assumed.
+   */
+  test('is declared on the route, not assumed by the code that spends it', () => {
+    expect(maxDuration).toBe(FUNCTION_BUDGET_SECONDS);
+  });
 });
 
 describe('POST /api/notify', () => {
