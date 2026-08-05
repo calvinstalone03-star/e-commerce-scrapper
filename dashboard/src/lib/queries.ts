@@ -6,6 +6,7 @@ import { cache } from 'react';
 
 import type { Channel } from '@/lib/channel';
 import { sql } from '@/lib/db';
+import { resolveMinGapHours } from '@/lib/price-change';
 import {
   filterOptionsSchema,
   overviewSchema,
@@ -54,7 +55,7 @@ import {
 /** Newest snapshot per product. Composed into most other queries. */
 const latestSnapshots = sql`
   SELECT DISTINCT ON (product_ref)
-    product_ref, price, sold, rating_star, scraped_at
+    id, product_ref, price, sold, rating_star, scraped_at
   FROM price_snapshots
   ORDER BY product_ref, scraped_at DESC, id DESC
 `;
@@ -184,6 +185,7 @@ export async function getProducts(
   filter: ProductFilter,
 ): Promise<{ rows: ProductRow[]; total: number }> {
   const offset = (filter.page - 1) * filter.pageSize;
+  const minGapHours = resolveMinGapHours();
 
   const where = sql`
     WHERE TRUE
@@ -219,11 +221,34 @@ export async function getProducts(
         s.username AS "storeUsername",
         s.location AS "storeLocation",
         l.price, l.sold, l.rating_star AS "ratingStar", l.scraped_at AS "scrapedAt",
+        previous.price      AS "previousPrice",
+        previous.scraped_at AS "previousScrapedAt",
         (SELECT count(*) FROM price_snapshots ps WHERE ps.product_ref = p.id)
           AS "snapshotCount"
       FROM products p
       LEFT JOIN stores s ON s.id = p.shop_ref
       LEFT JOIN latest l ON l.product_ref = p.id
+      -- What the movement badge is measured against: the newest snapshot at
+      -- least NOTIFY_MIN_GAP_HOURS older than the current one, matching
+      -- selectPriceChanges in lib/notify/events.ts exactly. Not lag() — see
+      -- lib/price-change.ts for why adjacent captures cannot be trusted.
+      --
+      -- LEFT JOIN, unlike the notifier's CROSS JOIN: a product with no
+      -- old-enough predecessor still belongs in this table, it just has no
+      -- movement to show. Today that is most of them.
+      LEFT JOIN LATERAL (
+        SELECT ps.price, ps.scraped_at
+          FROM price_snapshots ps
+         WHERE ps.product_ref = p.id
+           -- Without this a gap of 0 would compare the newest snapshot to
+           -- itself: it satisfies its own scraped_at bound and wins the
+           -- tie-break below.
+           AND ps.id <> l.id
+           AND ps.price IS NOT NULL
+           AND ps.scraped_at <= l.scraped_at - make_interval(hours => ${minGapHours})
+         ORDER BY ps.scraped_at DESC, ps.id DESC
+         LIMIT 1
+      ) AS previous ON TRUE
       ${where}
       -- Unique tiebreak, so a page boundary cannot duplicate or swallow a row.
       -- Ties are the norm here rather than the exception: sold and rating_star

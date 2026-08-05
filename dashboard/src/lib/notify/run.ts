@@ -12,6 +12,9 @@ import {
 } from '@/lib/notify/format';
 import { resolveBaseUrl } from '@/lib/notify/links';
 import { ownSetPositions } from '@/lib/notify/positions';
+// Shared with the product table's movement badge, so the two cannot come to
+// disagree about what counts as a price change. See lib/price-change.ts.
+import { resolveMinGapHours } from '@/lib/price-change';
 import { sendMessages } from '@/lib/notify/telegram';
 import {
   advanceWatermark,
@@ -69,7 +72,6 @@ export type NotifyEnv = {
   NOTIFY_PER_PRODUCT_MAX?: string;
 };
 
-const DEFAULT_MIN_GAP_HOURS = 12;
 const DEFAULT_STALE_HOURS = 36;
 const STALE_WARNING_COOLDOWN_HOURS = 24;
 
@@ -176,7 +178,7 @@ export function resolveSettings(env: NotifyEnv): NotifySettings {
       NOTIFY_BASE_URL: env.NOTIFY_BASE_URL,
       VERCEL_PROJECT_PRODUCTION_URL: env.VERCEL_PROJECT_PRODUCTION_URL,
     }),
-    minGapHours: wholeNumber(env.NOTIFY_MIN_GAP_HOURS, DEFAULT_MIN_GAP_HOURS),
+    minGapHours: resolveMinGapHours(env),
     staleHours: wholeNumber(env.NOTIFY_STALE_HOURS, DEFAULT_STALE_HOURS),
     perProductMax: wholeNumber(env.NOTIFY_PER_PRODUCT_MAX, DEFAULT_PER_PRODUCT_MAX),
   };
