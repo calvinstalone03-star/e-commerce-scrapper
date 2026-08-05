@@ -1,0 +1,54 @@
+#!/bin/bash
+#
+# Ask the deployed notifier to check what changed and post it to Telegram.
+#
+# Run this after a scrape. The notifier itself lives in the Vercel deployment —
+# that is where a dashboard link resolves to a host a phone can open — but the
+# trigger has to come from here, because Vercel's Hobby plan caps cron jobs at
+# once per day and rejects a more frequent expression at deploy time.
+#
+# Reads NOTIFY_URL and NOTIFY_SECRET from the repo root .env.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [ ! -f "$ROOT/.env" ]; then
+    echo "no .env at $ROOT — NOTIFY_URL and NOTIFY_SECRET have nowhere to come from" >&2
+    exit 2
+fi
+
+# Only the two keys this needs, so a malformed line elsewhere in .env cannot be
+# executed by a blanket `source`.
+#
+# `|| true` on each: a key absent from .env (not merely empty) makes `grep`
+# exit 1, and `pipefail` carries that exit status into the assignment. Under
+# `set -e` that would abort the script on this line — before the `-z` check
+# below ever runs, and errexit prints nothing on its way out, so it would die
+# silently. Swallowing it here means "missing" and "present but empty" both
+# reach that check, which is the one place this script explains itself.
+NOTIFY_URL="$(grep -E '^NOTIFY_URL=' "$ROOT/.env" | head -1 | cut -d= -f2-)" || true
+NOTIFY_SECRET="$(grep -E '^NOTIFY_SECRET=' "$ROOT/.env" | head -1 | cut -d= -f2-)" || true
+
+if [ -z "${NOTIFY_URL:-}" ] || [ -z "${NOTIFY_SECRET:-}" ]; then
+    echo "NOTIFY_URL or NOTIFY_SECRET missing from $ROOT/.env" >&2
+    exit 2
+fi
+
+# --fail-with-body, not --fail: both make a 401 or 503 a non-zero exit rather
+# than a body printed as if it were success, but --fail throws the body away on
+# the way out. That body is the whole diagnostic — the route answers a failed
+# run with `detail`, carrying Postgres's or Telegram's own words — and without
+# it the operator's log reads `curl: (22) ... 503` and nothing else.
+#
+# Stamped, because launchd runs this unattended every half hour and appends to
+# one log: without a date, a run that sent nothing is indistinguishable from a
+# run that never happened, which is the first thing anyone checks.
+printf '[%s] ' "$(date -Iseconds)"
+
+# No -v, ever: the Authorization header is on this request.
+curl -sS --fail-with-body -X POST \
+     -H "Authorization: Bearer ${NOTIFY_SECRET}" \
+     -H 'content-type: application/json' \
+     "${NOTIFY_URL%/}/api/notify"
+echo

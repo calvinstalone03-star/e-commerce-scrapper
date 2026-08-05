@@ -6,6 +6,7 @@ import { cache } from 'react';
 
 import type { Channel } from '@/lib/channel';
 import { sql } from '@/lib/db';
+import { resolveMinGapHours } from '@/lib/price-change';
 import {
   filterOptionsSchema,
   overviewSchema,
@@ -54,7 +55,7 @@ import {
 /** Newest snapshot per product. Composed into most other queries. */
 const latestSnapshots = sql`
   SELECT DISTINCT ON (product_ref)
-    product_ref, price, sold, rating_star, scraped_at
+    id, product_ref, price, sold, rating_star, scraped_at
   FROM price_snapshots
   ORDER BY product_ref, scraped_at DESC, id DESC
 `;
@@ -184,6 +185,7 @@ export async function getProducts(
   filter: ProductFilter,
 ): Promise<{ rows: ProductRow[]; total: number }> {
   const offset = (filter.page - 1) * filter.pageSize;
+  const minGapHours = resolveMinGapHours();
 
   const where = sql`
     WHERE TRUE
@@ -219,11 +221,34 @@ export async function getProducts(
         s.username AS "storeUsername",
         s.location AS "storeLocation",
         l.price, l.sold, l.rating_star AS "ratingStar", l.scraped_at AS "scrapedAt",
+        previous.price      AS "previousPrice",
+        previous.scraped_at AS "previousScrapedAt",
         (SELECT count(*) FROM price_snapshots ps WHERE ps.product_ref = p.id)
           AS "snapshotCount"
       FROM products p
       LEFT JOIN stores s ON s.id = p.shop_ref
       LEFT JOIN latest l ON l.product_ref = p.id
+      -- What the movement badge is measured against: the newest snapshot at
+      -- least NOTIFY_MIN_GAP_HOURS older than the current one, matching
+      -- selectPriceChanges in lib/notify/events.ts exactly. Not lag() — see
+      -- lib/price-change.ts for why adjacent captures cannot be trusted.
+      --
+      -- LEFT JOIN, unlike the notifier's CROSS JOIN: a product with no
+      -- old-enough predecessor still belongs in this table, it just has no
+      -- movement to show. Today that is most of them.
+      LEFT JOIN LATERAL (
+        SELECT ps.price, ps.scraped_at
+          FROM price_snapshots ps
+         WHERE ps.product_ref = p.id
+           -- Without this a gap of 0 would compare the newest snapshot to
+           -- itself: it satisfies its own scraped_at bound and wins the
+           -- tie-break below.
+           AND ps.id <> l.id
+           AND ps.price IS NOT NULL
+           AND ps.scraped_at <= l.scraped_at - make_interval(hours => ${minGapHours})
+         ORDER BY ps.scraped_at DESC, ps.id DESC
+         LIMIT 1
+      ) AS previous ON TRUE
       ${where}
       -- Unique tiebreak, so a page boundary cannot duplicate or swallow a row.
       -- Ties are the norm here rather than the exception: sold and rating_star
@@ -281,8 +306,46 @@ const NAME_MATCH_THRESHOLD = 0.45;
  * A price ratio past which the pairing is a packaging difference, not a
  * position: 1.0 means "double, or half". Expressed as a ratio rather than a
  * percentage because that is what the SQL compares.
+ *
+ * Exported so `lib/notify/positions.ts` imports this exact constant rather
+ * than copying the literal. Two thresholds with one name is how the
+ * dashboard and the notifier would come to silently disagree about which
+ * comparisons are trustworthy.
  */
-const EXTREME_GAP = 1.0;
+export const EXTREME_GAP = 1.0;
+
+/**
+ * The extreme-gap rule, for the callers that decide it in JavaScript.
+ *
+ * There are two — `getPricePositionDetail` below, which derives its cheapest
+ * rival from an array rather than from SQL, and `notify/positions.ts` — and
+ * before this they each wrote the comparison out. They drifted exactly where
+ * you would expect: one guarded the zero denominator and the other did not, so
+ * a listing recorded at 0 was not extreme on the dashboard and was extreme in
+ * Telegram. Sharing the constant was never enough; the rule has to be shared
+ * too.
+ *
+ * Divided by the smaller of the two prices, not by the rival unconditionally.
+ * Dividing by the rival only ever fires when we are the dearer side: when the
+ * rival is dearer the ratio is `1 - ours/rival`, bounded below 1 for any
+ * positive pair, so no multiple however large trips a threshold of 1.0 in that
+ * direction. `Math.min` catches both and leaves the case that already worked
+ * unchanged — when we are the dearer side, our price was never the smaller one.
+ *
+ * A zero on either side is not a gap, it is a missing price wearing a number.
+ * It has to be excluded before the division: in JavaScript a positive
+ * numerator over zero is `Infinity`, which clears any threshold.
+ *
+ * The two SQL copies — `getPricePositions`'s `extreme` column and
+ * `computePairingSnapshot`'s `gapVolume` filter — cannot call this, and are
+ * kept in step by hand. They are the remaining places this rule can drift.
+ */
+export function isExtremeGap(ourPrice: number | null, rivalPrice: number | null): boolean {
+  if (ourPrice === null || rivalPrice === null) return false;
+  const smaller = Math.min(ourPrice, rivalPrice);
+  if (smaller === 0) return false;
+  return Math.abs(ourPrice - rivalPrice) / smaller >= EXTREME_GAP;
+}
 
 /**
  * Our products beside their rivals'.
@@ -425,7 +488,7 @@ export async function getPricePositions(
       // mistake — one set number spans a single minifigure and a box of sixty.
       // A row with no rival has no gap and is not extreme, so it stays.
       filter.extreme === 'hide'
-        ? sql`AND (b.gap_ratio IS NULL OR b.gap_ratio < ${EXTREME_GAP})`
+        ? sql`AND NOT b.extreme`
         : sql``
     }
     ${
@@ -514,11 +577,25 @@ export async function getPricePositions(
           ELSE round(((m.price - g.cheapest_price) / g.cheapest_price) * 100, 1)
         END AS gap_percent,
         -- Precomputed so the filter reads a column instead of an expression over
-        -- an aggregate, which is the whole reason this query is fast now.
+        -- an aggregate, which is the whole reason this query is fast now. Also
+        -- the one place "is this extreme" is decided, sent to the client as
+        -- extreme (below) so pricing/page.tsx and pricing/[id]/page.tsx read
+        -- it rather than each re-deriving their own copy of this rule from
+        -- gap_percent — which is exactly how they used to disagree with this
+        -- filter and, on the rival-dearer side, with the truth.
+        --
+        -- Divided by the smaller of the two, not by cheapest_price alone —
+        -- unlike gap_percent above. Dividing by the rival unconditionally only
+        -- ever flags a gap when WE are the dearer side: when the rival is
+        -- dearer the ratio is bounded below 1 for any positive pair, so no
+        -- multiple, however large, trips a threshold of 1.0 in that direction.
+        -- least() catches both, and leaves the WE-dearer case exactly as it
+        -- was: the rival's price was already the smaller one then.
         CASE
-          WHEN m.price IS NULL OR g.cheapest_price IS NULL OR g.cheapest_price = 0 THEN NULL
-          ELSE abs((m.price - g.cheapest_price) / g.cheapest_price)
-        END AS gap_ratio
+          WHEN m.price IS NULL OR g.cheapest_price IS NULL OR least(m.price, g.cheapest_price) = 0
+            THEN false
+          ELSE abs((m.price - g.cheapest_price) / least(m.price, g.cheapest_price)) >= ${EXTREME_GAP}
+        END AS extreme
       FROM mine m
       LEFT JOIN agg g ON g.mine_id = m.id
     ),
@@ -560,7 +637,8 @@ export async function getPricePositions(
                  cheapest_marketplace AS "cheapestMarketplace",
                  dearest_price AS "dearestPrice",
                  position,
-                 gap_percent AS "gapPercent"
+                 gap_percent AS "gapPercent",
+                 extreme
           FROM page
         ) shaped
       ) AS rows
@@ -692,10 +770,16 @@ export async function computePairingSnapshot(channel: Channel): Promise<PairingS
                  round((s.price - s.cheapest) / s.cheapest * 100, 1) AS "gapPercent"
           FROM scored s
           JOIN mine m ON m.id = s.id
-          WHERE s.rivals > 0 AND s.sold IS NOT NULL AND s.cheapest > 0
+          WHERE s.rivals > 0 AND s.sold IS NOT NULL AND s.cheapest > 0 AND s.price > 0
             -- Beyond this the pairing is a packaging difference rather than a
             -- price, the same reason the worklist hides those rows by default.
-            AND abs((s.price - s.cheapest) / s.cheapest) < ${EXTREME_GAP}
+            -- least(), not s.cheapest alone: dividing by the rival uncondition-
+            -- ally only ever excludes a pairing when WE are the dearer side,
+            -- because that ratio is bounded below 1 no matter how large the
+            -- true multiple is when the rival is the dearer one. "gapPercent"
+            -- above is untouched — same signed, rival-denominated figure the
+            -- chart always plotted — only which rows reach it changes.
+            AND abs((s.price - s.cheapest) / least(s.price, s.cheapest)) < ${EXTREME_GAP}
         ) g
       ) AS "gapVolume",
       (SELECT count(*) FROM scored)                  AS listings,
@@ -843,6 +927,10 @@ export const getPricePositionDetail = cache(async (
         ours === null || cheapestPrice === null || cheapestPrice === 0
           ? null
           : Math.round(((ours - cheapestPrice) / cheapestPrice) * 1000) / 10,
+      // Same rule as getPricePositions's `extreme` column, decided in JS
+      // because this path computes cheapestPrice from the `rivals` array
+      // rather than from SQL — through the shared helper, not a second copy.
+      extreme: isExtremeGap(ours, cheapestPrice),
     }),
     rivals: rivals.map((row) => rivalRowSchema.parse(row)),
   };

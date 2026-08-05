@@ -8,7 +8,7 @@ import {
 } from '@tanstack/react-table';
 import dynamic from 'next/dynamic';
 import Link from 'next/link';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 import { EmptyState } from '@/components/EmptyState';
 import { ProductImage } from '@/components/ProductImage';
@@ -28,6 +28,7 @@ import {
   formatSold,
   formatStoreName,
   isPlaceholderStore,
+  priceDelta,
 } from '@/lib/format';
 import type { ProductFilter, ProductRow } from '@/lib/schemas';
 
@@ -78,9 +79,11 @@ type ProductTableProps = {
   /** The filter the server rendered `initialData` under. */
   initialFilter: ProductFilter;
   initialData: ProductsSeed['data'];
+  /** How old a snapshot must be to count as the comparison. Legend only. */
+  minGapHours: number;
 };
 
-export function ProductTable({ initialFilter, initialData }: ProductTableProps) {
+export function ProductTable({ initialFilter, initialData, minGapHours }: ProductTableProps) {
   const { filter, setFilter, resetFilter, isFiltered } = useProductFilter();
   const seed = useMemo<ProductsSeed>(
     () => ({ filter: initialFilter, data: initialData }),
@@ -159,6 +162,24 @@ export function ProductTable({ initialFilter, initialData }: ProductTableProps) 
         </p>
         <span aria-live="polite">{isFetching ? 'Memuat…' : ''}</span>
       </div>
+
+      {/* Only where there is a badge to explain. Most rows have one snapshot and
+          therefore no movement at all, and a legend for symbols nobody can see
+          would be furniture. */}
+      {rows.some((row) => row.previousPrice !== null) ? (
+        <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
+          <span className="inline-flex items-center gap-1 rounded-full bg-positive/10 px-1.5 py-0.5 leading-none font-medium text-positive">
+            ▼ turun
+          </span>
+          <span className="inline-flex items-center gap-1 rounded-full bg-negative/10 px-1.5 py-0.5 leading-none font-medium text-negative">
+            ▲ naik
+          </span>
+          <span>
+            dibanding snapshot ≥{minGapHours} jam sebelumnya — bukan snapshot tepat sebelumnya,
+            yang dalam data ini berbeda tanpa harga benar-benar berubah.
+          </span>
+        </p>
+      ) : null}
 
       <Table
         containerRef={scrollRef}
@@ -290,6 +311,72 @@ export function ProductTable({ initialFilter, initialData }: ProductTableProps) 
 }
 
 // ---------------------------------------------------------------------------
+// Price movement
+// ---------------------------------------------------------------------------
+
+/** One decimal, id-ID, and never a `+` of its own — the sign is spelled below. */
+const percent = new Intl.NumberFormat('id-ID', {
+  minimumFractionDigits: 1,
+  maximumFractionDigits: 1,
+});
+
+/**
+ * Which way the price moved since the comparison snapshot.
+ *
+ * Down is green and up is red, the same way round as the price-position screens
+ * (`gapPercent > 0 ? 'text-negative' : 'text-positive'`) and the history chart:
+ * cheaper is the good direction on a page about competing on price.
+ *
+ * Renders nothing at all when there is no comparison. Most rows are in that
+ * state — a product seen once has no predecessor twelve hours older — and a
+ * column of "0%" would say "this price held steady" about listings nobody has
+ * looked at twice. `previousPrice` being null is the difference between "did not
+ * move" and "cannot know yet", and it is worth keeping visible.
+ */
+function PriceMove({
+  current,
+  previous,
+  since,
+}: {
+  current: string | null;
+  previous: string | null;
+  since: string | null;
+}) {
+  const change = priceDelta(previous, current);
+  if (change === null) return null;
+
+  const up = change.absolute > 0;
+  const flat = change.absolute === 0;
+  const tone = flat
+    ? 'bg-surface-muted text-muted'
+    : up
+      ? 'bg-negative/10 text-negative'
+      : 'bg-positive/10 text-positive';
+  const arrow = flat ? '•' : up ? '▲' : '▼';
+  const word = flat ? 'tetap' : up ? 'naik' : 'turun';
+  const magnitude = flat ? 'tetap' : `${percent.format(Math.abs(change.percent))}%`;
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[11px] leading-none font-medium tabular-nums ${tone}`}
+      // The badge is a summary; the numbers behind it belong within reach
+      // rather than in another screen.
+      title={`${word} dari ${formatPrice(previous)} (${formatDate(since)}) ke ${formatPrice(
+        current,
+      )}${flat ? '' : ` · selisih ${formatPrice(Math.abs(change.absolute))}`}`}
+    >
+      <span aria-hidden>{arrow}</span>
+      <span aria-hidden>{magnitude}</span>
+      <span className="sr-only">
+        Harga {word}
+        {flat ? '' : ` ${percent.format(Math.abs(change.percent))} persen`} dibanding{' '}
+        {formatDate(since)}
+      </span>
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Columns
 // ---------------------------------------------------------------------------
 
@@ -361,7 +448,14 @@ function buildColumns(openHistory: (product: ProductRow) => void): ColumnDef<Pro
       accessorKey: 'price',
       header: 'Harga',
       cell: ({ row }) => (
-        <span className="font-medium text-foreground">{formatPrice(row.original.price)}</span>
+        <div className="flex flex-col items-end gap-1">
+          <span className="font-medium text-foreground">{formatPrice(row.original.price)}</span>
+          <PriceMove
+            current={row.original.price}
+            previous={row.original.previousPrice}
+            since={row.original.previousScrapedAt}
+          />
+        </div>
       ),
     },
     {
@@ -488,7 +582,17 @@ function PriceHistoryPanel({
 
         <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
           <dl className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            <Metric label="Harga" value={formatPrice(product.price)} />
+            <Metric
+              label="Harga"
+              value={formatPrice(product.price)}
+              note={
+                <PriceMove
+                  current={product.price}
+                  previous={product.previousPrice}
+                  since={product.previousScrapedAt}
+                />
+              }
+            />
             <Metric label="Terjual" value={formatSold(product.sold)} />
             <Metric label="Rating" value={formatRating(product.ratingStar)} />
             <Metric label="Snapshot" value={formatSold(product.snapshotCount)} />
@@ -517,11 +621,23 @@ function PriceHistoryPanel({
   );
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+function Metric({
+  label,
+  value,
+  note,
+}: {
+  label: string;
+  value: string;
+  /** Rendered under the value. Nothing is laid out for it when it renders null. */
+  note?: ReactNode;
+}) {
   return (
     <div className="rounded-md border border-line px-2.5 py-2">
       <dt className="text-xs text-muted">{label}</dt>
-      <dd className="mt-0.5 text-sm font-medium tabular-nums">{value}</dd>
+      <dd className="mt-0.5 space-y-1 text-sm font-medium tabular-nums">
+        <span className="block">{value}</span>
+        {note}
+      </dd>
     </div>
   );
 }

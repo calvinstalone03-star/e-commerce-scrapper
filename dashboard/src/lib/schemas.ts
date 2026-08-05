@@ -76,6 +76,15 @@ export const productRowSchema = z.object({
   sold: z.coerce.number().int().nullable(),
   ratingStar: moneySchema,
   scrapedAt: timestampSchema,
+  /**
+   * The price this one is measured against: the newest snapshot at least
+   * `NOTIFY_MIN_GAP_HOURS` older (`lib/price-change.ts`). Null when the product
+   * has no snapshot old enough to trust as a comparison, which for most rows
+   * today is the case — and is why the table shows nothing rather than 0%.
+   */
+  previousPrice: moneySchema,
+  /** When that comparison price was captured. Null whenever `previousPrice` is. */
+  previousScrapedAt: timestampSchema,
   /** How many snapshots exist — a product with 1 has no history to chart yet. */
   snapshotCount: z.coerce.number().int().default(0),
 });
@@ -121,6 +130,14 @@ export const pricePositionRowSchema = z.object({
   position: z.coerce.number().int().nullable(),
   /** Our price against the cheapest rival, in percent. Positive means dearer. */
   gapPercent: z.coerce.number().nullable(),
+  /**
+   * Gap too large to be a pricing decision — a packaging difference on the
+   * same set number, not a real position. Symmetric: true whichever side is
+   * dearer. The one place this is decided; the client reads it rather than
+   * re-deriving it from `gapPercent`, which is a different, signed figure
+   * with a different (rival-only) denominator that must not double as this.
+   */
+  extreme: z.boolean(),
 });
 export type PricePositionRow = z.infer<typeof pricePositionRowSchema>;
 

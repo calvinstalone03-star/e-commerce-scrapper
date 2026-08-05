@@ -18,7 +18,9 @@ import { sql } from '@/lib/db';
  * cost nothing here and are the difference between a lock and the appearance of
  * one.
  *
- * Credentials live in `app_credentials`, the one table this app writes to. On
+ * Credentials live in `app_credentials`, one of the two tables this app writes
+ * to — `notify_watermark` (`lib/notify/watermark.ts`) is the other, and
+ * everything the scraper owns is read-only here, as `lib/db.ts` sets out. On
  * disk would be simpler and is what this started as, right up until the first
  * serverless deploy: there is no writable persistent filesystem there, so a
  * file-backed store re-seeds on every cold start, rotates the signing key and

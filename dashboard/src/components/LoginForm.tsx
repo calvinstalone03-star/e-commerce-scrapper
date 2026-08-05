@@ -12,11 +12,16 @@ import { signIn, type FormState } from '@/app/actions/auth';
  * it submits and reports its error with JavaScript disabled or still loading.
  * A login screen is the one place that has to work before the bundle does.
  */
-export function LoginForm() {
+export function LoginForm({ next }: { next?: string }) {
   const [state, formAction] = useActionState<FormState, FormData>(signIn, {});
 
   return (
     <form action={formAction} className="space-y-3">
+      {/* Round-trips the destination through the POST, so the action can send
+          the visitor where the notification pointed rather than to the
+          overview. Re-validated on the server — a hidden field is a suggestion,
+          not a guarantee. */}
+      <input type="hidden" name="next" value={next ?? '/'} />
       <Field label="Username" name="username" type="text" autoComplete="username" autoFocus />
       <Field label="Password" name="password" type="password" autoComplete="current-password" />
 

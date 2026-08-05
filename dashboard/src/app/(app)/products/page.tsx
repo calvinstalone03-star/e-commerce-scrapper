@@ -6,6 +6,7 @@ import { Filters } from '@/components/Filters';
 import { ProductTable } from '@/components/ProductTable';
 import { Skeleton } from '@/components/ui';
 import { STORE_OPTIONS_FILTER, productSearchParams, toStoreOptions } from '@/lib/client-api';
+import { resolveMinGapHours } from '@/lib/price-change';
 import { getFilterOptions, getProducts, getStores } from '@/lib/queries';
 import { productFilterSchema, type PagedProducts } from '@/lib/schemas';
 
@@ -76,7 +77,13 @@ export default async function ProductsPage({
       </Suspense>
 
       <Suspense fallback={<Skeleton className="h-96 w-full" />}>
-        <ProductTable initialFilter={filter} initialData={initialData} />
+        {/* The comparison window is a server setting, so the legend states the
+            real number instead of the documented default. */}
+        <ProductTable
+          initialFilter={filter}
+          initialData={initialData}
+          minGapHours={resolveMinGapHours()}
+        />
       </Suspense>
     </div>
   );

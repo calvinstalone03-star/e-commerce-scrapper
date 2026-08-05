@@ -601,6 +601,126 @@ default, which is what the per-transaction `SET LOCAL` is for. If those three
 seconds matter more than remote access, run the dashboard locally — it is the
 same code, and `scripts/dashboard-server.sh` already does it.
 
+## 8. Telegram notifications
+
+The dashboard tells you where you stand when you open it. This tells you when
+something moved without you opening anything: a price change, a shop you have
+never seen, or a new listing in a shop you already track.
+
+It runs **in the deployment**, not in the scraper — a notification is read on a
+phone, and a link to `127.0.0.1:3100` is not. The trigger comes from here,
+because Vercel's Hobby plan caps cron jobs at once per day.
+
+**1. A bot.** Message `@BotFather`, `/newbot`, keep the token. Message
+`@userinfobot` to get your own chat id.
+
+**2. Three variables on the deployment.**
+
+```bash
+vercel env add TELEGRAM_BOT_TOKEN production
+vercel env add TELEGRAM_CHAT_ID production
+vercel env add NOTIFY_SECRET production   # anything long and random
+```
+
+**3. Two variables here,** in the repo root `.env`:
+
+```bash
+NOTIFY_URL=https://<your-deployment>
+NOTIFY_SECRET=<the same value you gave Vercel>
+```
+
+**4. Trigger it.** Nothing about a scrape sends a notification on its own — the
+notifier is a separate step, and something has to run it. Either shape works:
+
+```cron
+0 6 * * * cd /path/to/ecom-scraper && .venv/bin/ecom-scraper run --mode store --pages 5 >> logs/store.log 2>&1
+5 7 * * * cd /path/to/ecom-scraper && scripts/notify.sh >> logs/notify.log 2>&1
+```
+
+Or a launchd agent, which is what this laptop actually runs:
+`~/Library/LaunchAgents/com.ecomscraper.notify.plist`, `StartInterval` 1800,
+`RunAtLoad` true, and deliberately **not** `KeepAlive` — the script exits by
+design, and keeping it alive would restart it in a loop. It is a sibling of the
+`com.ecomscraper.ingest` and `.dashboard` agents, whose launchers are
+`scripts/ingest-server.sh` and `scripts/dashboard-server.sh`. Half an hour is
+not arbitrary: a change only counts once its comparison snapshot is
+`NOTIFY_MIN_GAP_HOURS` (12) older, so a shorter interval does not report more,
+it only finds nothing more often.
+
+Note what `NOTIFY_URL` points at in that arrangement. The scrape data lives in
+Postgres on this laptop, and a Vercel deployment cannot reach `127.0.0.1`, so
+the notifier runs against the local dashboard — `http://127.0.0.1:3100` —
+rather than against the deployment. Pointing it at a deployment means moving
+the database somewhere both can reach first.
+
+Two things silently produce no notification, and both look identical from the
+outside. `scripts/dashboard-server.sh` serves a build and does not make one, so
+a dashboard started before the notifier existed has no `/api/notify` to call —
+`curl -X POST http://127.0.0.1:3100/api/notify` answers 401 when the route is
+there and 404 when it is not. And `next start` reads `.env.local` once at boot,
+so a corrected `TELEGRAM_CHAT_ID` needs `launchctl kickstart -k
+gui/$(id -u)/com.ecomscraper.dashboard` before it takes effect.
+
+The first run after setup sends nothing: the watermark is seeded to what is
+already in the database, because 12,000 listings you have had for weeks are not
+news.
+
+### What counts as a price change
+
+A snapshot is compared against the newest one at least `NOTIFY_MIN_GAP_HOURS`
+older (12 by default), not against whatever came immediately before it.
+
+Captures taken hours apart disagree about price without anything having been
+repriced. In this database, 37 of 38 snapshot pairs taken 1.5–3.5 hours apart
+differ, against 3 of 1,335 pairs taken a day apart — and `sold` is byte-identical
+across the near pairs, which no genuinely repriced listing would be. Comparing
+against the immediate predecessor reports mostly artefacts.
+
+Set `NOTIFY_MIN_GAP_HOURS=0` to turn the rule off and see the difference.
+
+### Which changes get a message of their own
+
+A change on a `set_code` one of our own shops carries gets its own message,
+carrying where we stand on that set: our price and shop, the cheapest rival and
+how many rivals there are, and which side we are on. Everything else stays in
+the digest, because "a shop we do not compete with moved a price" has no
+position to state.
+
+Where the two sides of a set are not comparable — `8827` is a sealed box of
+sixty in our shop and a single loose minifigure in someone else's — the message
+still goes out, but the position line is replaced by a note saying so. A
+confidently wrong "kita lebih mahal Rp 8,1 juta" costs the reader their trust in
+every other message that was right.
+
+`NOTIFY_PER_PRODUCT_MAX` (10) caps how many of these one run sends. The order is
+by proportional move, largest first, so a cap that bites keeps the changes that
+most demand a decision; the remainder drops into the digest, which says how many
+it is holding. Set 0 for digest only.
+
+Ten is not a taste judgement, it is what the function budget pays for. Telegram
+accepts about 20 messages a minute to one group, so the notifier spaces them
+three seconds apart — without that spacing a backlog run is a burst, Telegram
+answers with a flood-wait of tens of seconds, and the run is abandoned. Ten
+per-product messages plus at most four of digest is 39 seconds of spacing, plus
+the requests and the queries either side, inside the 60 seconds `maxDuration`
+declares in `dashboard/src/app/api/notify/route.ts`.
+
+That 60 is Vercel's Hobby ceiling, the plan `scripts/notify.sh` documents. On
+Pro it is 300, and then `FUNCTION_BUDGET_SECONDS`, `maxDuration` and
+`NOTIFY_PER_PRODUCT_MAX` can go back to the 300 and 30 the design was costed
+against. Raise them together: a run that overshoots the limit is killed
+mid-transaction, so the watermark never advances and the next run rebuilds the
+same backlog into the same wall.
+
+### If it goes quiet
+
+Silence is correct when nothing changed. It is also what a notifier reading the
+wrong database looks like. So if the newest snapshot it can see is older than
+`NOTIFY_STALE_HOURS` (36), it says so instead — at most once a day.
+
+The usual cause is step 5 of section 7: the ingest server still writing to the
+laptop while the deployment reads Neon.
+
 ## Exit codes
 
 | Code | Meaning |
