@@ -106,3 +106,41 @@ export function formatStoreName(username: string | null, name: string | null): s
 export function isPlaceholderStore(username: string | null): boolean {
   return Boolean(username && /^shop-\d+$/.test(username));
 }
+
+/** Where each marketplace serves a seller's storefront. */
+const STOREFRONT_HOSTS: Record<string, string> = {
+  shopee: 'https://shopee.co.id',
+  tokopedia: 'https://www.tokopedia.com',
+};
+
+/**
+ * The seller's own page on the marketplace, or null when there is not one to
+ * link to.
+ *
+ * Both marketplaces put the slug straight after the host — that is what
+ * `username` is, and `config/stores.txt` accepts a pasted storefront URL for the
+ * same reason. So this is a concatenation, and the only real question is when
+ * *not* to build one.
+ *
+ * That case is the placeholder. Shopee's search cards carry a shop id and no
+ * slug, so the scraper stores `shop-<id>` (`scraper/ingest.py:_is_synthetic`),
+ * and `https://shopee.co.id/shop-1259259013` is not a shop — it is a 404 with a
+ * confident-looking URL. Returning null instead lets the caller show nothing,
+ * which is the honest state: the row already says the name was never recorded,
+ * and scraping that shop's own page fills both in.
+ *
+ * @param marketplace Row's marketplace value.
+ * @param username Slug as stored, placeholder or real.
+ * @returns An absolute URL, or null when the shop cannot be addressed.
+ */
+export function storeUrl(marketplace: string, username: string | null): string | null {
+  const host = STOREFRONT_HOSTS[marketplace];
+  if (!host) return null;
+
+  const slug = username?.trim();
+  if (!slug || isPlaceholderStore(slug)) return null;
+
+  // Encoded, because nothing guarantees a seller handle is URL-safe: it arrives
+  // from a marketplace payload, not from this codebase.
+  return `${host}/${encodeURIComponent(slug)}`;
+}

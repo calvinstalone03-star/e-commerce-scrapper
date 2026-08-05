@@ -9,6 +9,7 @@ import {
   formatSold,
   formatStoreName,
   isPlaceholderStore,
+  storeUrl,
 } from '@/lib/format';
 import { toSearchParams, type StoreFilter, type StoreRow } from '@/lib/schemas';
 
@@ -63,6 +64,39 @@ function SortHeader({
         </span>
       </Link>
     </TH>
+  );
+}
+
+/**
+ * Out to the seller's own page on the marketplace.
+ *
+ * Deliberately the second link in the cell rather than the first: the shop name
+ * goes to this dashboard's own view of the shop, which is what someone reading a
+ * table of shops usually wants next. Leaving the marketplace is the other
+ * question, so it gets its own small target rather than stealing the name.
+ *
+ * Renders nothing for a shop with no addressable page — see `storeUrl`. That is
+ * exactly the row that already reads "nama toko tidak terekam", so the absent
+ * link needs no explanation of its own.
+ */
+function StorefrontLink({ store }: { store: StoreRow }) {
+  const href = storeUrl(store.marketplace, store.username);
+  if (href === null) return null;
+
+  const where = MARKETPLACE_LABELS[store.marketplace] ?? store.marketplace;
+  return (
+    <a
+      href={href}
+      target="_blank"
+      // noreferrer alongside noopener: this is an outbound link to a
+      // marketplace, and the dashboard's own URL is nobody else's business.
+      rel="noopener noreferrer"
+      title={`Buka toko ini di ${where}`}
+      className="text-xs leading-none text-muted transition-colors hover:text-foreground"
+    >
+      <span aria-hidden>↗</span>
+      <span className="sr-only">Buka {formatStoreName(store.username, store.name)} di {where}</span>
+    </a>
   );
 }
 
@@ -221,12 +255,15 @@ export function StoreTable({
             rows.map((store) => (
               <TR key={store.id}>
                 <TD>
-                  <Link
-                    href={`/stores/${store.id}`}
-                    className="font-medium text-foreground underline-offset-4 hover:underline"
-                  >
-                    {formatStoreName(store.username, store.name)}
-                  </Link>
+                  <span className="flex items-center gap-1.5">
+                    <Link
+                      href={`/stores/${store.id}`}
+                      className="font-medium text-foreground underline-offset-4 hover:underline"
+                    >
+                      {formatStoreName(store.username, store.name)}
+                    </Link>
+                    <StorefrontLink store={store} />
+                  </span>
                   {isPlaceholderStore(store.username) ? (
                     // The marketplace never exposed a slug for this shop, so the
                     // numeric id is all there is. Labelled, not passed off as a name.
