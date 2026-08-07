@@ -270,6 +270,31 @@ stop it, and re-opening re-attaches to the run in progress. It is still
 user-triggered: nothing runs on a timer, and the only requests made to the
 marketplace are the page loads a person clicking through results would make.
 
+#### Which database a run files into
+
+**Lokal** / **Neon**, above the scrape button. Lokal is Postgres on this laptop;
+Neon is the hosted database the deployed dashboard reads (section 7). The totals
+under the button are counted in whichever is selected, which is the quickest way
+to see how far apart the two have drifted.
+
+The extension holds no database credential and never speaks to Neon. It sends
+one header — `X-Ingest-Target: local|neon` — and the ingest server, which
+already holds both connection strings, writes with the same parser and the same
+upserts either way. That is the whole reason this is a header and not a second
+implementation: a copy of the parser in JavaScript would drift from
+`scraper/ingest.py` within a week, and a connection string shipped inside an
+extension is a full write credential sitting in a Chrome profile.
+
+The Neon button is disabled unless the server reports the target as available,
+which it does by reading `NEON_DATABASE_URL`. Clicking it when the server has no
+such variable would otherwise turn into a failed scrape instead of a control
+that is visibly off; if the button is on and the write still fails, the popup
+shows the server's own sentence rather than `HTTP 503`.
+
+The choice is fixed when a run starts. Switching mid-walk would split one shop's
+catalogue across two databases and leave neither able to say so, so the toggle
+is locked while a job is running.
+
 | File | Job |
 |---|---|
 | `extension/sites.js` | Per-marketplace config: hosts, product-link shape, and how the site numbers result pages (Shopee from 0, Tokopedia from 1). |
@@ -525,29 +550,52 @@ connection over one — `unsupported startup parameter in options`. The trigram
 threshold the price matching needs is set per transaction instead
 (`withNameMatching` in `dashboard/src/lib/queries.ts`).
 
-**2. The schema and the data.** Both against the **direct** endpoint.
+**2. The schema and the data.** Put the **direct** endpoint in the repo root
+`.env` — `ecom-scraper sync` reads it from there, and so does the ingest server's
+Neon destination:
 
 ```bash
-export NEON_DIRECT='postgresql://…@ep-….neon.tech/…?sslmode=require'
-LOCAL=postgresql://calvin@127.0.0.1:5432/ecom_scraper
+NEON_DATABASE_URL=postgresql://…@ep-….neon.tech/…?sslmode=require
+```
 
-# Schema first: the same migrations, applied to the new database.
-DATABASE_URL="$NEON_DIRECT" ecom-scraper initdb
+Then:
 
-# Then the rows, if you want the history rather than a fresh start. One table at
-# a time, in this order: a single --data-only dump does not guarantee parents
-# before children, and `products` without its `stores` is a foreign key error.
-# `app_credentials` is deliberately absent — let the deployment seed its own
-# login from DASHBOARD_PASSWORD rather than inheriting the laptop's.
-for t in stores products price_snapshots product_keywords scrape_runs; do
-  pg_dump --data-only --no-owner --no-privileges -t "public.$t" "$LOCAL" \
-    | psql -v ON_ERROR_STOP=1 "$NEON_DIRECT"
-done
+```bash
+ecom-scraper sync --dry-run   # what would change, writes nothing
+ecom-scraper sync             # migrations, then the rows
+```
 
+`sync` mirrors: afterwards the target's `stores`, `products`,
+`product_keywords`, `price_snapshots` and `scrape_runs` are exactly what this
+laptop holds, **ids included**. Ids rather than natural keys because
+`notify_watermark` stores ids and nothing else here would survive being
+renumbered; copying them verbatim also means the two databases agree on what row
+8134 is.
+
+It is safe to re-run, and it is the command to reach for whenever the two have
+drifted apart — which they will, since the laptop keeps collecting.
+
+Three things it will not do. It never touches `app_credentials`: a deployment's
+login is meant to be its own, seeded from `DASHBOARD_PASSWORD`, not the laptop's.
+It refuses outright when the target holds shops or listings this database does
+not — a mirror would delete them, so it names them and stops unless you pass
+`--force`. And it reseeds the target's `notify_watermark` to the maximums it just
+copied, for the reason `migrations/005_notify_watermark.sql` gives: what was
+copied is history, not news, and a stale watermark would announce 18,000
+long-known listings on the next notifier run.
+
+The whole thing runs in one transaction on the target, so a connection dropped
+partway leaves it exactly as it was rather than half-mirrored.
+
+```bash
 # Fresh rows, no statistics: without this the planner guesses and the price
 # screens pay for it.
-psql "$NEON_DIRECT" -c 'ANALYZE'
+psql "$NEON_DATABASE_URL" -c 'ANALYZE'
 ```
+
+The equivalent by hand is a per-table `pg_dump --data-only` in foreign-key order
+(`stores`, `products`, then the rest) — parents before children, or `products`
+fails on its foreign key.
 
 **3. The dashboard.** Point Vercel at this repo with **Root Directory =
 `dashboard`**, and set two environment variables:
@@ -629,23 +677,52 @@ NOTIFY_URL=https://<your-deployment>
 NOTIFY_SECRET=<the same value you gave Vercel>
 ```
 
-**4. Trigger it.** Nothing about a scrape sends a notification on its own — the
-notifier is a separate step, and something has to run it. Either shape works:
+**4. Trigger it.** Something has to run the notifier; a scrape does not send a
+notification by writing rows. Two triggers do it here, and they are not
+alternatives — the first is for latency, the second is the floor.
+
+*The ingest server, when a burst goes quiet.* Those same two variables are read
+by `scraper/config.py`, and with both set the ingest server watches its own
+writes: every batch that stores a row marks the clock, and once
+`NOTIFY_QUIET_SECONDS` (180) pass with no further batch, it POSTs `/api/notify`
+itself (`scraper/notify_trigger.py`). The extension has no "scrape finished"
+event to hang this on — it hands over whatever JSON the page the user is on
+already received, for as long as they browse — so silence is what stands in for
+one. Restart the server after setting the variables; it reads them at boot:
+`launchctl kickstart -k gui/$(id -u)/com.ecomscraper.ingest`.
+
+Set `NOTIFY_QUIET_SECONDS=0` to fire on the next tick instead of waiting, and
+leave `NOTIFY_URL` unset to turn the whole mechanism off.
+
+*A timer, unconditionally.* A launchd agent is what this laptop actually runs:
+`~/Library/LaunchAgents/com.ecomscraper.notify.plist`, `StartInterval` 1800,
+`RunAtLoad` true, and deliberately **not** `KeepAlive` — the script exits by
+design, and keeping it alive would restart it in a loop. It is a sibling of the
+`com.ecomscraper.ingest` and `.dashboard` agents, whose launchers are
+`scripts/ingest-server.sh` and `scripts/dashboard-server.sh`. A cron line does
+the same job:
 
 ```cron
 0 6 * * * cd /path/to/ecom-scraper && .venv/bin/ecom-scraper run --mode store --pages 5 >> logs/store.log 2>&1
 5 7 * * * cd /path/to/ecom-scraper && scripts/notify.sh >> logs/notify.log 2>&1
 ```
 
-Or a launchd agent, which is what this laptop actually runs:
-`~/Library/LaunchAgents/com.ecomscraper.notify.plist`, `StartInterval` 1800,
-`RunAtLoad` true, and deliberately **not** `KeepAlive` — the script exits by
-design, and keeping it alive would restart it in a loop. It is a sibling of the
-`com.ecomscraper.ingest` and `.dashboard` agents, whose launchers are
-`scripts/ingest-server.sh` and `scripts/dashboard-server.sh`. Half an hour is
-not arbitrary: a change only counts once its comparison snapshot is
-`NOTIFY_MIN_GAP_HOURS` (12) older, so a shorter interval does not report more,
-it only finds nothing more often.
+The timer stays even with the quiet-window trigger armed, because that trigger
+has two holes it cannot cover itself: a browsing session that never goes quiet
+never fires one, and a POST that fails is dropped rather than retried. Both are
+a missed *run*, not a missed change — the watermark has not moved, so the next
+timer tick reports everything the missed run would have.
+
+Half an hour is not arbitrary either. A price change only counts once its
+comparison snapshot is `NOTIFY_MIN_GAP_HOURS` (12) older, so a shorter interval
+does not report more, it only finds nothing more often. What the quiet-window
+trigger buys is therefore narrower than it looks, and worth stating exactly: a
+**new shop** or a **new listing** is a watermark comparison — reportable the
+moment the row exists — so those arrive minutes after capture instead of up to
+half an hour later. Price changes keep the timing the data gives them.
+
+Two triggers landing together is safe: `/api/notify` takes the watermark row
+`FOR UPDATE`, so the second waits for the first and then finds nothing new.
 
 Note what `NOTIFY_URL` points at in that arrangement. The scrape data lives in
 Postgres on this laptop, and a Vercel deployment cannot reach `127.0.0.1`, so
@@ -745,6 +822,12 @@ Real environment variables win over `.env`.
 | `MIN_DELAY` | `2.0` | Lower bound of the per-request random delay, seconds |
 | `MAX_DELAY` | `5.0` | Upper bound. Must be >= `MIN_DELAY` or startup fails |
 | `COOKIES_PATH` | `cookies.json` | Where the cookie jar is persisted. Always written `0600`; `.gitignore` covers `*cookies*.json`, so a path outside that pattern is yours to add |
+| `NOTIFY_URL` | _(unset)_ | Dashboard hosting `/api/notify`. With `NOTIFY_SECRET`, the ingest server runs the notifier itself once its writes go quiet. Unset, only the timer does |
+| `NOTIFY_SECRET` | _(unset)_ | Bearer token that route checks. Must match the dashboard's own |
+| `NOTIFY_QUIET_SECONDS` | `180.0` | Silence after the last stored batch before that run fires. `0` fires on the next tick |
+| `NEON_DATABASE_URL` | _(unset)_ | The hosted database (section 7). Target of `ecom-scraper sync`, and the second destination the extension can pick. Use the direct, non-pooler endpoint |
+| `NEON_NOTIFY_URL` | _(unset)_ | Deployed dashboard reading that database. Set with `NEON_NOTIFY_SECRET`, a batch written to the Neon destination runs its notifier |
+| `NEON_NOTIFY_SECRET` | _(unset)_ | Bearer token that deployment checks. No fallback to `NOTIFY_SECRET` — two different deployments |
 
 Target files (`config/keywords.txt`, `config/stores.txt`): one entry per line,
 blank lines and `#` comment lines ignored, duplicates collapsed. A `#` only

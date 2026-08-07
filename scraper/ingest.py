@@ -29,6 +29,7 @@ import logging
 import os
 import secrets
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -40,6 +41,7 @@ from scraper.adapters.shopee import _extract_items, parse_item
 from scraper.config import Settings, get_settings
 from scraper.db import session_scope
 from scraper.models import Marketplace, PriceSnapshot, Product, Store, parse_sold
+from scraper.notify_trigger import NotifyTrigger, build_notify_trigger
 from scraper.store import (
     insert_snapshot_if_changed,
     upsert_product,
@@ -720,14 +722,34 @@ def _is_synthetic(username: str | None, shop_id: int) -> bool:
     return not username or username == f"shop-{shop_id}"
 
 
-def build_app(settings: Settings | None = None, service: IngestService | None = None) -> Any:
+def build_app(
+    settings: Settings | None = None,
+    service: IngestService | None = None,
+    trigger: NotifyTrigger | None = None,
+    neon_service: IngestService | None = None,
+    neon_trigger: NotifyTrigger | None = None,
+) -> Any:
     """Build the FastAPI application.
 
     Imported lazily so the rest of the package does not require FastAPI.
 
+    The server writes to one of two databases, chosen per request by the
+    ``X-Ingest-Target`` header — ``local`` (the default, and what every build of
+    the extension before this sent) or ``neon``. Both destinations run the same
+    parser and the same upserts; only the engine underneath differs, which is
+    the whole reason the choice can live in a header instead of in a second
+    implementation.
+
     Args:
         settings: Configuration.
-        service: Pre-built service, for tests.
+        service: Pre-built local service, for tests.
+        trigger: Pre-built local notify trigger, for tests. Omitted, one is built
+            from ``settings`` and is None unless ``NOTIFY_URL`` and
+            ``NOTIFY_SECRET`` are both set.
+        neon_service: Pre-built hosted service, for tests. Omitted, one is built
+            when ``NEON_DATABASE_URL`` is set, and the target is unavailable
+            when it is not.
+        neon_trigger: Pre-built hosted notify trigger, for tests.
 
     Returns:
         A FastAPI app exposing ``GET /health`` and ``POST /ingest``.
@@ -745,9 +767,96 @@ def build_app(settings: Settings | None = None, service: IngestService | None = 
 
     settings = settings or get_settings()
     token = resolve_token(settings)
-    service = service or IngestService(settings)
 
-    app = FastAPI(title="ecom-scraper ingest", docs_url=None, redoc_url=None)
+    if neon_service is None and settings.neon_database_url:
+        neon_service = IngestService(settings, database_url=settings.neon_database_url)
+
+    services: dict[str, IngestService | None] = {
+        "local": service or IngestService(settings),
+        "neon": neon_service,
+    }
+    triggers: dict[str, NotifyTrigger | None] = {
+        "local": trigger if trigger is not None else build_notify_trigger(settings),
+        "neon": neon_trigger
+        if neon_trigger is not None
+        else build_notify_trigger(settings, target="neon"),
+    }
+
+    @asynccontextmanager
+    async def lifespan(_app: Any) -> Any:
+        """Own the trigger threads for exactly as long as the server runs."""
+        for one in triggers.values():
+            if one is not None:
+                one.start()
+        try:
+            yield
+        finally:
+            for one in triggers.values():
+                if one is not None:
+                    one.stop()
+
+    app = FastAPI(
+        title="ecom-scraper ingest", docs_url=None, redoc_url=None, lifespan=lifespan
+    )
+    # Published so `serve` can say at startup which targets exist and whether
+    # each will run a notifier. "No notification arrived" has two
+    # indistinguishable causes — nothing changed, or nothing is wired — and this
+    # puts the answer in logs/ingest.log at boot rather than leaving it to be
+    # inferred. `notify_trigger` stays as its own attribute because that is the
+    # one a single-target deployment cares about.
+    app.state.notify_trigger = triggers["local"]
+    app.state.notify_triggers = triggers
+    app.state.services = services
+
+    def _resolve(target: str | None) -> tuple[str, IngestService]:
+        """Pick the database this request writes to.
+
+        Args:
+            target: The ``X-Ingest-Target`` header, or None for the default.
+
+        Returns:
+            The resolved target name and its service.
+
+        Raises:
+            HTTPException: 422 for a target that does not exist, 503 for one
+                that exists but has no database configured. Different codes on
+                purpose: the first is a bug in the caller, the second is a
+                missing line in `.env`, and the popup shows them differently.
+        """
+        name = (target or "local").strip().lower()
+        if name not in services:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown target {name!r}; expected one of {', '.join(services)}",
+            )
+        chosen = services[name]
+        if chosen is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"the {name} target has no database configured. Set "
+                    "NEON_DATABASE_URL in .env and restart the ingest server "
+                    "(launchctl kickstart -k gui/$(id -u)/com.ecomscraper.ingest)."
+                ),
+            )
+        return name, chosen
+
+    def _mark(target: str, result: IngestResult) -> None:
+        """Tell that target's trigger this batch wrote something reportable.
+
+        ``stored``, not ``seen``: re-reading a page the user already visited
+        writes no snapshot, and every event the notifier reports — a new shop, a
+        new listing, a price change — reaches the database as a snapshot row. A
+        batch that stored none therefore cannot have produced one, and marking
+        on ``seen`` would keep the quiet window open for the whole of an
+        unproductive browse.
+
+        Per target, because one dashboard reads one database: a write to Neon is
+        not news to the notifier reading the laptop's Postgres.
+        """
+        one = triggers.get(target)
+        if one is not None and result.stored > 0:
+            one.mark()
 
     def _authorise(supplied: str | None) -> None:
         # compare_digest, not ==: token comparison should not leak length or
@@ -777,6 +886,13 @@ def build_app(settings: Settings | None = None, service: IngestService | None = 
             "ok": True,
             "marketplace": Marketplace.SHOPEE.value,
             "captured_paths": list(CAPTURED_PATHS),
+            # Which destinations the popup may offer. Sent unauthenticated like
+            # the rest of this route: it is a list of two names and whether each
+            # is configured, not what they point at.
+            "targets": {name: chosen is not None for name, chosen in services.items()},
+            "notifies": {
+                name: one is not None for name, one in triggers.items()
+            },
             "started_at": datetime.fromtimestamp(_STARTED_AT, tz=timezone.utc).isoformat(),
             "source_changed_at": datetime.fromtimestamp(newest, tz=timezone.utc).isoformat(),
             # True means: restart me. `launchctl kickstart -k
@@ -788,12 +904,14 @@ def build_app(settings: Settings | None = None, service: IngestService | None = 
     def ingest(
         body: dict[str, Any] = Body(...),
         x_ingest_token: str | None = Header(default=None),
+        x_ingest_target: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """Accept one captured payload from the extension.
 
         Body: ``{"url": str, "payload": object, "capturedAt": iso8601 | null}``.
         """
         _authorise(x_ingest_token)
+        target, chosen = _resolve(x_ingest_target)
 
         url = str(body.get("url") or "")
         if not url:
@@ -807,19 +925,22 @@ def build_app(settings: Settings | None = None, service: IngestService | None = 
             except ValueError:
                 captured_at = None
 
-        result = service.ingest(url, body.get("payload"), captured_at)
-        return result.as_dict()
+        result = chosen.ingest(url, body.get("payload"), captured_at)
+        _mark(target, result)
+        return {**result.as_dict(), "target": target}
 
     @app.post("/ingest-dom")
     def ingest_dom(
         body: dict[str, Any] = Body(...),
         x_ingest_token: str | None = Header(default=None),
+        x_ingest_target: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """Accept listings the extension read off a rendered page.
 
         Body: ``{"items": [...], "pageUrl": str, "scrapedAt": iso8601 | null}``.
         """
         _authorise(x_ingest_token)
+        target, chosen = _resolve(x_ingest_target)
 
         items = body.get("items")
         if not isinstance(items, list):
@@ -842,27 +963,38 @@ def build_app(settings: Settings | None = None, service: IngestService | None = 
             ) from None
 
         entries = [entry for entry in items if isinstance(entry, dict)]
-        result = service.ingest_dom(
+        result = chosen.ingest_dom(
             entries,
             str(body.get("pageUrl") or ""),
             scraped_at,
             marketplace=market,
             keyword=str(body.get("keyword") or "") or None,
         )
-        return result.as_dict()
+        _mark(target, result)
+        return {**result.as_dict(), "target": target}
 
     @app.get("/stats")
-    def stats(x_ingest_token: str | None = Header(default=None)) -> dict[str, Any]:
-        """Row counts for the extension popup, so it can show progress."""
+    def stats(
+        x_ingest_token: str | None = Header(default=None),
+        x_ingest_target: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Row counts for the extension popup, so it can show progress.
+
+        Counted in the same database the popup is about to write to. Showing the
+        laptop's totals next to a Neon destination would read as "18,256
+        products are already there" when the answer is whatever Neon holds.
+        """
         _authorise(x_ingest_token)
+        target, chosen = _resolve(x_ingest_target)
         from scraper.db import session_scope as _scope
         from scraper.store import get_stats
 
-        with _scope(settings.database_url) as session:
-            return {
+        with _scope(chosen.database_url) as session:
+            counts = {
                 key: value
                 for key, value in get_stats(session).items()
                 if isinstance(value, int)
             }
+        return {**counts, "target": target}
 
     return app

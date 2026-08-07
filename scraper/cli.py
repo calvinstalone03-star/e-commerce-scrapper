@@ -9,6 +9,7 @@ Commands::
     ecom-scraper run --mode keyword|store [--keywords-file P] [--stores-file P]
                      [--pages N] [--target T ...] [--marketplace shopee]
     ecom-scraper initdb
+    ecom-scraper sync [--to URL] [--dry-run] [--yes] [--force] [--no-migrate]
     ecom-scraper stats [--marketplace shopee]
 
 ``login`` opens a visible browser and waits while **you** log in by hand; it only
@@ -955,6 +956,27 @@ def serve(
     table.add_row("listening on", f"http://{host}:{port}")
     table.add_row("database", _safe_dsn(settings.database_url))
     table.add_row("ingest token", escape(token))
+
+    table.add_row(
+        "neon target",
+        _safe_dsn(settings.neon_database_url)
+        if settings.neon_database_url
+        else "off (set NEON_DATABASE_URL in .env)",
+    )
+
+    triggers = getattr(application.state, "notify_triggers", {})
+    for name in ("local", "neon"):
+        trigger = triggers.get(name)
+        table.add_row(
+            f"notify trigger ({name})",
+            f"{escape(trigger.url)}/api/notify after {trigger.quiet_seconds:.0f}s quiet"
+            if trigger is not None
+            else (
+                "off (set NOTIFY_URL and NOTIFY_SECRET in .env)"
+                if name == "local"
+                else "off (set NEON_NOTIFY_URL and NEON_NOTIFY_SECRET in .env)"
+            ),
+        )
     console.print(table)
     console.print(
         "Paste that token into the extension popup, then browse Shopee normally.\n"
@@ -1346,6 +1368,188 @@ def run(
             f"[yellow]failed targets:[/yellow] {', '.join(result.failed_targets)}"
         )
         raise typer.Exit(1)
+
+
+@app.command()
+def sync(
+    to: str = typer.Option(
+        None, "--to", help="Target database URL. Defaults to NEON_DATABASE_URL from .env."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print what would change and stop. Writes nothing."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    force: bool = typer.Option(
+        False, "--force", help="Mirror even when the target holds rows this database does not."
+    ),
+    migrate: bool = typer.Option(
+        True, "--migrate/--no-migrate", help="Apply migrations to the target first."
+    ),
+    batch_size: int = typer.Option(
+        1000, "--batch-size", min=1, help="Rows per insert round trip."
+    ),
+) -> None:
+    """Mirror this database's scraped tables onto another one.
+
+    The target ends up holding exactly what this database holds, ids included,
+    for ``stores``, ``products``, ``product_keywords``, ``price_snapshots`` and
+    ``scrape_runs``. Its ``app_credentials`` is left alone and its
+    ``notify_watermark`` is reseeded to the end of what was copied, so the
+    deployment's notifier does not announce the mirror itself as news.
+
+    This deletes. ``--dry-run`` first is the habit worth having, and the
+    confirmation prompt names the target before anything is written.
+
+    Args:
+        to: Target database URL.
+        dry_run: Report and stop.
+        yes: Skip the prompt.
+        force: Proceed despite rows only the target has.
+        migrate: Apply migrations to the target before mirroring.
+        batch_size: Rows per insert.
+
+    Raises:
+        typer.Exit: Code 2 on a missing/identical target or an unforced
+            destructive mirror, code 1 if the mirror itself fails.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from scraper.db import _normalise_url, get_engine, run_migrations
+    from scraper.sync import mirror, plan, reseed_watermark, table_counts
+
+    settings = _settings()
+    target_url = (to or settings.neon_database_url or "").strip()
+    if not target_url:
+        _fail(
+            "no target database. Pass --to, or set NEON_DATABASE_URL in .env:\n"
+            "  NEON_DATABASE_URL=postgresql://…@ep-….neon.tech/…?sslmode=require\n"
+            "Use the direct endpoint (the host without `-pooler`) — this does schema "
+            "work and bulk inserts."
+        )
+        return
+
+    # Compared normalised, because the same database spelled two ways
+    # (`postgresql://` vs `postgresql+psycopg://`) is the same database, and this
+    # command truncates the target before reading the source. Mirroring onto
+    # itself would empty it and then have nothing left to copy back.
+    if _normalise_url(target_url) == _normalise_url(settings.database_url):
+        _fail(
+            "the target is this same database. That would truncate it and then "
+            "mirror the empty result onto itself."
+        )
+        return
+
+    source_engine = get_engine(settings.database_url)
+    target_engine = get_engine(target_url)
+
+    console.print(
+        f"source [bold]{_safe_dsn(settings.database_url)}[/bold]\n"
+        f"target [bold]{_safe_dsn(target_url)}[/bold]"
+    )
+
+    try:
+        if migrate and not dry_run:
+            applied = run_migrations(target_engine)
+            console.print(
+                f"migrations applied to target: {', '.join(applied)}"
+                if applied
+                else "migrations: nothing to apply"
+            )
+
+        sync_plan = plan(source_engine, target_engine)
+    except SQLAlchemyError as exc:
+        _fail(f"could not read one of the databases: {exc}")
+        return
+
+    table = Table(title="mirror plan", header_style="bold")
+    table.add_column("table")
+    table.add_column("here", justify="right")
+    table.add_column("target now", justify="right")
+    table.add_column("target after", justify="right")
+    for diff in sync_plan.diffs:
+        table.add_row(diff.table, str(diff.source), str(diff.target), str(diff.source))
+    console.print(table)
+
+    if sync_plan.missing_tables:
+        console.print(
+            "[yellow]target is missing[/yellow] "
+            f"{', '.join(sync_plan.missing_tables)} — "
+            + ("--migrate will create them." if migrate else "run without --no-migrate.")
+        )
+
+    if sync_plan.destroys_rows:
+        stores = sync_plan.target_only_stores
+        products = sync_plan.target_only_products
+        console.print(
+            f"[yellow]the target holds rows this database does not:[/yellow] "
+            f"{len(stores)} shop(s), {len(products)} listing(s). A mirror deletes them."
+        )
+        for marketplace, shop_id in stores[:10]:
+            console.print(f"  shop    {marketplace} {shop_id}")
+        for marketplace, item_id in products[:10]:
+            console.print(f"  listing {marketplace} {item_id}")
+        if len(stores) + len(products) > 20:
+            console.print("  …")
+
+    if dry_run:
+        console.print("[dim]--dry-run: nothing written.[/dim]")
+        return
+
+    if sync_plan.destroys_rows and not force:
+        _fail(
+            "refusing to delete rows only the target has. Copy them here first, or "
+            "pass --force if they are genuinely disposable."
+        )
+        return
+
+    if not yes and not typer.confirm(
+        f"Replace the scraped tables in {_safe_dsn(target_url)} with this database's?"
+    ):
+        console.print("cancelled.")
+        return
+
+    try:
+        # A status line rather than a print per batch: this is one long
+        # operation over a link that may be slow, so it needs to show progress
+        # without leaving 60 lines of it in logs/notify.log's neighbours.
+        with console.status("mirroring…") as status:
+
+            def _progress(table_name: str, rows: int) -> None:
+                status.update(f"mirroring {table_name}: {rows} rows")
+
+            written = mirror(
+                source_engine, target_engine, batch_size=batch_size, on_progress=_progress
+            )
+            status.update("reseeding the notifier watermark…")
+            watermark = reseed_watermark(target_engine)
+            after = table_counts(target_engine)
+    except SQLAlchemyError as exc:
+        # The mirror runs in one transaction, so this is "unchanged", not
+        # "half-copied" — worth saying, because the alternative is what anyone
+        # would assume of a bulk copy that died partway.
+        _fail(f"mirror failed, target unchanged: {exc}", code=1)
+        return
+
+    result = Table(title="mirrored", header_style="bold")
+    result.add_column("table")
+    result.add_column("written", justify="right")
+    result.add_column("target holds", justify="right")
+    for name in written:
+        result.add_row(name, str(written[name]), str(after.get(name, 0)))
+    console.print(result)
+
+    if watermark is None:
+        console.print(
+            "[yellow]no notify_watermark on the target[/yellow] — its notifier has "
+            "never run there. Nothing to reseed."
+        )
+    else:
+        console.print(
+            "notifier watermark reseeded to "
+            f"snapshot {watermark['last_snapshot_id']}, "
+            f"product {watermark['last_product_id']}, "
+            f"store {watermark['last_store_id']} — the mirror itself is not news."
+        )
 
 
 @app.command()
