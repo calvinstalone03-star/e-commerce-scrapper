@@ -72,28 +72,63 @@ git add .env.example && git commit -m "chore: stop the Telegram notify triggers"
 **Files:**
 - Create: `migrations/006_notify_seen.sql`
 - Modify: `migrations/005_notify_watermark.sql` (gut to comments)
-- Test: `dashboard/src/lib/notify/seen.test.ts` (created in Task 4 — here only the migration-idempotency case in `tests/test_db.py`)
+- Test: `tests/test_store.py` — the migration test already lives there.
 
 **Interfaces:**
 - Produces: table `notify_seen (id integer PK CHECK (id = 1), last_seen_snapshot_id bigint NOT NULL, updated_at timestamptz)`.
 
+**Existing machinery to use, not rebuild:**
+- `scraper.db.run_migrations(engine, migrations_dir='migrations')` runs `*.sql` in
+  lexicographic order, each in its own transaction, and **skips files whose content is
+  only comments** (`_has_ddl`, db.py:461) without reporting them as applied. The 005
+  tombstone therefore needs no special casing.
+- `tests/test_store.py:218-229` already asserts the properties — first file, `.sql`
+  extension, sorted order, and idempotency via `run_migrations(engine) == applied`.
+  Do not duplicate those. Gutting 005 drops it from `applied`; that test still passes
+  because it asserts properties rather than a filename list.
+
 - [ ] **Step 1: Write the failing test**
 
-In `tests/test_db.py`:
+Add to `tests/test_store.py`, next to the existing migration test. It covers what is
+new — the seed — not idempotency, which is already covered two lines above.
 
 ```python
-def test_migrations_are_idempotent_across_two_passes(tmp_database_url):
-    """The directory has no ledger, so re-running is the recovery path."""
-    from scraper.db import apply_migrations
-    apply_migrations(tmp_database_url)
-    apply_migrations(tmp_database_url)  # must not raise
-    with create_engine(tmp_database_url).begin() as tx:
-        assert tx.execute(text("SELECT count(*) FROM notify_seen")).scalar() == 1
+def test_notify_seen_is_seeded_from_the_watermark_when_one_exists(engine):
+    """006 must not announce history that 005's notifier already reported."""
+    with engine.begin() as tx:
+        tx.exec_driver_sql("INSERT INTO price_snapshots ... ")  # three rows
+        tx.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS notify_watermark ("
+            "id integer PRIMARY KEY, last_snapshot_id bigint NOT NULL DEFAULT 0)"
+        )
+        tx.exec_driver_sql("INSERT INTO notify_watermark VALUES (1, 2)")
+    run_migrations(engine)
+    with engine.connect() as conn:
+        seed = conn.exec_driver_sql(
+            "SELECT last_seen_snapshot_id FROM notify_seen WHERE id = 1"
+        ).scalar()
+    assert seed == 2, "the watermark arm must win over max(price_snapshots.id)"
+
+
+def test_notify_seen_falls_back_to_max_snapshot_id_without_a_watermark(engine):
+    """A database 005 never reached must not report its whole history as unread."""
+    with engine.begin() as tx:
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_watermark")
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_seen")
+        tx.exec_driver_sql("INSERT INTO price_snapshots ... ")  # highest id 7
+    run_migrations(engine)
+    with engine.connect() as conn:
+        assert conn.exec_driver_sql(
+            "SELECT last_seen_snapshot_id FROM notify_seen WHERE id = 1"
+        ).scalar() == 7
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+Fill the two `INSERT INTO price_snapshots` statements from the fixtures already used in
+`tests/test_store.py` — the ids are what matter, not the prices.
 
-Run: `.venv/bin/pytest tests/test_db.py -k idempotent -v`
+- [ ] **Step 2: Run them and watch them fail**
+
+Run: `.venv/bin/pytest tests/test_store.py -k notify_seen -v`
 Expected: FAIL — `relation "notify_seen" does not exist`.
 
 - [ ] **Step 3: Write `migrations/006_notify_seen.sql`**
@@ -162,13 +197,20 @@ Leave the file (the directory is read in sorted order and its absence would conf
 
 - [ ] **Step 5: Run the test**
 
-Run: `.venv/bin/pytest tests/test_db.py -k idempotent -v`
-Expected: PASS.
+Run: `.venv/bin/pytest tests/test_store.py -k notify_seen -v`
+Expected: PASS, 2 tests.
+
+- [ ] **Step 5b: Confirm the existing migration test still passes**
+
+Run: `.venv/bin/pytest tests/test_store.py -k migration -v`
+Expected: PASS. Gutting 005 removes it from `applied`; that test asserts properties,
+not filenames, so it must not need editing. If it does need editing, stop — something
+other than the tombstone changed.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add migrations/006_notify_seen.sql migrations/005_notify_watermark.sql tests/test_db.py
+git add migrations/006_notify_seen.sql migrations/005_notify_watermark.sql tests/test_store.py
 git commit -m "feat: add notify_seen, tombstone the watermark migration"
 ```
 
