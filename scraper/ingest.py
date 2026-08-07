@@ -29,7 +29,6 @@ import logging
 import os
 import secrets
 import time
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -41,7 +40,6 @@ from scraper.adapters.shopee import _extract_items, parse_item
 from scraper.config import Settings, get_settings
 from scraper.db import session_scope
 from scraper.models import Marketplace, PriceSnapshot, Product, Store, parse_sold
-from scraper.notify_trigger import NotifyTrigger, build_notify_trigger
 from scraper.store import (
     insert_snapshot_if_changed,
     upsert_product,
@@ -725,9 +723,7 @@ def _is_synthetic(username: str | None, shop_id: int) -> bool:
 def build_app(
     settings: Settings | None = None,
     service: IngestService | None = None,
-    trigger: NotifyTrigger | None = None,
     neon_service: IngestService | None = None,
-    neon_trigger: NotifyTrigger | None = None,
 ) -> Any:
     """Build the FastAPI application.
 
@@ -743,13 +739,9 @@ def build_app(
     Args:
         settings: Configuration.
         service: Pre-built local service, for tests.
-        trigger: Pre-built local notify trigger, for tests. Omitted, one is built
-            from ``settings`` and is None unless ``NOTIFY_URL`` and
-            ``NOTIFY_SECRET`` are both set.
         neon_service: Pre-built hosted service, for tests. Omitted, one is built
             when ``NEON_DATABASE_URL`` is set, and the target is unavailable
             when it is not.
-        neon_trigger: Pre-built hosted notify trigger, for tests.
 
     Returns:
         A FastAPI app exposing ``GET /health`` and ``POST /ingest``.
@@ -775,37 +767,9 @@ def build_app(
         "local": service or IngestService(settings),
         "neon": neon_service,
     }
-    triggers: dict[str, NotifyTrigger | None] = {
-        "local": trigger if trigger is not None else build_notify_trigger(settings),
-        "neon": neon_trigger
-        if neon_trigger is not None
-        else build_notify_trigger(settings, target="neon"),
-    }
 
-    @asynccontextmanager
-    async def lifespan(_app: Any) -> Any:
-        """Own the trigger threads for exactly as long as the server runs."""
-        for one in triggers.values():
-            if one is not None:
-                one.start()
-        try:
-            yield
-        finally:
-            for one in triggers.values():
-                if one is not None:
-                    one.stop()
-
-    app = FastAPI(
-        title="ecom-scraper ingest", docs_url=None, redoc_url=None, lifespan=lifespan
-    )
-    # Published so `serve` can say at startup which targets exist and whether
-    # each will run a notifier. "No notification arrived" has two
-    # indistinguishable causes — nothing changed, or nothing is wired — and this
-    # puts the answer in logs/ingest.log at boot rather than leaving it to be
-    # inferred. `notify_trigger` stays as its own attribute because that is the
-    # one a single-target deployment cares about.
-    app.state.notify_trigger = triggers["local"]
-    app.state.notify_triggers = triggers
+    app = FastAPI(title="ecom-scraper ingest", docs_url=None, redoc_url=None)
+    # Published so `serve` can say at startup which targets exist.
     app.state.services = services
 
     def _resolve(target: str | None) -> tuple[str, IngestService]:
@@ -841,23 +805,6 @@ def build_app(
             )
         return name, chosen
 
-    def _mark(target: str, result: IngestResult) -> None:
-        """Tell that target's trigger this batch wrote something reportable.
-
-        ``stored``, not ``seen``: re-reading a page the user already visited
-        writes no snapshot, and every event the notifier reports — a new shop, a
-        new listing, a price change — reaches the database as a snapshot row. A
-        batch that stored none therefore cannot have produced one, and marking
-        on ``seen`` would keep the quiet window open for the whole of an
-        unproductive browse.
-
-        Per target, because one dashboard reads one database: a write to Neon is
-        not news to the notifier reading the laptop's Postgres.
-        """
-        one = triggers.get(target)
-        if one is not None and result.stored > 0:
-            one.mark()
-
     def _authorise(supplied: str | None) -> None:
         # compare_digest, not ==: token comparison should not leak length or
         # prefix through timing, cheap to get right.
@@ -890,9 +837,6 @@ def build_app(
             # the rest of this route: it is a list of two names and whether each
             # is configured, not what they point at.
             "targets": {name: chosen is not None for name, chosen in services.items()},
-            "notifies": {
-                name: one is not None for name, one in triggers.items()
-            },
             "started_at": datetime.fromtimestamp(_STARTED_AT, tz=timezone.utc).isoformat(),
             "source_changed_at": datetime.fromtimestamp(newest, tz=timezone.utc).isoformat(),
             # True means: restart me. `launchctl kickstart -k
@@ -926,7 +870,6 @@ def build_app(
                 captured_at = None
 
         result = chosen.ingest(url, body.get("payload"), captured_at)
-        _mark(target, result)
         return {**result.as_dict(), "target": target}
 
     @app.post("/ingest-dom")
@@ -970,7 +913,6 @@ def build_app(
             marketplace=market,
             keyword=str(body.get("keyword") or "") or None,
         )
-        _mark(target, result)
         return {**result.as_dict(), "target": target}
 
     @app.get("/stats")

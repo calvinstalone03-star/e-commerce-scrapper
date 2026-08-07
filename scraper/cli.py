@@ -964,19 +964,6 @@ def serve(
         else "off (set NEON_DATABASE_URL in .env)",
     )
 
-    triggers = getattr(application.state, "notify_triggers", {})
-    for name in ("local", "neon"):
-        trigger = triggers.get(name)
-        table.add_row(
-            f"notify trigger ({name})",
-            f"{escape(trigger.url)}/api/notify after {trigger.quiet_seconds:.0f}s quiet"
-            if trigger is not None
-            else (
-                "off (set NOTIFY_URL and NOTIFY_SECRET in .env)"
-                if name == "local"
-                else "off (set NEON_NOTIFY_URL and NEON_NOTIFY_SECRET in .env)"
-            ),
-        )
     console.print(table)
     console.print(
         "Paste that token into the extension popup, then browse Shopee normally.\n"

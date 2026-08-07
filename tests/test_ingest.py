@@ -46,19 +46,13 @@ def item(item_id: int = 111, shop_id: int = 222) -> dict:
 
 @pytest.fixture()
 def settings(tmp_path) -> Settings:
-    # notify_* and neon_* explicitly None rather than omitted: this repo's own
-    # .env sets NOTIFY_URL and NOTIFY_SECRET, Settings reads it, and an omission
-    # would let build_app arm a real trigger against the developer's dashboard —
-    # or, once NEON_DATABASE_URL is set there, open a connection to Neon from a
-    # test that believes the target is unconfigured.
+    # neon_database_url explicitly None rather than omitted: this repo's own
+    # .env may set it, Settings reads that file, and an omission would open a
+    # connection to Neon from a test that believes the target is unconfigured.
     return Settings(
         database_url="postgresql://localhost/unused",
         cookies_path=tmp_path / "cookies.json",
-        notify_url=None,
-        notify_secret=None,
         neon_database_url=None,
-        neon_notify_url=None,
-        neon_notify_secret=None,
     )
 
 
@@ -259,110 +253,6 @@ def test_an_unparseable_timestamp_falls_back_to_now(client) -> None:
 
 
 # ----------------------------------------------------------------------
-# Notify trigger
-# ----------------------------------------------------------------------
-
-
-class RecordingTrigger:
-    """Stands in for NotifyTrigger, counting marks instead of debouncing them."""
-
-    def __init__(self) -> None:
-        self.marks = 0
-
-    def mark(self) -> None:
-        self.marks += 1
-
-
-class QuietService(RecordingService):
-    """A service that parses everything and stores nothing new."""
-
-    def ingest(self, url, payload, captured_at=None) -> IngestResult:
-        super().ingest(url, payload, captured_at)
-        return IngestResult(seen=1, stored=0, unchanged=1)
-
-    def ingest_dom(self, items, page_url="", scraped_at=None, **kwargs) -> IngestResult:
-        super().ingest_dom(items, page_url, scraped_at, **kwargs)
-        return IngestResult(seen=len(items), stored=0, unchanged=len(items))
-
-
-def trigger_client(settings, monkeypatch, service=None):
-    from fastapi.testclient import TestClient
-
-    monkeypatch.setenv("INGEST_TOKEN", "test-token")
-    trigger = RecordingTrigger()
-    app = build_app(settings, service=service or RecordingService(), trigger=trigger)
-    return TestClient(app), trigger
-
-
-def test_a_stored_batch_marks_the_trigger(settings, monkeypatch) -> None:
-    http, trigger = trigger_client(settings, monkeypatch)
-
-    http.post(
-        "/ingest",
-        json={"url": SEARCH_URL, "payload": {"items": [{"item_basic": item()}]}},
-        headers={"X-Ingest-Token": "test-token"},
-    )
-
-    assert trigger.marks == 1
-
-
-def test_a_stored_dom_batch_marks_the_trigger(settings, monkeypatch) -> None:
-    http, trigger = trigger_client(settings, monkeypatch)
-
-    http.post(
-        "/ingest-dom",
-        json={"items": [{"name": "Kaos", "price": "Rp55.000"}], "pageUrl": SEARCH_URL},
-        headers={"X-Ingest-Token": "test-token"},
-    )
-
-    assert trigger.marks == 1
-
-
-def test_a_batch_that_stored_nothing_does_not_mark(settings, monkeypatch) -> None:
-    """Re-reading a page the user already visited is not a scrape to report."""
-    http, trigger = trigger_client(settings, monkeypatch, service=QuietService())
-
-    http.post(
-        "/ingest",
-        json={"url": SEARCH_URL, "payload": {"items": [{"item_basic": item()}]}},
-        headers={"X-Ingest-Token": "test-token"},
-    )
-    http.post(
-        "/ingest-dom",
-        json={"items": [{"name": "Kaos", "price": "Rp55.000"}], "pageUrl": SEARCH_URL},
-        headers={"X-Ingest-Token": "test-token"},
-    )
-
-    assert trigger.marks == 0
-
-
-def test_a_rejected_batch_does_not_mark(settings, monkeypatch) -> None:
-    """A 401 must not be able to drive the notifier."""
-    http, trigger = trigger_client(settings, monkeypatch)
-
-    http.post("/ingest", json={"url": SEARCH_URL, "payload": {"items": []}})
-
-    assert trigger.marks == 0
-
-
-def test_ingest_runs_without_a_trigger(settings, monkeypatch) -> None:
-    """NOTIFY_URL unset is the normal case for a bare checkout, not an error."""
-    from fastapi.testclient import TestClient
-
-    monkeypatch.setenv("INGEST_TOKEN", "test-token")
-    app = build_app(settings, service=RecordingService(), trigger=None)
-
-    with TestClient(app) as http:  # runs the lifespan that owns the trigger
-        response = http.post(
-            "/ingest",
-            json={"url": SEARCH_URL, "payload": {"items": [{"item_basic": item()}]}},
-            headers={"X-Ingest-Token": "test-token"},
-        )
-
-    assert response.status_code == 200
-
-
-# ----------------------------------------------------------------------
 # Choosing a database
 # ----------------------------------------------------------------------
 
@@ -374,18 +264,8 @@ def two_targets(settings, monkeypatch):
 
     monkeypatch.setenv("INGEST_TOKEN", "test-token")
     local, neon = RecordingService(), RecordingService()
-    local_trigger, neon_trigger = RecordingTrigger(), RecordingTrigger()
-    app = build_app(
-        settings,
-        service=local,
-        trigger=local_trigger,
-        neon_service=neon,
-        neon_trigger=neon_trigger,
-    )
-    return TestClient(app), {
-        "local": (local, local_trigger),
-        "neon": (neon, neon_trigger),
-    }
+    app = build_app(settings, service=local, neon_service=neon)
+    return TestClient(app), {"local": local, "neon": neon}
 
 
 def post_dom(http, target=None):
@@ -407,8 +287,8 @@ def test_no_target_header_writes_to_local(two_targets) -> None:
 
     assert response.status_code == 200
     assert response.json()["target"] == "local"
-    assert len(targets["local"][0].dom_calls) == 1
-    assert targets["neon"][0].dom_calls == []
+    assert len(targets["local"].dom_calls) == 1
+    assert targets["neon"].dom_calls == []
 
 
 def test_the_header_picks_the_hosted_database(two_targets) -> None:
@@ -418,25 +298,15 @@ def test_the_header_picks_the_hosted_database(two_targets) -> None:
 
     assert response.status_code == 200
     assert response.json()["target"] == "neon"
-    assert targets["local"][0].dom_calls == []
-    assert len(targets["neon"][0].dom_calls) == 1
+    assert targets["local"].dom_calls == []
+    assert len(targets["neon"].dom_calls) == 1
 
 
 def test_the_target_is_case_insensitive(two_targets) -> None:
     http, targets = two_targets
 
     assert post_dom(http, "NEON").status_code == 200
-    assert len(targets["neon"][0].dom_calls) == 1
-
-
-def test_each_target_marks_only_its_own_trigger(two_targets) -> None:
-    """One dashboard reads one database: a Neon write is not local news."""
-    http, targets = two_targets
-
-    post_dom(http, "neon")
-
-    assert targets["neon"][1].marks == 1
-    assert targets["local"][1].marks == 0
+    assert len(targets["neon"].dom_calls) == 1
 
 
 def test_an_unknown_target_is_refused(two_targets) -> None:
@@ -446,7 +316,7 @@ def test_an_unknown_target_is_refused(two_targets) -> None:
 
     assert response.status_code == 422
     assert "unknown target" in response.json()["detail"]
-    assert targets["local"][0].dom_calls == []
+    assert targets["local"].dom_calls == []
 
 
 def test_an_unconfigured_target_says_so(settings, monkeypatch) -> None:
@@ -454,7 +324,7 @@ def test_an_unconfigured_target_says_so(settings, monkeypatch) -> None:
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("INGEST_TOKEN", "test-token")
-    app = build_app(settings, service=RecordingService(), trigger=RecordingTrigger())
+    app = build_app(settings, service=RecordingService())
 
     response = post_dom(TestClient(app), "neon")
 
@@ -472,8 +342,8 @@ def test_the_ingest_route_routes_too(two_targets) -> None:
     )
 
     assert response.json()["target"] == "neon"
-    assert len(targets["neon"][0].calls) == 1
-    assert targets["local"][0].calls == []
+    assert len(targets["neon"].calls) == 1
+    assert targets["local"].calls == []
 
 
 def test_health_says_which_targets_exist(two_targets) -> None:
@@ -482,14 +352,13 @@ def test_health_says_which_targets_exist(two_targets) -> None:
     body = http.get("/health").json()
 
     assert body["targets"] == {"local": True, "neon": True}
-    assert body["notifies"] == {"local": True, "neon": True}
 
 
 def test_health_reports_an_unconfigured_target_as_unavailable(settings, monkeypatch) -> None:
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("INGEST_TOKEN", "test-token")
-    app = build_app(settings, service=RecordingService(), trigger=None)
+    app = build_app(settings, service=RecordingService())
 
     body = TestClient(app).get("/health").json()
 

@@ -18,9 +18,6 @@ Env var                   Field                     Notes
 ``MAX_DELAY``             ``max_delay``             default 5.0 seconds
 ``COOKIES_PATH``          ``cookies_path``          default ./cookies.json (gitignored)
 ``NEON_DATABASE_URL``     ``neon_database_url``     hosted DB: sync target, second ingest target
-``NOTIFY_URL``            ``notify_url``            None => ingest never runs the notifier itself
-``NOTIFY_SECRET``         ``notify_secret``         bearer token for the dashboard's /api/notify
-``NOTIFY_QUIET_SECONDS``  ``notify_quiet_seconds``  default 180.0; the silence that ends a scrape
 ========================  ========================  ===============================================
 """
 
@@ -157,44 +154,6 @@ class Settings(BaseSettings):
         "to when the extension asks for it. Use the direct (non-pooler) endpoint: "
         "both of those do schema work and bulk inserts, which is not what a pooler in "
         "transaction mode is for. Excluded from repr().",
-    )
-    notify_url: str | None = Field(
-        default=None,
-        description="Base URL of the dashboard that hosts /api/notify. Set together "
-        "with notify_secret, the ingest server runs the notifier itself once a burst "
-        "of ingest goes quiet (scraper.notify_trigger). Unset, it does not — the "
-        "launchd agent running scripts/notify.sh is then the only trigger.",
-    )
-    notify_secret: str | None = Field(
-        default=None,
-        # repr=False for the same reason as database_url: this is a bearer
-        # credential for a route that writes to Telegram, and runner._record_failure
-        # persists repr(exc) into scrape_runs.error.
-        repr=False,
-        description="Bearer token /api/notify checks, matching NOTIFY_SECRET on the "
-        "dashboard. Excluded from repr().",
-    )
-    neon_notify_url: str | None = Field(
-        default=None,
-        description="Base URL of the deployed dashboard that reads NEON_DATABASE_URL. "
-        "Set with neon_notify_secret, an ingest batch written to the neon target runs "
-        "that deployment's notifier, the way notify_url's does for local writes.",
-    )
-    neon_notify_secret: str | None = Field(
-        default=None,
-        # repr=False: bearer credential, same reasoning as notify_secret.
-        repr=False,
-        description="Bearer token the deployed dashboard checks. Deliberately has no "
-        "fallback to notify_secret — these are two different deployments, and a "
-        "fallback would send the laptop's secret to a host on the internet because a "
-        "variable was forgotten. Excluded from repr().",
-    )
-    notify_quiet_seconds: float = Field(
-        default=180.0,
-        ge=0.0,
-        description="How long ingest must stay silent before the notifier is run. "
-        "The extension delivers a browsing session as a stream of batches, so this "
-        "is what separates one 'scrape' from the next.",
     )
 
     @field_validator("cookies_path", mode="before")
