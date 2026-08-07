@@ -8,13 +8,22 @@
  * listing would be. A marker driven by the immediate predecessor would light up
  * most of the table with artefacts and mean nothing.
  *
- * So both the notifier and the product list compare against *the newest
- * snapshot at least this many hours older*, and they read the same setting to
- * decide how many. That is the whole reason this lives in its own module rather
- * than in `notify/run.ts`: `lib/queries.ts` cannot import from there without a
- * cycle (`notify/positions.ts` already imports `queries.ts`), and a second copy
- * of the number is how the badge in the table and the message on the phone would
- * come to disagree about what counts as a price change.
+ * So every screen that reports a price change compares against *the newest
+ * snapshot at least some hours older*. The product table's movement badge takes
+ * that floor from here; `/notifications` applies the same rule against a wider
+ * floor of its own — `DEFAULT_WINDOW.gapHours` in `notify/rival-moves.ts`, 24, a
+ * literal rather than a reading of this setting, because that window is also
+ * what the read marker advances over and moving it from the environment would
+ * move what "already read" means.
+ *
+ * Its own module because the badge is assembled in two places that must agree:
+ * `queries.ts` measures it in SQL (`make_interval(hours => …)`), and
+ * `ProductTable.tsx` prints the caption that tells the reader what was measured
+ * ("dibanding snapshot ≥N jam sebelumnya"), taking N through
+ * `products/page.tsx`. A second copy of the number is how a badge would come to
+ * describe itself wrongly. Being a plain module with no database and no
+ * `server-only` import is also what lets `product-movement.test.ts` cover the
+ * parsing directly.
  */
 
 /**
@@ -23,6 +32,11 @@
  * Twelve, so a comparison spans at least half a day. `NOTIFY_MIN_GAP_HOURS=0`
  * turns the rule off and compares against the immediately preceding snapshot,
  * which is documented as a way to see the artefacts for yourself.
+ *
+ * The variable keeps the `NOTIFY_` prefix of the notifier that first needed it,
+ * which is now deleted. Renaming it would mean editing the environment of a
+ * running deployment to buy nothing, so the name stays and this note explains
+ * it.
  */
 export const DEFAULT_MIN_GAP_HOURS = 12;
 
@@ -39,10 +53,12 @@ export const DEFAULT_MIN_GAP_HOURS = 12;
  */
 export function resolveMinGapHours(
   // `Record`, not `{ NOTIFY_MIN_GAP_HOURS?: string }`: TypeScript's weak-type
-  // check refuses to assign `process.env` to an all-optional type it shares no
-  // declared property with — the same trap `NotifyEnv` documents in
-  // `notify/run.ts`. An index signature has no such problem, and `NotifyEnv`
-  // (a type alias, so it gains an implicit index signature) still passes here.
+  // check fires when every property of a target type is optional, and it
+  // compares only the properties *declared* on `ProcessEnv`, ignoring its index
+  // signature — so the narrow, more descriptive shape would refuse
+  // `process.env` at every call site and force a cast there instead. An index
+  // signature has no such problem, and a test may still pass a plain object
+  // literal.
   env: Record<string, string | undefined> = process.env,
 ): number {
   const text = env.NOTIFY_MIN_GAP_HOURS?.trim();
