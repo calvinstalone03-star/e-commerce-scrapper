@@ -1394,8 +1394,8 @@ def sync(
     The target ends up holding exactly what this database holds, ids included,
     for ``stores``, ``products``, ``product_keywords``, ``price_snapshots`` and
     ``scrape_runs``. Its ``app_credentials`` is left alone and its
-    ``notify_watermark`` is reseeded to the end of what was copied, so the
-    deployment's notifier does not announce the mirror itself as news.
+    ``notify_seen`` is reseeded to the end of what was copied, so the
+    dashboard does not render the mirror itself as news.
 
     This deletes. ``--dry-run`` first is the habit worth having, and the
     confirmation prompt names the target before anything is written.
@@ -1415,7 +1415,7 @@ def sync(
     from sqlalchemy.exc import SQLAlchemyError
 
     from scraper.db import _normalise_url, get_engine, run_migrations
-    from scraper.sync import mirror, plan, reseed_watermark, table_counts
+    from scraper.sync import mirror, plan, reseed_seen, table_counts
 
     settings = _settings()
     target_url = (to or settings.neon_database_url or "").strip()
@@ -1520,8 +1520,8 @@ def sync(
             written = mirror(
                 source_engine, target_engine, batch_size=batch_size, on_progress=_progress
             )
-            status.update("reseeding the notifier watermark…")
-            watermark = reseed_watermark(target_engine)
+            status.update("reseeding the notifications read marker…")
+            seen = reseed_seen(target_engine)
             after = table_counts(target_engine)
     except SQLAlchemyError as exc:
         # The mirror runs in one transaction, so this is "unchanged", not
@@ -1538,17 +1538,15 @@ def sync(
         result.add_row(name, str(written[name]), str(after.get(name, 0)))
     console.print(result)
 
-    if watermark is None:
+    if seen is None:
         console.print(
-            "[yellow]no notify_watermark on the target[/yellow] — its notifier has "
-            "never run there. Nothing to reseed."
+            "[yellow]no notify_seen on the target[/yellow] — the dashboard has "
+            "never been migrated there. Nothing to reseed."
         )
     else:
         console.print(
-            "notifier watermark reseeded to "
-            f"snapshot {watermark['last_snapshot_id']}, "
-            f"product {watermark['last_product_id']}, "
-            f"store {watermark['last_store_id']} — the mirror itself is not news."
+            f"notifications read marker reseeded to snapshot {seen} — "
+            "the mirror itself is not news."
         )
 
 

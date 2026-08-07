@@ -18,14 +18,14 @@ serials — ``products.id`` means nothing to Shopee — and the natural keys are
 map every source id to a target id and rewrite ``shop_ref`` and ``product_ref``
 as it went. Copying ids verbatim skips that entirely, and leaves the two
 databases agreeing on what row 8134 is, which matters the moment anything holds
-an id across them — ``notify_watermark`` does exactly that.
+an id across them — ``notify_seen`` does exactly that.
 
-What this does **not** touch: ``app_credentials`` and ``notify_watermark``. Both
+What this does **not** touch: ``app_credentials`` and ``notify_seen``. Both
 belong to the dashboard rather than to the scrape, and the target's login is
-deliberately not the laptop's (README section 7, step 2). The watermark is
-instead *reseeded* to the mirrored maximums by :func:`reseed_watermark`, for the
-reason ``migrations/005_notify_watermark.sql`` gives: everything just copied
-predates the notifier's interest in it, and announcing 18,000 long-known
+deliberately not the laptop's (README section 7, step 2). The marker is
+instead *reseeded* to the mirrored maximum by :func:`reseed_seen`, for the
+reason ``migrations/006_notify_seen.sql`` gives: everything just copied
+predates the reader's interest in it, and announcing 18,000 long-known
 listings as new is not a useful notification.
 
 The destructive part is guarded rather than trusted. :func:`plan` reports what
@@ -53,7 +53,7 @@ __all__ = [
     "mirror",
     "natural_keys",
     "plan",
-    "reseed_watermark",
+    "reseed_seen",
     "table_counts",
 ]
 
@@ -71,9 +71,9 @@ SCRAPED_TABLES: tuple[str, ...] = (
 )
 
 #: Tables the target owns and this never writes. The dashboard makes both
-#: (``lib/auth.ts``, ``lib/notify/watermark.ts``), and a deployment's login is
-#: not meant to be the laptop's.
-OWNED_BY_TARGET: frozenset[str] = frozenset({"app_credentials", "notify_watermark"})
+#: (``lib/auth.ts``, ``migrations/006_notify_seen.sql``), and a deployment's
+#: login is not meant to be the laptop's.
+OWNED_BY_TARGET: frozenset[str] = frozenset({"app_credentials", "notify_seen"})
 
 #: Rows per round trip. The target is usually across the internet, so this is a
 #: latency knob, not a memory one: 18,000 products at 1,000 a time is 18 round
@@ -258,7 +258,7 @@ def mirror(
     Args:
         source: Database to read.
         target: Database to overwrite. Its ``app_credentials`` and
-            ``notify_watermark`` are left alone.
+            ``notify_seen`` are left alone.
         batch_size: Rows per insert round trip.
         on_progress: Called as ``(table, rows_written_so_far)`` after each batch.
 
@@ -306,30 +306,32 @@ def mirror(
     return written
 
 
-def reseed_watermark(target: Engine) -> dict[str, int] | None:
-    """Point the target's notifier at the end of what was just mirrored.
+def reseed_seen(target: Engine) -> int | None:
+    """Point the target's read marker at the end of what was just mirrored.
 
-    Without this the watermark still holds ids from the target's own, now
-    deleted, id space. Those ids are meaningless against the mirrored rows: too
-    low and the next notifier run announces thousands of listings that have been
-    known for weeks, too high and it silently skips real changes.
+    Without this ``notify_seen`` still holds an id from the target's own, now
+    deleted, id space — meaningless against the mirrored rows, and possibly
+    sitting above the new ``max(price_snapshots.id)`` entirely, since
+    :func:`mirror` truncates the target and copies ids verbatim. Too low and
+    the dashboard renders thousands of long-known listings as new, too high
+    and it silently hides real changes.
 
-    Reseeding to the current maximums is the same posture
-    ``migrations/005_notify_watermark.sql`` takes on a fresh database, and for
-    the same reason — what was just copied is history, not news.
+    Reseeding to the current maximum is the same posture
+    ``migrations/006_notify_seen.sql`` takes on a fresh database, and for the
+    same reason — what was just copied is history, not news.
 
     Args:
         target: Database that was mirrored into.
 
     Returns:
-        The seeded ids, or None when the target has no ``notify_watermark``
-        table (a database the dashboard has never migrated).
+        The seeded ``last_seen_snapshot_id``, or None when the target has no
+        ``notify_seen`` table (a database the dashboard has never migrated).
     """
     with target.begin() as tx:
         exists = tx.execute(
             text(
                 "SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema = 'public' AND table_name = 'notify_watermark'"
+                "WHERE table_schema = 'public' AND table_name = 'notify_seen'"
             )
         ).first()
         if exists is None:
@@ -338,25 +340,14 @@ def reseed_watermark(target: Engine) -> dict[str, int] | None:
         row = tx.execute(
             text(
                 """
-                INSERT INTO notify_watermark
-                    (id, last_snapshot_id, last_product_id, last_store_id, updated_at)
-                VALUES (1,
-                        COALESCE((SELECT max(id) FROM price_snapshots), 0),
-                        COALESCE((SELECT max(id) FROM products), 0),
-                        COALESCE((SELECT max(id) FROM stores), 0),
-                        now())
+                INSERT INTO notify_seen (id, last_seen_snapshot_id, updated_at)
+                VALUES (1, COALESCE((SELECT max(id) FROM price_snapshots), 0), now())
                 ON CONFLICT (id) DO UPDATE SET
-                    last_snapshot_id = EXCLUDED.last_snapshot_id,
-                    last_product_id  = EXCLUDED.last_product_id,
-                    last_store_id    = EXCLUDED.last_store_id,
-                    updated_at       = EXCLUDED.updated_at
-                RETURNING last_snapshot_id, last_product_id, last_store_id
+                    last_seen_snapshot_id = EXCLUDED.last_seen_snapshot_id,
+                    updated_at            = EXCLUDED.updated_at
+                RETURNING last_seen_snapshot_id
                 """
             )
         ).one()
 
-    return {
-        "last_snapshot_id": row[0],
-        "last_product_id": row[1],
-        "last_store_id": row[2],
-    }
+    return row[0]

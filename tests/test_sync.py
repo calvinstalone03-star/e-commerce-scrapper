@@ -31,7 +31,7 @@ from scraper.sync import (
     mirror,
     natural_keys,
     plan,
-    reseed_watermark,
+    reseed_seen,
     table_counts,
 )
 
@@ -74,7 +74,7 @@ def _reset(engine, url: str) -> None:
     """Drop everything, including the tables the migrations own, and rebuild."""
     Base.metadata.drop_all(engine)
     with engine.begin() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS app_credentials, notify_watermark"))
+        conn.execute(text("DROP TABLE IF EXISTS app_credentials, notify_seen"))
     init_db(url)
 
 
@@ -121,7 +121,7 @@ def seed(engine, *, shop_id: int = 5001, item_id: int = 7001, store_pk: int = 11
 
 
 def test_mirror_copies_rows_with_their_ids(databases) -> None:
-    """Ids are the point: notify_watermark holds them across both databases."""
+    """Ids are the point: notify_seen holds one across both databases."""
     source, target = databases
     seed(source)
 
@@ -272,37 +272,37 @@ def test_natural_keys_refuses_a_table_without_one(databases) -> None:
 
 
 # ----------------------------------------------------------------------
-# The watermark
+# The read marker
 # ----------------------------------------------------------------------
 
 
-def test_reseed_points_the_watermark_at_what_was_mirrored(databases) -> None:
-    """Otherwise the next run announces every mirrored listing as new."""
+def test_reseed_points_seen_at_what_was_mirrored(databases) -> None:
+    """Otherwise the dashboard renders every mirrored listing as new."""
     source, target = databases
     seed(source, store_pk=11, product_pk=21, snapshot_pk=31)
 
     mirror(source, target)
-    seeded = reseed_watermark(target)
+    seeded = reseed_seen(target)
 
-    assert seeded == {"last_snapshot_id": 31, "last_product_id": 21, "last_store_id": 11}
+    assert seeded == 31
 
 
-def test_reseed_overwrites_a_watermark_from_the_targets_old_id_space(databases) -> None:
+def test_reseed_overwrites_a_seen_marker_from_the_targets_old_id_space(databases) -> None:
+    """A marker left from the target's own history can sit above the new max."""
     source, target = databases
     seed(source, store_pk=11, product_pk=21, snapshot_pk=31)
     with target.begin() as conn:
-        conn.execute(text("UPDATE notify_watermark SET last_product_id = 999999"))
+        conn.execute(text("UPDATE notify_seen SET last_seen_snapshot_id = 999999"))
 
     mirror(source, target)
-    seeded = reseed_watermark(target)
+    seeded = reseed_seen(target)
 
-    assert seeded is not None
-    assert seeded["last_product_id"] == 21
+    assert seeded == 31
 
 
 def test_reseed_reports_a_target_the_dashboard_has_never_migrated(databases) -> None:
     _source, target = databases
     with target.begin() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS notify_watermark"))
+        conn.execute(text("DROP TABLE IF EXISTS notify_seen"))
 
-    assert reseed_watermark(target) is None
+    assert reseed_seen(target) is None
