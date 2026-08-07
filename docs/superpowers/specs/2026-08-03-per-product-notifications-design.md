@@ -1,5 +1,11 @@
 # Satu produk satu pesan, untuk barang yang kita jual juga
 
+> **SUPERSEDED.** The feature this document describes was replaced by the
+> in-dashboard notifications page. See
+> [`docs/superpowers/specs/2026-08-07-dashboard-notifications-design.md`](2026-08-07-dashboard-notifications-design.md).
+> Kept as the record of what was built and why it was removed; nothing here
+> describes code that still exists.
+
 Tanggal: 2026-08-03
 
 Lanjutan dari [notifikasi Telegram](2026-08-03-telegram-notifications-design.md).

@@ -1,5 +1,11 @@
 # Telegram Notifications Implementation Plan
 
+> **SUPERSEDED.** The feature this document describes was replaced by the
+> in-dashboard notifications page. See
+> [`docs/superpowers/specs/2026-08-07-dashboard-notifications-design.md`](../specs/2026-08-07-dashboard-notifications-design.md).
+> Kept as the record of what was built and why it was removed; nothing here
+> describes code that still exists.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A `POST /api/notify` route handler in the Vercel dashboard that reads what changed in Postgres since a stored watermark and sends one grouped Telegram digest with dashboard deep links.

@@ -568,7 +568,7 @@ ecom-scraper sync             # migrations, then the rows
 `sync` mirrors: afterwards the target's `stores`, `products`,
 `product_keywords`, `price_snapshots` and `scrape_runs` are exactly what this
 laptop holds, **ids included**. Ids rather than natural keys because
-`notify_watermark` stores ids and nothing else here would survive being
+`notify_seen` stores an id and nothing else here would survive being
 renumbered; copying them verbatim also means the two databases agree on what row
 8134 is.
 
@@ -579,10 +579,10 @@ Three things it will not do. It never touches `app_credentials`: a deployment's
 login is meant to be its own, seeded from `DASHBOARD_PASSWORD`, not the laptop's.
 It refuses outright when the target holds shops or listings this database does
 not — a mirror would delete them, so it names them and stops unless you pass
-`--force`. And it reseeds the target's `notify_watermark` to the maximums it just
-copied, for the reason `migrations/005_notify_watermark.sql` gives: what was
-copied is history, not news, and a stale watermark would announce 18,000
-long-known listings on the next notifier run.
+`--force`. And it reseeds the target's `notify_seen` to the newest snapshot id it
+just copied, for the reason `migrations/006_notify_seen.sql` gives: what was
+copied is history, not news, and a read marker left behind would show 18,000
+long-known listings as unread on the notifications page.
 
 The whole thing runs in one transaction on the target, so a connection dropped
 partway leaves it exactly as it was rather than half-mirrored.
@@ -649,103 +649,64 @@ default, which is what the per-transaction `SET LOCAL` is for. If those three
 seconds matter more than remote access, run the dashboard locally — it is the
 same code, and `scripts/dashboard-server.sh` already does it.
 
-## 8. Telegram notifications
+## 8. Notifications
 
-The dashboard tells you where you stand when you open it. This tells you when
-something moved without you opening anything: a price change, a shop you have
-never seen, or a new listing in a shop you already track.
+The dashboard tells you where you stand when you open it. `/notifications` tells
+you what changed while you were not looking: every rival that moved a price on a
+`set_code` one of our own shops carries. A bell in the topbar carries the unread
+count, so the answer is visible from whichever screen you are already on.
 
-It runs **in the deployment**, not in the scraper — a notification is read on a
-phone, and a link to `127.0.0.1:3100` is not. The trigger comes from here,
-because Vercel's Hobby plan caps cron jobs at once per day.
+**There is nothing to configure.** No bot, no token, no shared secret, no
+trigger, no timer. The page reads the same database every other screen reads,
+and how far you have read is one row in `notify_seen`
+(`migrations/006_notify_seen.sql`, applied by `ecom-scraper initdb` like every
+other migration). Setting up section 7 is all the setup there is.
 
-**1. A bot.** Message `@BotFather`, `/newbot`, keep the token. Message
-`@userinfobot` to get your own chat id.
+This replaced a Telegram bot, and the trade it makes is worth knowing. A bot
+pushes; a page waits to be opened. What was bought with that is a worklist that
+survives being read — the old digest was a message you scrolled past once,
+whereas this is the same rows tomorrow, still there, still linked to the screen
+that answers what to do about them.
 
-**2. Three variables on the deployment.**
+### What is on it
 
-```bash
-vercel env add TELEGRAM_BOT_TOKEN production
-vercel env add TELEGRAM_CHAT_ID production
-vercel env add NOTIFY_SECRET production   # anything long and random
-```
+A rolling **14-day window**, newest first, with two tabs. *Semua* is the landing
+view and always renders the whole window. *Baru* is the same list narrowed to
+what arrived above your read marker, and it is allowed to be empty — you got
+there by asking a question whose honest answer is sometimes "nothing".
 
-**3. Two variables here,** in the repo root `.env`:
+The read marker **never filters Semua**, which is the rule the whole screen is
+built around. A marker that filtered could only ever be read once: one glance on
+a phone would erase a 56-row worklist that then existed nowhere. It decides
+which rows are styled as new and what the bell counts, and nothing else. Opening
+the page advances it (`POST /api/notifications/seen`) to the top of the window
+rather than to the last row rendered, so a row below the display cap is not
+stranded — it is still in the window tomorrow.
 
-```bash
-NOTIFY_URL=https://<your-deployment>
-NOTIFY_SECRET=<the same value you gave Vercel>
-```
+A row qualifies when a rival's price moved by at least **5%** against a
+comparison snapshot **at least 24 hours and at most 7 days** older. Rows where
+that rival went *under* our price sort first, because that is the one that
+demands a decision; a big move on a set we are still comfortably winning is
+news, not a decision. A shop that repriced its whole catalogue at once folds
+into a single entry that carries its members, so 33 identical rows cannot bury
+everything else — and the fold happens *within* the undercut partition, never
+across it, so a group cannot straddle "went under us" and "did not".
 
-**4. Trigger it.** Something has to run the notifier; a scrape does not send a
-notification by writing rows. Two triggers do it here, and they are not
-alternatives — the first is for latency, the second is the floor.
+Each row states its own real comparison age rather than claiming "24 jam". The
+24-hour floor is a guard against the noise between captures a few hours apart,
+not a description of what any given row compared against: measured against this
+database, the window returns the same 56 rows at 1, 6, 12, 24, 48 and 72 hours,
+and the comparisons actually chosen range from 78 to 140 hours old. What binds
+is the scrape spacing, so the page reports what it used.
 
-*The ingest server, when a burst goes quiet.* Those same two variables are read
-by `scraper/config.py`, and with both set the ingest server watches its own
-writes: every batch that stores a row marks the clock, and once
-`NOTIFY_QUIET_SECONDS` (180) pass with no further batch, it POSTs `/api/notify`
-itself (`scraper/notify_trigger.py`). The extension has no "scrape finished"
-event to hang this on — it hands over whatever JSON the page the user is on
-already received, for as long as they browse — so silence is what stands in for
-one. Restart the server after setting the variables; it reads them at boot:
-`launchctl kickstart -k gui/$(id -u)/com.ecomscraper.ingest`.
-
-Set `NOTIFY_QUIET_SECONDS=0` to fire on the next tick instead of waiting, and
-leave `NOTIFY_URL` unset to turn the whole mechanism off.
-
-*A timer, unconditionally.* A launchd agent is what this laptop actually runs:
-`~/Library/LaunchAgents/com.ecomscraper.notify.plist`, `StartInterval` 1800,
-`RunAtLoad` true, and deliberately **not** `KeepAlive` — the script exits by
-design, and keeping it alive would restart it in a loop. It is a sibling of the
-`com.ecomscraper.ingest` and `.dashboard` agents, whose launchers are
-`scripts/ingest-server.sh` and `scripts/dashboard-server.sh`. A cron line does
-the same job:
-
-```cron
-0 6 * * * cd /path/to/ecom-scraper && .venv/bin/ecom-scraper run --mode store --pages 5 >> logs/store.log 2>&1
-5 7 * * * cd /path/to/ecom-scraper && scripts/notify.sh >> logs/notify.log 2>&1
-```
-
-The timer stays even with the quiet-window trigger armed, because that trigger
-has two holes it cannot cover itself: a browsing session that never goes quiet
-never fires one, and a POST that fails is dropped rather than retried. Both are
-a missed *run*, not a missed change — the watermark has not moved, so the next
-timer tick reports everything the missed run would have.
-
-Half an hour is not arbitrary either. A price change only counts once its
-comparison snapshot is `NOTIFY_MIN_GAP_HOURS` (12) older, so a shorter interval
-does not report more, it only finds nothing more often. What the quiet-window
-trigger buys is therefore narrower than it looks, and worth stating exactly: a
-**new shop** or a **new listing** is a watermark comparison — reportable the
-moment the row exists — so those arrive minutes after capture instead of up to
-half an hour later. Price changes keep the timing the data gives them.
-
-Two triggers landing together is safe: `/api/notify` takes the watermark row
-`FOR UPDATE`, so the second waits for the first and then finds nothing new.
-
-Note what `NOTIFY_URL` points at in that arrangement. The scrape data lives in
-Postgres on this laptop, and a Vercel deployment cannot reach `127.0.0.1`, so
-the notifier runs against the local dashboard — `http://127.0.0.1:3100` —
-rather than against the deployment. Pointing it at a deployment means moving
-the database somewhere both can reach first.
-
-Two things silently produce no notification, and both look identical from the
-outside. `scripts/dashboard-server.sh` serves a build and does not make one, so
-a dashboard started before the notifier existed has no `/api/notify` to call —
-`curl -X POST http://127.0.0.1:3100/api/notify` answers 401 when the route is
-there and 404 when it is not. And `next start` reads `.env.local` once at boot,
-so a corrected `TELEGRAM_CHAT_ID` needs `launchctl kickstart -k
-gui/$(id -u)/com.ecomscraper.dashboard` before it takes effect.
-
-The first run after setup sends nothing: the watermark is seeded to what is
-already in the database, because 12,000 listings you have had for weeks are not
-news.
+Cross-marketplace by design, like `/products` and `/stores`: a rival's move
+matters whichever marketplace it happens on. Every link it builds still carries
+`?kanal=`, because the screens it points at are scoped.
 
 ### What counts as a price change
 
-A snapshot is compared against the newest one at least `NOTIFY_MIN_GAP_HOURS`
-older (12 by default), not against whatever came immediately before it.
+Everywhere in this project a snapshot is compared against the newest one at
+least some hours older, never against whatever came immediately before it.
 
 Captures taken hours apart disagree about price without anything having been
 repriced. In this database, 37 of 38 snapshot pairs taken 1.5–3.5 hours apart
@@ -753,50 +714,30 @@ differ, against 3 of 1,335 pairs taken a day apart — and `sold` is byte-identi
 across the near pairs, which no genuinely repriced listing would be. Comparing
 against the immediate predecessor reports mostly artefacts.
 
-Set `NOTIFY_MIN_GAP_HOURS=0` to turn the rule off and see the difference.
+The product table's movement badge reads its floor from
+`NOTIFY_MIN_GAP_HOURS` (12), through `dashboard/src/lib/price-change.ts` — one
+module rather than a copy in each query, so the badge cannot come to disagree
+with what the rest of the app calls a change. The variable keeps its `NOTIFY_`
+name from the notifier that first needed it. Set `NOTIFY_MIN_GAP_HOURS=0` to
+turn the rule off and see the artefacts for yourself.
 
-### Which changes get a message of their own
+`/notifications` applies the same rule with its own, wider floor of 24 hours
+(`DEFAULT_WINDOW` in `dashboard/src/lib/notify/rival-moves.ts`), which is also
+what the read marker advances over — one constant read by both, because a marker
+that moved over a different window from the one the page renders would strand
+exactly the rows nobody had read.
 
-A change on a `set_code` one of our own shops carries gets its own message,
-carrying where we stand on that set: our price and shop, the cheapest rival and
-how many rivals there are, and which side we are on. Everything else stays in
-the digest, because "a shop we do not compete with moved a price" has no
-position to state.
+### If it is empty
 
-Where the two sides of a set are not comparable — `8827` is a sealed box of
-sixty in our shop and a single loose minifigure in someone else's — the message
-still goes out, but the position line is replaced by a note saying so. A
-confidently wrong "kita lebih mahal Rp 8,1 juta" costs the reader their trust in
-every other message that was right.
+An empty *Baru* means nothing new since you last looked, which is the ordinary
+case. An empty *Semua* does not: the window is 14 days wide and unfiltered, so
+nothing there at all means nothing is being written to the database this
+dashboard reads.
 
-`NOTIFY_PER_PRODUCT_MAX` (10) caps how many of these one run sends. The order is
-by proportional move, largest first, so a cap that bites keeps the changes that
-most demand a decision; the remainder drops into the digest, which says how many
-it is holding. Set 0 for digest only.
-
-Ten is not a taste judgement, it is what the function budget pays for. Telegram
-accepts about 20 messages a minute to one group, so the notifier spaces them
-three seconds apart — without that spacing a backlog run is a burst, Telegram
-answers with a flood-wait of tens of seconds, and the run is abandoned. Ten
-per-product messages plus at most four of digest is 39 seconds of spacing, plus
-the requests and the queries either side, inside the 60 seconds `maxDuration`
-declares in `dashboard/src/app/api/notify/route.ts`.
-
-That 60 is Vercel's Hobby ceiling, the plan `scripts/notify.sh` documents. On
-Pro it is 300, and then `FUNCTION_BUDGET_SECONDS`, `maxDuration` and
-`NOTIFY_PER_PRODUCT_MAX` can go back to the 300 and 30 the design was costed
-against. Raise them together: a run that overshoots the limit is killed
-mid-transaction, so the watermark never advances and the next run rebuilds the
-same backlog into the same wall.
-
-### If it goes quiet
-
-Silence is correct when nothing changed. It is also what a notifier reading the
-wrong database looks like. So if the newest snapshot it can see is older than
-`NOTIFY_STALE_HOURS` (36), it says so instead — at most once a day.
-
-The usual cause is step 5 of section 7: the ingest server still writing to the
-laptop while the deployment reads Neon.
+The usual cause is step 5 of section 7 — the ingest server still writing to the
+laptop while the deployment reads Neon. Compare the row counts:
+`ecom-scraper doctor` against this machine, and the Ringkasan screen on the
+deployment.
 
 ## Exit codes
 
@@ -822,12 +763,12 @@ Real environment variables win over `.env`.
 | `MIN_DELAY` | `2.0` | Lower bound of the per-request random delay, seconds |
 | `MAX_DELAY` | `5.0` | Upper bound. Must be >= `MIN_DELAY` or startup fails |
 | `COOKIES_PATH` | `cookies.json` | Where the cookie jar is persisted. Always written `0600`; `.gitignore` covers `*cookies*.json`, so a path outside that pattern is yours to add |
-| `NOTIFY_URL` | _(unset)_ | Dashboard hosting `/api/notify`. With `NOTIFY_SECRET`, the ingest server runs the notifier itself once its writes go quiet. Unset, only the timer does |
-| `NOTIFY_SECRET` | _(unset)_ | Bearer token that route checks. Must match the dashboard's own |
-| `NOTIFY_QUIET_SECONDS` | `180.0` | Silence after the last stored batch before that run fires. `0` fires on the next tick |
 | `NEON_DATABASE_URL` | _(unset)_ | The hosted database (section 7). Target of `ecom-scraper sync`, and the second destination the extension can pick. Use the direct, non-pooler endpoint |
-| `NEON_NOTIFY_URL` | _(unset)_ | Deployed dashboard reading that database. Set with `NEON_NOTIFY_SECRET`, a batch written to the Neon destination runs its notifier |
-| `NEON_NOTIFY_SECRET` | _(unset)_ | Bearer token that deployment checks. No fallback to `NOTIFY_SECRET` — two different deployments |
+
+The dashboard reads its own environment, not this one — see
+`dashboard/.env.example`. `NOTIFY_MIN_GAP_HOURS` (12) lives there: it is how old
+a comparison snapshot must be before the product table calls a price difference
+a change (section 8).
 
 Target files (`config/keywords.txt`, `config/stores.txt`): one entry per line,
 blank lines and `#` comment lines ignored, duplicates collapsed. A `#` only
