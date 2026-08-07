@@ -101,12 +101,36 @@ export type RivalMovesOptions = {
   windowDays: number;
   /** How stale a comparison may be before the move is not reported. 7. */
   maxLookbackDays: number;
+  /**
+   * The read marker, when the caller wants only what is above it — the page's
+   * "Baru" tab — and `null` for the whole window, which is the "Semua" tab and
+   * the default landing view.
+   *
+   * Stated rather than optional, so a caller has to decide. This is the one
+   * predicate in the feature that can hide a row, and a filter that could be
+   * left off by accident is how the first draft shipped a page that rendered
+   * empty on day one.
+   */
+  newerThanSnapshotId: string | null;
   limit: number;
   offset: number;
 };
 
-/** Everything that defines the window; what both exports must agree on. */
-export type RivalMovesWindow = Omit<RivalMovesOptions, 'limit' | 'offset'>;
+/**
+ * Everything that defines the window; what both exports must agree on.
+ *
+ * `newerThanSnapshotId` is omitted alongside `limit` and `offset`, and that
+ * omission is the important one. The ceiling exists to say how far the marker
+ * may advance; a ceiling taken over rows already filtered *by* the marker would
+ * be a ceiling that could never move past the marker's own position, and the
+ * rows above it would be stranded. The type says so, and `qualifyingMoves` never
+ * reads the field regardless — the marker predicate lives in `rivalMoves`'s
+ * outer SELECT, not in the shared fragment.
+ */
+export type RivalMovesWindow = Omit<
+  RivalMovesOptions,
+  'limit' | 'offset' | 'newerThanSnapshotId'
+>;
 
 /**
  * The window the page renders and the marker advances over — one constant, read
@@ -135,6 +159,16 @@ export const DEFAULT_WINDOW: RivalMovesWindow = {
   windowDays: 14,
   maxLookbackDays: 7,
 };
+
+/**
+ * Past this the unread count stops counting and says "99+".
+ *
+ * Shared for the same reason as the window above, and it is not a style point:
+ * the bell in the topbar and the count on the page's "Baru" tab are two
+ * renderings of one number, on screen at the same time. Two constants that
+ * happen to be equal would show 99+ next to 120 the day one of them was changed.
+ */
+export const BADGE_CAP = 99;
 
 type Row = {
   id: string;
@@ -245,6 +279,12 @@ function qualifyingMoves({ gapHours, threshold, windowDays, maxLookbackDays }: R
  * price first, then by the size of the move, and only then by id. `NULLS LAST`
  * on the first key puts the sets we have no price for after the ones we know we
  * are still winning — an unknown is not evidence of anything.
+ *
+ * `newerThanSnapshotId` is the page's second tab and the **only** predicate here
+ * that depends on read state. It sits in this outer SELECT rather than in
+ * `qualifyingMoves` for a reason that is easy to undo by accident: the shared
+ * fragment is what `rivalMovesCeiling` counts over, and a marker predicate
+ * inside it would cap the ceiling at the marker and strand everything above.
  */
 export async function rivalMoves(opts: RivalMovesOptions): Promise<RivalMove[]> {
   const rows = await sql<Row[]>`
@@ -265,6 +305,11 @@ export async function rivalMoves(opts: RivalMovesOptions): Promise<RivalMove[]> 
       FROM moves m
       JOIN rival_listings r ON r.id = m.product_ref
       LEFT JOIN our_price op ON op.set_code = r.set_code
+     WHERE ${
+       opts.newerThanSnapshotId === null
+         ? sql`true`
+         : sql`m.id > ${opts.newerThanSnapshotId}::bigint`
+     }
      ORDER BY (m.price < op.price) DESC NULLS LAST,
               abs(m.price - m.previous_price) / m.previous_price DESC,
               m.id DESC
@@ -316,4 +361,62 @@ export async function rivalMovesCeiling(opts: RivalMovesWindow): Promise<string 
     SELECT max(m.id) AS ceiling FROM moves m`;
 
   return row.ceiling === null ? null : String(row.ceiling);
+}
+
+/** How many unread moves there are, and whether that number stopped early. */
+export type UnreadRivalMoves = { count: number; capped: boolean };
+
+/**
+ * What the bell says.
+ *
+ * Its own query rather than `rivalMoves(...).length`, because of where it is
+ * called from: `(app)/layout.tsx` wraps **every** signed-in page, so this runs
+ * on the overview, on the product table, on settings. Fetching the feed to count
+ * it would put the page's whole cost on every screen in the app, ordering
+ * included, to render a two-digit number.
+ *
+ * Bounded twice over, and the two bounds are not the same bound. `LIMIT cap + 1`
+ * bounds the *work*: `moves` is a plain CTE, so Postgres inlines it and the
+ * `Limit` node sits directly over the nested loop, free to stop once enough rows
+ * exist. `capped` bounds the *claim*: past the cap the honest answer is "at least
+ * this many", which is what a "99+" badge says, and it keeps the number on screen
+ * independent of how big the backlog got.
+ *
+ * Only the second of those is observable from the return value, so only the
+ * second is what the tests assert. The first was checked with `EXPLAIN (ANALYZE,
+ * BUFFERS)` against the scraper's own database — 22,121 snapshots — rather than
+ * asserted: **33.6ms**, and the `Limit` node reports 56 rows, which is every
+ * qualifying move there is. So the cap does not bind today and this is simply the
+ * cost of the feed's `WHERE` clause without its ordering; it starts paying for
+ * itself when the backlog passes 99.
+ *
+ * That same plan confirms the other half of the reasoning. The `our_price` CTE is
+ * unreferenced from here and does not appear in the plan at all, and
+ * `own_listings` appears but is reported "never executed" — Postgres does not
+ * evaluate an unreferenced CTE. The 2,530 index probes that decide *undercutting*
+ * are the expensive half of the feed's plan, and they are not paid for on every
+ * page load. That falls out of reusing the shared fragment rather than being
+ * arranged, but it is what makes reusing it affordable.
+ *
+ * Takes the marker rather than reading it, so the clamp in `readSeen` stays the
+ * one definition of what the marker means. A caller with a raw
+ * `last_seen_snapshot_id` from after a destructive mirror would otherwise count
+ * against an id no row can reach and report a permanent zero.
+ */
+export async function unreadRivalMoves(
+  opts: RivalMovesWindow,
+  sinceSnapshotId: string,
+  cap: number,
+): Promise<UnreadRivalMoves> {
+  const [row] = await sql<{ count: number }[]>`
+    ${qualifyingMoves(opts)}
+    SELECT count(*)::int AS count
+      FROM (
+        SELECT 1
+          FROM moves m
+         WHERE m.id > ${sinceSnapshotId}::bigint
+         LIMIT ${cap + 1}
+      ) bounded`;
+
+  return { count: Math.min(row.count, cap), capped: row.count > cap };
 }

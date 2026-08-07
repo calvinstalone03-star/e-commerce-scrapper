@@ -4,7 +4,12 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 
 import { sql } from '@/lib/db';
-import { rivalMoves, rivalMovesCeiling, type RivalMovesOptions } from '@/lib/notify/rival-moves';
+import {
+  rivalMoves,
+  rivalMovesCeiling,
+  unreadRivalMoves,
+  type RivalMovesOptions,
+} from '@/lib/notify/rival-moves';
 
 /**
  * Rival price moves, against a real database.
@@ -51,6 +56,10 @@ const DEFAULTS: RivalMovesOptions = {
   threshold: 0.05,
   windowDays: 14,
   maxLookbackDays: 7,
+  // The "Semua" tab, which is the page's landing view: the marker filters
+  // nothing. Every case below that does not say otherwise is asking for the
+  // whole window.
+  newerThanSnapshotId: null,
   limit: 50,
   offset: 0,
 };
@@ -417,5 +426,109 @@ describe('rivalMovesCeiling', () => {
   test('no qualifying move at all is a null ceiling, not a zero', async () => {
     await seedRivalMove({ from: '100000', to: '99999', hoursApart: 48 });
     expect(await rivalMovesCeiling(DEFAULTS)).toBeNull();
+  });
+});
+
+describe('rivalMoves — the marker predicate is the second tab, and nothing else', () => {
+  /**
+   * The page renders two tabs from this one function: "Semua", which passes
+   * `null` and gets the whole 14-day window, and "Baru", which passes the read
+   * marker. "Semua" is the landing view on purpose — an earlier design filtered
+   * on the marker unconditionally and, measured against the live database, would
+   * have shipped an empty page on day one, because the marker's seed (22154)
+   * sits above the highest qualifying event id (22089).
+   */
+
+  /** The ids of every qualifying move, ascending. */
+  async function qualifyingIds(): Promise<string[]> {
+    const rows = await rivalMoves(DEFAULTS);
+    return rows.map((row) => row.snapshotId).sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
+  }
+
+  test('null renders the whole window regardless of read state', async () => {
+    await seedThreeRivalMoves();
+    expect(await rivalMoves({ ...DEFAULTS, newerThanSnapshotId: null })).toHaveLength(3);
+  });
+
+  test('a marker keeps only what is above it, and is exclusive', async () => {
+    await seedThreeRivalMoves();
+    const ids = await qualifyingIds();
+
+    // Exclusive: the row AT the marker has been seen, so passing the middle id
+    // must leave exactly the one above it.
+    const above = await rivalMoves({ ...DEFAULTS, newerThanSnapshotId: ids[1] });
+    expect(above.map((row) => row.snapshotId)).toEqual([ids[2]]);
+  });
+
+  test('a marker at the top leaves nothing, and the page still has a Semua tab', async () => {
+    // The day-one state on the scraper's own database, in miniature.
+    await seedThreeRivalMoves();
+    const ids = await qualifyingIds();
+
+    expect(await rivalMoves({ ...DEFAULTS, newerThanSnapshotId: ids[2] })).toHaveLength(0);
+    expect(await rivalMoves({ ...DEFAULTS, newerThanSnapshotId: null })).toHaveLength(3);
+  });
+
+  test('the ceiling ignores the marker entirely', async () => {
+    // The predicate lives in rivalMoves's outer SELECT, never in the shared
+    // `qualifyingMoves` fragment. Move it into the fragment and the ceiling
+    // caps itself at the marker — so the marker could never advance past its own
+    // position again, and every row above it would be stranded unread forever.
+    await seedThreeRivalMoves();
+    const ids = await qualifyingIds();
+
+    const ceiling = await rivalMovesCeiling(DEFAULTS);
+    expect(ceiling).toBe(ids[2]);
+
+    // `RivalMovesWindow` omits the field, and the excess-property check refuses
+    // a fresh literal carrying it. It does *not* refuse a variable of the wider
+    // type — which is the shape a real caller has — so the runtime guarantee has
+    // to hold on its own: `qualifyingMoves` never reads the field.
+    const wide: RivalMovesOptions = { ...DEFAULTS, newerThanSnapshotId: ids[2] };
+    expect(await rivalMovesCeiling(wide)).toBe(ids[2]);
+  });
+});
+
+describe('unreadRivalMoves — what the bell says', () => {
+  test('counts only what is above the marker', async () => {
+    await seedThreeRivalMoves();
+    const rows = await rivalMoves(DEFAULTS);
+    const ids = rows.map((row) => row.snapshotId).sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
+
+    expect(await unreadRivalMoves(DEFAULTS, '0', 99)).toEqual({ count: 3, capped: false });
+    expect(await unreadRivalMoves(DEFAULTS, ids[1], 99)).toEqual({ count: 1, capped: false });
+    expect(await unreadRivalMoves(DEFAULTS, ids[2], 99)).toEqual({ count: 0, capped: false });
+  });
+
+  test('agrees with the feed it is a badge for', async () => {
+    // The failure this guards against is a count and a list that disagree —
+    // a bell showing 3 over a tab showing 5, or the reverse. Both go through
+    // `qualifyingMoves` so that they cannot; this checks that they do.
+    await seedThreeRivalMoves();
+    await seedRivalMove({ from: '100000', to: '99999', hoursApart: 48 }); // under threshold
+    await seedMove({ isOwn: true, from: '100000', to: '50000', hoursApart: 48 }); // ours
+
+    const listed = await rivalMoves({ ...DEFAULTS, newerThanSnapshotId: '0' });
+    expect(await unreadRivalMoves(DEFAULTS, '0', 99)).toEqual({
+      count: listed.length,
+      capped: false,
+    });
+  });
+
+  test('caps the number it claims, and says it capped', async () => {
+    // Past the cap the honest answer is "at least this many", which is what a
+    // "99+" reads as. This covers the *claim* only: the `LIMIT` that also bounds
+    // the work is invisible from the return value — dropping it leaves every
+    // assertion here passing — so it is checked by `EXPLAIN` in the query's own
+    // header rather than pretended to be covered from out here.
+    await seedThreeRivalMoves();
+    expect(await unreadRivalMoves(DEFAULTS, '0', 2)).toEqual({ count: 2, capped: true });
+    expect(await unreadRivalMoves(DEFAULTS, '0', 3)).toEqual({ count: 3, capped: false });
+  });
+
+  test('honors the window, so the bell cannot count what the page will not show', async () => {
+    await seedThreeRivalMoves();
+    const narrowed = { ...DEFAULTS, windowDays: 1 }; // every fixture is 1.25 days old
+    expect(await unreadRivalMoves(narrowed, '0', 99)).toEqual({ count: 0, capped: false });
   });
 });

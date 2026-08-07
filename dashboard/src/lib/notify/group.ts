@@ -124,3 +124,52 @@ export function foldRivalMoves(moves: RivalMove[]): FoldedMoveGroup[] {
 
   return folded.sort((left, right) => weight(right) - weight(left));
 }
+
+/** The undercut state a group stands for; `null` where we have no price. */
+export function groupUndercutsUs(entry: FoldedMoveGroup): boolean | null {
+  return entry.kind === 'folded' ? entry.members[0].undercutsUs : entry.move.undercutsUs;
+}
+
+/**
+ * Fold, without throwing away the reason the rows were in that order.
+ *
+ * `rivalMoves` orders by `undercutsUs DESC NULLS LAST` **first** and magnitude
+ * second, because a rival dropping below our price is the event that demands a
+ * decision and a big move on a set we are still comfortably winning is not.
+ * `foldRivalMoves` re-sorts by magnitude alone, and a fold applied to the query's
+ * output therefore discards that primary key: a 40% cut on a listing we already
+ * undercut by half would out-rank a 6% cut that just went under us. The row that
+ * needed reading today would be somewhere down the page.
+ *
+ * The fix is to fold **within** the undercut partition rather than to re-sort
+ * afterwards, and the difference between those two is not cosmetic.
+ *
+ * Re-sorting afterwards leaves groups that straddle the partition — a store's
+ * catalogue-wide reprice folds into one entry whose members include both the
+ * three listings that went under us and the thirty that did not. Such a group
+ * has no honest position in an undercut-first ordering, and it has no honest
+ * headline either: whatever it says about undercutting is false for most of its
+ * members, and the reader has to expand thirty rows to find the three. Keyed on
+ * store and delta, that straddle is ordinary rather than exotic — the same
+ * rupiah cut across a catalogue lands on different sides of our price depending
+ * only on which set each listing is.
+ *
+ * Partitioning first makes every group homogeneous, so `groupUndercutsUs` can
+ * read the answer off any member, and each partition keeps `foldRivalMoves`'s
+ * magnitude order untouched. The cost is that a straddling reprice is reported
+ * as two or three entries instead of one — which is the correct number, because
+ * "went under us" and "did not" are two different pieces of news about the same
+ * decision. Where a split leaves fewer than `FOLD_MOVE_MIN_GROUP` members, those
+ * rows print individually, which is also right: a handful of undercutting rows
+ * is exactly what this page exists to show one at a time.
+ */
+export function foldByConsequence(moves: RivalMove[]): FoldedMoveGroup[] {
+  // `true`, then `false`, then `null` — the same `DESC NULLS LAST` the query
+  // orders by. An unknown is not evidence that we are safe, so it goes last
+  // rather than being treated as a `false`.
+  const partitions: Array<boolean | null> = [true, false, null];
+
+  return partitions.flatMap((undercuts) =>
+    foldRivalMoves(moves.filter((move) => move.undercutsUs === undercuts)),
+  );
+}

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 
-import { foldRivalMoves } from '@/lib/notify/group';
+import { foldByConsequence, foldRivalMoves, groupUndercutsUs } from '@/lib/notify/group';
 import type { RivalMove } from '@/lib/notify/rival-moves';
 
 /**
@@ -125,5 +125,102 @@ describe('foldRivalMoves', () => {
 
     expect(folded).toHaveLength(2);
     expect(folded[0].kind).toBe('folded');
+  });
+});
+
+describe('foldByConsequence', () => {
+  /**
+   * The ordering key `foldRivalMoves` throws away, put back.
+   *
+   * `rivalMoves` orders by `undercutsUs DESC NULLS LAST` first and magnitude
+   * second. Folding re-sorts by magnitude alone, so a fold applied to the query
+   * output silently demotes the one class of row this page exists for.
+   */
+
+  const ids = (entries: ReturnType<typeof foldByConsequence>): number[] =>
+    entries.flatMap((entry) =>
+      entry.kind === 'folded' ? entry.members.map((m) => m.productId) : [entry.move.productId],
+    );
+
+  test('a small undercutting move outranks a large one that does not', () => {
+    // The regression in one case. Plain `foldRivalMoves` puts the 50% move
+    // first; the rival who just went under our price is what needs reading.
+    const dearer = move({ productId: 1, previousPrice: '1000000', price: '500000' });
+    const under = move({ productId: 2, previousPrice: '100000', price: '94000', undercutsUs: true });
+
+    expect(ids(foldByConsequence([dearer, under]))).toEqual([2, 1]);
+    // And this is what it is fixing.
+    expect(ids(foldRivalMoves([dearer, under]))).toEqual([1, 2]);
+  });
+
+  test('an unknown own price sorts after a known safe one — NULLS LAST', () => {
+    // We have no price for the set, so we do not know we are being undercut. An
+    // unknown is not evidence that we are not, but it is not evidence that we
+    // are either, so it ranks below a move we know did not go under us.
+    const unknown = move({ productId: 1, previousPrice: '100000', price: '20000', ourPrice: null, undercutsUs: null });
+    const known = move({ productId: 2, previousPrice: '100000', price: '94000', undercutsUs: false });
+
+    expect(ids(foldByConsequence([unknown, known]))).toEqual([2, 1]);
+  });
+
+  test('magnitude still orders within a partition', () => {
+    const small = move({ productId: 1, previousPrice: '100000', price: '97000', undercutsUs: true });
+    const large = move({ productId: 2, previousPrice: '100000', price: '60000', undercutsUs: true });
+
+    expect(ids(foldByConsequence([small, large]))).toEqual([2, 1]);
+  });
+
+  test('a straddling reprice splits, so no group lies about its members', () => {
+    // One store, one rupiah cut, applied across a catalogue: three of those
+    // listings went under our price and three did not, because they are
+    // different sets. Folded as one entry the group cannot state its own
+    // undercut status without being wrong about half of it, and the three rows
+    // that matter are buried inside thirty that do not.
+    const under = [1, 2, 3].map((id) =>
+      move({ productId: id, storeId: 7, previousPrice: '100000', price: '90000', undercutsUs: true }),
+    );
+    const over = [4, 5, 6].map((id) =>
+      move({ productId: id, storeId: 7, previousPrice: '100000', price: '90000', undercutsUs: false }),
+    );
+
+    const folded = foldByConsequence([...over, ...under]);
+
+    expect(folded).toHaveLength(2);
+    expect(folded.map(groupUndercutsUs)).toEqual([true, false]);
+    expect(ids(folded)).toEqual([1, 2, 3, 4, 5, 6]);
+
+    // Plain folding keys on store and delta alone, so it makes one group of six
+    // whose undercut status is unanswerable.
+    expect(foldRivalMoves([...over, ...under])).toHaveLength(1);
+  });
+
+  test('a split below the fold threshold prints its rows individually', () => {
+    // Two undercutting rows out of five is a coincidence at group level and a
+    // worklist at row level. Printing them one at a time is what this page is
+    // for.
+    const under = [1, 2].map((id) =>
+      move({ productId: id, storeId: 7, previousPrice: '100000', price: '90000', undercutsUs: true }),
+    );
+    const over = [3, 4, 5].map((id) =>
+      move({ productId: id, storeId: 7, previousPrice: '100000', price: '90000', undercutsUs: false }),
+    );
+
+    const folded = foldByConsequence([...over, ...under]);
+
+    expect(folded.map((entry) => entry.kind)).toEqual(['single', 'single', 'folded']);
+    expect(ids(folded)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  test('groupUndercutsUs answers for a folded group and for a lone row alike', () => {
+    const under = [1, 2, 3].map((id) =>
+      move({ productId: id, storeId: 7, previousPrice: '100000', price: '90000', undercutsUs: true }),
+    );
+    const [group] = foldByConsequence(under);
+    expect(group.kind).toBe('folded');
+    expect(groupUndercutsUs(group)).toBe(true);
+
+    const [lone] = foldByConsequence([move({ productId: 9, undercutsUs: null })]);
+    expect(lone.kind).toBe('single');
+    expect(groupUndercutsUs(lone)).toBeNull();
   });
 });
