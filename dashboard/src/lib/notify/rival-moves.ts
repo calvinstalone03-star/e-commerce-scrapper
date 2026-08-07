@@ -108,6 +108,34 @@ export type RivalMovesOptions = {
 /** Everything that defines the window; what both exports must agree on. */
 export type RivalMovesWindow = Omit<RivalMovesOptions, 'limit' | 'offset'>;
 
+/**
+ * The window the page renders and the marker advances over — one constant, read
+ * by both.
+ *
+ * Not a default parameter and not two copies. `/api/notifications/seen` moves
+ * the marker to `rivalMovesCeiling` of *this* window, and the page renders
+ * `rivalMoves` over *this* window; if those two ever named different windows the
+ * marker would jump past rows the page can still show, and the rows it stranded
+ * would be exactly the ones nobody had read. The invariant is "same window", so
+ * it is stated as one value rather than as two matching literals.
+ *
+ * The numbers themselves are the design's, and one of them is measured to be
+ * nearly inert: the query was run at 1, 6, 12, 24, 48 and 72 hours against the
+ * scraper's database and returned the same 56 rows every time — it first moves
+ * at 96 hours (55). What binds is not `gapHours` but the scrape spacing, and in
+ * those 56 rows the comparison actually chosen ranges from 78 to 140 hours old.
+ * `gapHours` is a floor against the noise between captures a few hours apart —
+ * 32 consecutive pairs 1.5 to 3.5 hours apart, all 32 disagreeing about price —
+ * not a description of what a row compares against. That is why every row on the
+ * page states its own real comparison age instead of claiming "24 jam".
+ */
+export const DEFAULT_WINDOW: RivalMovesWindow = {
+  gapHours: 24,
+  threshold: 0.05,
+  windowDays: 14,
+  maxLookbackDays: 7,
+};
+
 type Row = {
   id: string;
   product_ref: number;

@@ -37,6 +37,11 @@ function request(path: string): NextRequest {
   return new NextRequest(`http://localhost:3000${path}`);
 }
 
+/** The same, for the one handler here that mutates rather than reads. */
+function postRequest(path: string): NextRequest {
+  return new NextRequest(`http://localhost:3000${path}`, { method: 'POST' });
+}
+
 type Route = {
   path: string;
   call: () => Promise<Response>;
@@ -63,6 +68,15 @@ const ROUTES: Route[] = [
       (await import('@/app/api/products/[id]/history/route')).GET(
         request('/api/products/1/history'),
         { params: Promise.resolve({ id: '1' }) },
+      ),
+  },
+  {
+    // The one handler here that writes. Unguarded it would let anyone who finds
+    // the URL clear the owner's unread badge — silently, and only forward.
+    path: '/api/notifications/seen',
+    call: async () =>
+      (await import('@/app/api/notifications/seen/route')).POST(
+        postRequest('/api/notifications/seen'),
       ),
   },
 ];
