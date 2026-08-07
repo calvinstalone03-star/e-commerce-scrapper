@@ -38,17 +38,27 @@ export type ShopBadge = {
 
 type NavItem = { href: string; label: string; icon: ReactNode };
 
+/**
+ * What the bell shows, as the layout worked it out.
+ *
+ * `capped` rather than a raw number past the cap: the count query stops early on
+ * purpose (it runs on every signed-in page), so beyond the cap the only honest
+ * claim is "at least this many" — which is what a "99+" reads as.
+ */
+export type UnreadBadge = { count: number; capped: boolean };
 
 export function AppShell({
   shops,
   username,
   warnDefaultPassword,
+  unread,
   signOutAction,
   children,
 }: {
   shops: ShopBadge[];
   username: string;
   warnDefaultPassword: boolean;
+  unread: UnreadBadge;
   signOutAction: () => Promise<void>;
   children: ReactNode;
 }) {
@@ -74,10 +84,12 @@ export function AppShell({
     <div className="flex min-h-screen flex-col">
       <Topbar
         shops={shops}
+        pathname={pathname}
         pathWithQuery={pathWithQuery}
         channel={channel}
         username={username}
         warnDefaultPassword={warnDefaultPassword}
+        unread={unread}
         signOutAction={signOutAction}
         onOpenDrawer={() => setDrawer(true)}
         onToggleRail={toggle}
@@ -147,20 +159,24 @@ export function AppShell({
 
 function Topbar({
   shops,
+  pathname,
   pathWithQuery,
   channel,
   username,
   warnDefaultPassword,
+  unread,
   signOutAction,
   onOpenDrawer,
   onToggleRail,
   collapsed,
 }: {
   shops: ShopBadge[];
+  pathname: string;
   pathWithQuery: string;
   channel: Channel | null;
   username: string;
   warnDefaultPassword: boolean;
+  unread: UnreadBadge;
   signOutAction: () => Promise<void>;
   onOpenDrawer: () => void;
   onToggleRail: () => void;
@@ -213,6 +229,7 @@ function Topbar({
       </div>
 
       <div className="ml-auto flex items-center gap-2">
+        <NotificationBell active={isActive(pathname, '/notifications')} channel={channel} unread={unread} />
         {warnDefaultPassword ? (
           <Link
             href={withChannel('/settings', channel)}
@@ -225,6 +242,78 @@ function Topbar({
         <SignOutButton signOutAction={signOutAction} />
       </div>
     </header>
+  );
+}
+
+/**
+ * The way in to the notifications page, and the only thing on screen that says
+ * there is anything to read.
+ *
+ * **`prefetch={false}`, and it is load-bearing.** `/notifications` is
+ * `force-dynamic`, and this bell is in the topbar of *every* signed-in page — so
+ * with the default viewport prefetch, merely rendering any screen in the app
+ * would run the full 14-day feed query on the server, ordering and all, for a
+ * page nobody has asked for yet. The design also names the sharper version of
+ * the same worry: nothing that clears the queue may be reachable without a
+ * deliberate click. (The clearing POST itself is in a client effect, so a
+ * prefetched payload does not fire it — but "the badge is only safe because of
+ * where the POST happens to live" is a guarantee one refactor away from being
+ * false, and this is the cheap way not to depend on it.)
+ *
+ * `withChannel` rather than a bare `/notifications`: the page itself is
+ * cross-marketplace and ignores the parameter, but the shop switcher three
+ * elements to the left reads it, and arriving without it would silently reset
+ * the visitor to the default shop for everything they do next.
+ */
+function NotificationBell({
+  active,
+  channel,
+  unread,
+}: {
+  active: boolean;
+  channel: Channel | null;
+  unread: UnreadBadge;
+}) {
+  const label =
+    unread.count === 0
+      ? 'Notifikasi'
+      : `Notifikasi, ${unread.count}${unread.capped ? ' atau lebih' : ''} belum dibaca`;
+
+  return (
+    <Link
+      href={withChannel('/notifications', channel)}
+      prefetch={false}
+      aria-label={label}
+      title={label}
+      aria-current={active ? 'page' : undefined}
+      className={cn(
+        'relative rounded-md p-2 transition-colors',
+        active ? 'text-accent' : 'text-muted hover:text-foreground',
+      )}
+    >
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.75}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden
+        className="size-5"
+      >
+        <path d="M18 8a6 6 0 10-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 01-3.4 0" />
+      </svg>
+
+      {unread.count > 0 ? (
+        <span
+          aria-hidden
+          className="absolute -top-0.5 -right-0.5 min-w-4 rounded-full bg-negative px-1 text-center text-[10px] leading-4 font-medium text-white tabular-nums"
+        >
+          {unread.count}
+          {unread.capped ? '+' : ''}
+        </span>
+      ) : null}
+    </Link>
   );
 }
 

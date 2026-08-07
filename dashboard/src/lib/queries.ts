@@ -229,13 +229,14 @@ export async function getProducts(
       LEFT JOIN stores s ON s.id = p.shop_ref
       LEFT JOIN latest l ON l.product_ref = p.id
       -- What the movement badge is measured against: the newest snapshot at
-      -- least NOTIFY_MIN_GAP_HOURS older than the current one, matching
-      -- selectPriceChanges in lib/notify/events.ts exactly. Not lag() — see
+      -- least NOTIFY_MIN_GAP_HOURS older than the current one. Not lag() — see
       -- lib/price-change.ts for why adjacent captures cannot be trusted.
+      -- rivalMoves in lib/notify/rival-moves.ts shapes its comparison the same
+      -- way; the number it uses is its own gapHours, not this setting.
       --
-      -- LEFT JOIN, unlike the notifier's CROSS JOIN: a product with no
-      -- old-enough predecessor still belongs in this table, it just has no
-      -- movement to show. Today that is most of them.
+      -- LEFT JOIN, unlike that query's CROSS JOIN: a product with no old-enough
+      -- predecessor still belongs in this table, it just has no movement to
+      -- show. Today that is most of them.
       LEFT JOIN LATERAL (
         SELECT ps.price, ps.scraped_at
           FROM price_snapshots ps
@@ -307,23 +308,27 @@ const NAME_MATCH_THRESHOLD = 0.45;
  * position: 1.0 means "double, or half". Expressed as a ratio rather than a
  * percentage because that is what the SQL compares.
  *
- * Exported so `lib/notify/positions.ts` imports this exact constant rather
- * than copying the literal. Two thresholds with one name is how the
- * dashboard and the notifier would come to silently disagree about which
- * comparisons are trustworthy.
+ * One literal behind three places in this file — `isExtremeGap` below,
+ * `getPricePositions`'s `extreme` column and `computePairingSnapshot`'s
+ * `gapVolume` filter — because two thresholds with one name is how they would
+ * come to silently disagree about which comparisons are trustworthy. Exported
+ * for `queries.test.ts`, which derives its fixtures from it rather than writing
+ * 1.0 into cases that would then keep passing whatever the rule became.
  */
 export const EXTREME_GAP = 1.0;
 
 /**
- * The extreme-gap rule, for the callers that decide it in JavaScript.
+ * The extreme-gap rule, for the caller that decides it in JavaScript.
  *
- * There are two — `getPricePositionDetail` below, which derives its cheapest
- * rival from an array rather than from SQL, and `notify/positions.ts` — and
- * before this they each wrote the comparison out. They drifted exactly where
- * you would expect: one guarded the zero denominator and the other did not, so
- * a listing recorded at 0 was not extreme on the dashboard and was extreme in
- * Telegram. Sharing the constant was never enough; the rule has to be shared
- * too.
+ * There is one — `getPricePositionDetail` below, which derives its cheapest
+ * rival from an array rather than from SQL. There were two, and the one that is
+ * gone (`notify/positions.ts`, deleted with the Telegram path it fed) is why
+ * this is a function at all: each had written the comparison out by hand, and
+ * they drifted exactly where you would expect — one guarded the zero
+ * denominator and the other did not, so a listing recorded at 0 was extreme in
+ * one caller and not in the other. Sharing the constant was never enough; the
+ * rule has to be shared too, and it stays shared for the next second caller
+ * rather than being folded back into its one call site.
  *
  * Divided by the smaller of the two prices, not by the rival unconditionally.
  * Dividing by the rival only ever fires when we are the dearer side: when the

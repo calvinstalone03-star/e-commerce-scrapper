@@ -7,17 +7,18 @@ monkeypatch one place.
 
 Environment variables, all optional except ``DATABASE_URL``:
 
-===================  ==================  =============================================
-Env var              Field               Notes
-===================  ==================  =============================================
-``DATABASE_URL``     ``database_url``    postgresql://calvin@127.0.0.1:5432/ecom_scraper
-``SHOPEE_USERNAME``  ``shopee_username`` None => bootstrap stays logged out
-``SHOPEE_PASSWORD``  ``shopee_password`` None => bootstrap stays logged out
-``HEADLESS``         ``headless``        default true; set false to watch the bootstrap
-``MIN_DELAY``        ``min_delay``       default 2.0 seconds
-``MAX_DELAY``        ``max_delay``       default 5.0 seconds
-``COOKIES_PATH``     ``cookies_path``    default ./cookies.json (gitignored)
-===================  ==================  =============================================
+========================  ========================  ===============================================
+Env var                   Field                     Notes
+========================  ========================  ===============================================
+``DATABASE_URL``          ``database_url``          postgresql://calvin@127.0.0.1:5432/ecom_scraper
+``SHOPEE_USERNAME``       ``shopee_username``       None => bootstrap stays logged out
+``SHOPEE_PASSWORD``       ``shopee_password``       None => bootstrap stays logged out
+``HEADLESS``              ``headless``              default true; set false to watch the bootstrap
+``MIN_DELAY``             ``min_delay``             default 2.0 seconds
+``MAX_DELAY``             ``max_delay``             default 5.0 seconds
+``COOKIES_PATH``          ``cookies_path``          default ./cookies.json (gitignored)
+``NEON_DATABASE_URL``     ``neon_database_url``     hosted DB: sync target, second ingest target
+========================  ========================  ===============================================
 """
 
 from __future__ import annotations
@@ -143,6 +144,16 @@ class Settings(BaseSettings):
         "written 0600. .gitignore covers the default name and anything matching "
         "*cookies*.json — point this somewhere else and it is on you to add that "
         "path to .gitignore too.",
+    )
+    neon_database_url: str | None = Field(
+        default=None,
+        # repr=False for the same reason as database_url: it embeds a password.
+        repr=False,
+        description="The hosted database the Vercel dashboard reads — the target of "
+        "`ecom-scraper sync`, and the second destination the ingest server can write "
+        "to when the extension asks for it. Use the direct (non-pooler) endpoint: "
+        "both of those do schema work and bulk inserts, which is not what a pooler in "
+        "transaction mode is for. Excluded from repr().",
     )
 
     @field_validator("cookies_path", mode="before")

@@ -216,9 +216,28 @@ describe('the gap setting', () => {
 // ---------------------------------------------------------------------------
 
 describe('resolveMinGapHours', () => {
-  test('falls back to the documented default when unset or blank', () => {
+  test('falls back to the documented default when unset', () => {
     expect(resolveMinGapHours({})).toBe(DEFAULT_MIN_GAP_HOURS);
-    expect(resolveMinGapHours({ NOTIFY_MIN_GAP_HOURS: '   ' })).toBe(DEFAULT_MIN_GAP_HOURS);
+  });
+
+  /**
+   * The shape a half-finished Vercel variable actually has: the key exists, the
+   * value was never pasted. `Number('')` and `Number('   ')` are both `0`, which
+   * is finite and non-negative, so the condition that rejects `'banyak'` waves
+   * these straight through — and a zero here is not a smaller setting, it is the
+   * rule switched off. Gap 0 compares a capture against the capture before it,
+   * which is exactly the artefact the minimum gap exists to suppress: measured
+   * against the live database, 3 real price changes become 40.
+   *
+   * Both spellings, because they reach the guard by different routes: `''` is
+   * falsy before `trim()` ever runs, `'   '` only after it. A test that checked
+   * one would pass against an implementation that mishandled the other.
+   */
+  test.each([
+    ['empty', ''],
+    ['whitespace', '   '],
+  ])('treats a %s NOTIFY_MIN_GAP_HOURS as unset rather than as zero', (_name, raw) => {
+    expect(resolveMinGapHours({ NOTIFY_MIN_GAP_HOURS: raw })).toBe(DEFAULT_MIN_GAP_HOURS);
   });
 
   test('takes a whole number of hours, zero included', () => {

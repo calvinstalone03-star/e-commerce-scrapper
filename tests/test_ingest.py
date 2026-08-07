@@ -46,9 +46,13 @@ def item(item_id: int = 111, shop_id: int = 222) -> dict:
 
 @pytest.fixture()
 def settings(tmp_path) -> Settings:
+    # neon_database_url explicitly None rather than omitted: this repo's own
+    # .env may set it, Settings reads that file, and an omission would open a
+    # connection to Neon from a test that believes the target is unconfigured.
     return Settings(
         database_url="postgresql://localhost/unused",
         cookies_path=tmp_path / "cookies.json",
+        neon_database_url=None,
     )
 
 
@@ -246,6 +250,119 @@ def test_an_unparseable_timestamp_falls_back_to_now(client) -> None:
 
     assert response.status_code == 200
     assert service.calls[0][2] is None  # service applies its own default
+
+
+# ----------------------------------------------------------------------
+# Choosing a database
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture()
+def two_targets(settings, monkeypatch):
+    """A server with both destinations wired to their own recording service."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("INGEST_TOKEN", "test-token")
+    local, neon = RecordingService(), RecordingService()
+    app = build_app(settings, service=local, neon_service=neon)
+    return TestClient(app), {"local": local, "neon": neon}
+
+
+def post_dom(http, target=None):
+    headers = {"X-Ingest-Token": "test-token"}
+    if target is not None:
+        headers["X-Ingest-Target"] = target
+    return http.post(
+        "/ingest-dom",
+        json={"items": [{"name": "Kaos", "price": "Rp55.000"}], "pageUrl": SEARCH_URL},
+        headers=headers,
+    )
+
+
+def test_no_target_header_writes_to_local(two_targets) -> None:
+    """Every extension build before this one sends no header at all."""
+    http, targets = two_targets
+
+    response = post_dom(http)
+
+    assert response.status_code == 200
+    assert response.json()["target"] == "local"
+    assert len(targets["local"].dom_calls) == 1
+    assert targets["neon"].dom_calls == []
+
+
+def test_the_header_picks_the_hosted_database(two_targets) -> None:
+    http, targets = two_targets
+
+    response = post_dom(http, "neon")
+
+    assert response.status_code == 200
+    assert response.json()["target"] == "neon"
+    assert targets["local"].dom_calls == []
+    assert len(targets["neon"].dom_calls) == 1
+
+
+def test_the_target_is_case_insensitive(two_targets) -> None:
+    http, targets = two_targets
+
+    assert post_dom(http, "NEON").status_code == 200
+    assert len(targets["neon"].dom_calls) == 1
+
+
+def test_an_unknown_target_is_refused(two_targets) -> None:
+    http, targets = two_targets
+
+    response = post_dom(http, "postgres-on-mars")
+
+    assert response.status_code == 422
+    assert "unknown target" in response.json()["detail"]
+    assert targets["local"].dom_calls == []
+
+
+def test_an_unconfigured_target_says_so(settings, monkeypatch) -> None:
+    """503, not 500: the fix is a line in .env, and the popup shows it as such."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("INGEST_TOKEN", "test-token")
+    app = build_app(settings, service=RecordingService())
+
+    response = post_dom(TestClient(app), "neon")
+
+    assert response.status_code == 503
+    assert "NEON_DATABASE_URL" in response.json()["detail"]
+
+
+def test_the_ingest_route_routes_too(two_targets) -> None:
+    http, targets = two_targets
+
+    response = http.post(
+        "/ingest",
+        json={"url": SEARCH_URL, "payload": {"items": [{"item_basic": item()}]}},
+        headers={"X-Ingest-Token": "test-token", "X-Ingest-Target": "neon"},
+    )
+
+    assert response.json()["target"] == "neon"
+    assert len(targets["neon"].calls) == 1
+    assert targets["local"].calls == []
+
+
+def test_health_says_which_targets_exist(two_targets) -> None:
+    http, _targets = two_targets
+
+    body = http.get("/health").json()
+
+    assert body["targets"] == {"local": True, "neon": True}
+
+
+def test_health_reports_an_unconfigured_target_as_unavailable(settings, monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("INGEST_TOKEN", "test-token")
+    app = build_app(settings, service=RecordingService())
+
+    body = TestClient(app).get("/health").json()
+
+    assert body["targets"] == {"local": True, "neon": False}
 
 
 # ----------------------------------------------------------------------

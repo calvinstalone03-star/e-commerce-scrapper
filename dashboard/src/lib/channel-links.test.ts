@@ -68,6 +68,16 @@ const FILES = [
   'src/app/(app)/pricing/[id]/page.tsx',
   'src/app/(app)/analytics/page.tsx',
   'src/app/(app)/settings/page.tsx',
+  // Not itself channel-scoped — a rival's move matters on either marketplace,
+  // so this screen spans both, the way `/products` and `/stores` do. It is
+  // listed anyway because of what it links *to*: every row points at
+  // `/pricing?kanal=…&q=…` through `priceChangeLink`, and its two tab links
+  // rebuild the current query. Any of those written as a literal would be a
+  // scoped URL built outside `withChannel`, which is precisely what this guard
+  // is for. Omitting the file means the guard silently stops covering the one
+  // screen in the app whose whole job is to send you somewhere else.
+  'src/app/(app)/notifications/page.tsx',
+  'src/components/NotificationsList.tsx',
   'src/components/shell/AppShell.tsx',
   'src/components/OwnShopScorecard.tsx',
   'src/components/PricingSearch.tsx',

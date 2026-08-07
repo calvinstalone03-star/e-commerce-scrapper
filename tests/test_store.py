@@ -239,6 +239,134 @@ def test_init_db_applies_the_sql_migration_and_is_idempotent(engine):
     assert {"stores", "products", "price_snapshots", "scrape_runs"} <= tables
 
 
+def test_notify_seen_is_seeded_from_the_watermark_when_one_exists(engine):
+    """006 must not announce history that 005's notifier already reported.
+
+    Cleans up notify_seen/notify_watermark and clears price_snapshots itself
+    (rather than relying on a fixture) because neither table is ORM-mapped —
+    Base.metadata.drop_all in the ``session`` fixture never touches them, and
+    the ``engine`` fixture is session-scoped, so a run_migrations call from an
+    earlier test in this file would otherwise have already seeded notify_seen
+    and left the singleton row for ON CONFLICT DO NOTHING to protect.
+
+    The ``finally`` block drops notify_watermark again on the way out. This
+    test is the only thing in the suite that creates that table, and the
+    ``engine`` fixture is session-scoped and shared with ``test_sync.py``'s
+    source database — leaving it behind would silently flip migration 006
+    onto its watermark arm for every later run_migrations call against this
+    database, poisoning tests that never touch notify_watermark themselves.
+    """
+    with engine.begin() as tx:
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_seen")
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_watermark")
+        tx.exec_driver_sql("DELETE FROM price_snapshots")
+        tx.exec_driver_sql(
+            "INSERT INTO price_snapshots (id, scraped_at) VALUES "
+            "(101, now()), (102, now()), (103, now())"
+        )
+        tx.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS notify_watermark ("
+            "id integer PRIMARY KEY, last_snapshot_id bigint NOT NULL DEFAULT 0)"
+        )
+        tx.exec_driver_sql("INSERT INTO notify_watermark VALUES (1, 2)")
+    try:
+        run_migrations(engine)
+        with engine.connect() as conn:
+            seed = conn.exec_driver_sql(
+                "SELECT last_seen_snapshot_id FROM notify_seen WHERE id = 1"
+            ).scalar()
+        assert seed == 2, "the watermark arm must win over max(price_snapshots.id)"
+    finally:
+        with engine.begin() as tx:
+            tx.exec_driver_sql("DROP TABLE IF EXISTS notify_watermark")
+
+
+def test_notify_seen_falls_back_to_max_snapshot_id_without_a_watermark(engine):
+    """A database 005 never reached must not report its whole history as unread."""
+    with engine.begin() as tx:
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_watermark")
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_seen")
+        tx.exec_driver_sql("DELETE FROM price_snapshots")
+        tx.exec_driver_sql(
+            "INSERT INTO price_snapshots (id, scraped_at) VALUES "
+            "(5, now()), (6, now()), (7, now())"
+        )
+    run_migrations(engine)
+    with engine.connect() as conn:
+        assert conn.exec_driver_sql(
+            "SELECT last_seen_snapshot_id FROM notify_seen WHERE id = 1"
+        ).scalar() == 7
+
+
+def test_notify_seen_does_not_move_once_marker_is_ahead_of_max_snapshot_id(engine):
+    """DO NOTHING, not DO UPDATE: a marker ahead of history must stay put.
+
+    Both seed tests above drop notify_seen before running the migration, so
+    they only ever exercise the fresh-insert path. This drives run_migrations
+    a *second* time against a database that already has a notify_seen row set
+    above max(price_snapshots.id) — the state a mirror's reseed_seen(), or a
+    human catching up past deleted snapshots, can leave behind — and checks
+    that the second pass leaves it alone. This is the regression guard for
+    006's ON CONFLICT clause: switching it from DO NOTHING to DO UPDATE would
+    silently rewind an ahead-of-history marker back down to max(id).
+    """
+    with engine.begin() as tx:
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_seen")
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_watermark")
+        tx.exec_driver_sql("DELETE FROM price_snapshots")
+        tx.exec_driver_sql(
+            "INSERT INTO price_snapshots (id, scraped_at) VALUES "
+            "(301, now()), (302, now())"
+        )
+    run_migrations(engine)  # first pass: fresh insert, seeds at max(id) = 302
+
+    with engine.begin() as tx:
+        tx.exec_driver_sql(
+            "UPDATE notify_seen SET last_seen_snapshot_id = 99999 WHERE id = 1"
+        )
+
+    run_migrations(engine)  # second pass: must not touch the existing row
+
+    with engine.connect() as conn:
+        seed = conn.exec_driver_sql(
+            "SELECT last_seen_snapshot_id FROM notify_seen WHERE id = 1"
+        ).scalar()
+    assert seed == 99999, "a re-run must not rewind a marker ahead of max(price_snapshots.id)"
+
+
+def test_notify_seen_does_not_fast_forward_past_unread_snapshots(engine):
+    """DO NOTHING, not DO UPDATE: unread rows must stay unread across a re-run.
+
+    Mirrors the previous test in the opposite direction. Here the marker sits
+    *below* max(price_snapshots.id) — real unread rows pending, the ordinary
+    state between two scrapes — and a second run_migrations must not silently
+    mark them all seen by jumping the marker up to the new max. Flip 006's
+    ON CONFLICT to DO UPDATE and this fails exactly like the test above.
+    """
+    with engine.begin() as tx:
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_seen")
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_watermark")
+        tx.exec_driver_sql("DELETE FROM price_snapshots")
+        tx.exec_driver_sql(
+            "INSERT INTO price_snapshots (id, scraped_at) VALUES (401, now())"
+        )
+    run_migrations(engine)  # first pass: fresh insert, seeds at max(id) = 401
+
+    with engine.begin() as tx:
+        # A new, unread row arrives after the marker was set.
+        tx.exec_driver_sql(
+            "INSERT INTO price_snapshots (id, scraped_at) VALUES (402, now())"
+        )
+
+    run_migrations(engine)  # second pass: must not fast-forward past it
+
+    with engine.connect() as conn:
+        seed = conn.exec_driver_sql(
+            "SELECT last_seen_snapshot_id FROM notify_seen WHERE id = 1"
+        ).scalar()
+    assert seed == 401, "a re-run must not fast-forward the marker past an unread snapshot"
+
+
 def test_has_ddl_distinguishes_real_sql_from_a_comments_only_placeholder():
     """The switch init_db uses to choose between the migration and create_all."""
     assert _has_ddl("CREATE TABLE x (id serial);")

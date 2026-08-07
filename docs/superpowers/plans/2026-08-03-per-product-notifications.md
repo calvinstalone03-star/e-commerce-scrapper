@@ -1,5 +1,11 @@
 # Per-Product Notifications Implementation Plan
 
+> **SUPERSEDED.** The feature this document describes was replaced by the
+> in-dashboard notifications page. See
+> [`docs/superpowers/specs/2026-08-07-dashboard-notifications-design.md`](../specs/2026-08-07-dashboard-notifications-design.md).
+> Kept as the record of what was built and why it was removed; nothing here
+> describes code that still exists.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task.
 
 **Goal:** Send one Telegram message per price change on a set our own shops also carry, each carrying our position on that set, and leave everything else in the existing digest.
