@@ -1397,7 +1397,12 @@ def sync(
 
     Raises:
         typer.Exit: Code 2 on a missing/identical target or an unforced
-            destructive mirror, code 1 if the mirror itself fails.
+            destructive mirror, code 1 if the mirror fails or if the reseed
+            after it does. The two are separate failures and say so: the
+            mirror is a single transaction and leaves the target untouched,
+            whereas the reseed runs after that transaction has committed, so
+            its failure leaves a mirrored target whose read marker still has
+            to be fixed by re-running the same command.
     """
     from sqlalchemy.exc import SQLAlchemyError
 
@@ -1507,22 +1512,63 @@ def sync(
             written = mirror(
                 source_engine, target_engine, batch_size=batch_size, on_progress=_progress
             )
-            status.update("reseeding the notifications read marker…")
-            seen = reseed_seen(target_engine)
-            after = table_counts(target_engine)
     except SQLAlchemyError as exc:
         # The mirror runs in one transaction, so this is "unchanged", not
         # "half-copied" — worth saying, because the alternative is what anyone
         # would assume of a bulk copy that died partway.
+        #
+        # Only `mirror` may be inside this try, and that is the whole point of
+        # the split below. It commits when it leaves its own `with
+        # target.begin()`; anything after it runs in a transaction of its own,
+        # so catching it here would print "target unchanged" over a target that
+        # had just been replaced.
         _fail(f"mirror failed, target unchanged: {exc}", code=1)
         return
+
+    try:
+        with console.status("reseeding the notifications read marker…"):
+            seen = reseed_seen(target_engine)
+    except SQLAlchemyError as exc:
+        # The mirror is already committed and cannot be undone from here. The
+        # target holds this database's rows under ids from this database's id
+        # space, while `notify_seen` may still hold an id from the space the
+        # TRUNCATE discarded — which is precisely the state `reseed_seen`
+        # exists to prevent, so the operator has to be told to redo it rather
+        # than left thinking nothing happened.
+        _fail(
+            f"the mirror committed, but the step after it did not: {exc}\n"
+            f"{_safe_dsn(target_url)} now holds this database's rows. Its "
+            "notifications read marker may still point into the id space the "
+            "mirror discarded, so the dashboard there can mark real changes as "
+            "already read or announce the whole history as new. Re-run this "
+            "same sync — the second run mirrors identical rows and reseeds the "
+            "marker again.",
+            code=1,
+        )
+        return
+
+    # A read-back for the table below and nothing else, so it is reported rather
+    # than raised: both writes have landed, and exiting non-zero here would say
+    # the sync failed when the only thing that failed was counting it.
+    after: dict[str, int] | None
+    try:
+        after = table_counts(target_engine)
+    except SQLAlchemyError as exc:
+        console.print(
+            f"[yellow]mirrored, but the target's row counts could not be read back[/yellow]: "
+            f"{escape(str(exc))}"
+        )
+        after = None
 
     result = Table(title="mirrored", header_style="bold")
     result.add_column("table")
     result.add_column("written", justify="right")
     result.add_column("target holds", justify="right")
     for name in written:
-        result.add_row(name, str(written[name]), str(after.get(name, 0)))
+        # "?" rather than 0 when the count is unknown: the rows are there, and a
+        # zero in this column would read as a mirror that wrote nothing.
+        held = "?" if after is None else str(after.get(name, 0))
+        result.add_row(name, str(written[name]), held)
     console.print(result)
 
     if seen is None:

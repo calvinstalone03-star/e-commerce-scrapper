@@ -339,3 +339,76 @@ def test_reseed_reports_a_target_the_dashboard_has_never_migrated(databases) -> 
         conn.execute(text("DROP TABLE IF EXISTS notify_seen"))
 
     assert reseed_seen(target) is None
+
+
+# ----------------------------------------------------------------------
+# What `ecom-scraper sync` claims when a step fails
+#
+# `mirror` commits when it leaves its own `with target.begin()`, and
+# `reseed_seen` then opens a transaction of its own. So the command has two
+# failure modes that look identical from the outside and mean opposite things,
+# and the only thing standing between them is which `try` block they land in.
+# These two tests are that boundary.
+# ----------------------------------------------------------------------
+
+
+def _run_sync(monkeypatch: pytest.MonkeyPatch):
+    """Invoke ``sync --to <target> --yes`` against the two test databases.
+
+    Settings are replaced wholesale rather than patched field by field: the real
+    ``.env`` names the *live* database, and a command whose entire job is to
+    TRUNCATE its target must never be able to read that value in a test.
+    """
+    from typer.testing import CliRunner
+
+    from scraper import cli
+    from scraper import config as config_mod
+    from scraper.config import Settings
+
+    monkeypatch.setattr(config_mod, "get_settings", lambda: Settings(database_url=SOURCE_URL))
+    return CliRunner().invoke(cli.app, ["sync", "--to", TARGET_URL, "--yes"])
+
+
+def test_a_failed_mirror_is_reported_as_unchanged(databases, monkeypatch) -> None:
+    """The claim is true here, and this is the only case where it is."""
+    source, target = databases
+    seed(source, shop_id=5001, item_id=7001)
+
+    def explode(engine, table, batch_size):
+        if table == "price_snapshots":
+            raise OperationalError("connection lost", None, Exception("boom"))
+        yield []
+
+    monkeypatch.setattr("scraper.sync._rows", explode)
+
+    result = _run_sync(monkeypatch)
+
+    assert result.exit_code == 1
+    assert "unchanged" in result.output
+    assert table_counts(target)["price_snapshots"] == 0
+
+
+def test_a_failed_reseed_does_not_claim_the_target_is_unchanged(databases, monkeypatch) -> None:
+    """It is changed — completely — and the operator has to know to re-run.
+
+    `reseed_seen` runs after the mirror's transaction has committed, so its
+    failure leaves a truncated-and-refilled target whose `notify_seen` still
+    holds an id from the id space that TRUNCATE discarded. Told "target
+    unchanged", nobody re-runs, and the dashboard on that target silently marks
+    real changes as already read.
+    """
+    source, target = databases
+    seed(source, shop_id=5001, item_id=7001)
+
+    def boom(_target_engine):
+        raise OperationalError("UPDATE notify_seen", None, Exception("boom"))
+
+    monkeypatch.setattr("scraper.sync.reseed_seen", boom)
+
+    result = _run_sync(monkeypatch)
+
+    assert result.exit_code == 1
+    assert "unchanged" not in result.output
+    assert "committed" in result.output
+    # Not a claim about the message: the mirror really did land.
+    assert table_counts(target)["price_snapshots"] == 1
