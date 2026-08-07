@@ -120,12 +120,23 @@ type MoveSpec = {
   hoursApart: number;
 };
 
-/** One listing, two captures `hoursApart`, the newer one `MOVE_HOURS_AGO` old. */
+/**
+ * One listing, two captures `hoursApart`, the newer one `MOVE_HOURS_AGO` old.
+ *
+ * Both timestamps come from one `Date.now()` read, not two calls to `ago()`.
+ * Two separate reads let the wall clock advance between them, so the true gap
+ * between the captures would be `hoursApart` hours plus however many
+ * milliseconds elapsed between the two `INSERT`s — invisible to every test that
+ * only checks a threshold on one side of a boundary, but it would make a test
+ * that wants to sit exactly on `gapHours` or `maxLookbackDays` a liar about what
+ * it seeded.
+ */
 async function seedMove(spec: MoveSpec): Promise<number> {
   const productId = nextProductId++;
   await addProduct(productId, spec.isOwn ? OWN_STORE : RIVAL_STORE, spec.setCode ?? SET);
-  await addSnapshot(productId, spec.from, ago(MOVE_HOURS_AGO + spec.hoursApart));
-  await addSnapshot(productId, spec.to, ago(MOVE_HOURS_AGO));
+  const reference = Date.now();
+  await addSnapshot(productId, spec.from, new Date(reference - (MOVE_HOURS_AGO + spec.hoursApart) * HOUR));
+  await addSnapshot(productId, spec.to, new Date(reference - MOVE_HOURS_AGO * HOUR));
   lastMoveProductId = productId;
   return productId;
 }
@@ -184,6 +195,66 @@ describe('rivalMoves — which snapshots qualify', () => {
   test('a rival on a set we do not carry is out of scope', async () => {
     await seedMove({ isOwn: false, setCode: '99999', from: '100000', to: '50000', hoursApart: 48 });
     expect(await rivalMoves(DEFAULTS)).toHaveLength(0);
+  });
+});
+
+describe('rivalMoves — the window parameters are honored, not hardcoded', () => {
+  /**
+   * Every case in the block above passes `DEFAULTS` outright, or overrides
+   * `maxLookbackDays` to a value that is itself the default (7). That leaves
+   * all four window parameters — `gapHours`, `threshold`, `windowDays`,
+   * `maxLookbackDays` — unverified as *parameters*: an implementation with
+   * `24`, `0.05`, `14` and `7` baked into the SQL as literals instead of bound
+   * values passes every test above unchanged.
+   *
+   * These probe each one with a genuinely non-default value against the same
+   * fixture — a rival move exactly at the default 5% threshold, its comparison
+   * 48 hours before it — and check that the row count moves.
+   */
+
+  test('threshold above the move excludes it', async () => {
+    await seedRivalMove({ from: '100000', to: '95000', hoursApart: 48 }); // -5.0%
+    expect(await rivalMoves({ ...DEFAULTS, threshold: 0.1 })).toHaveLength(0);
+  });
+
+  test('threshold well below the move still includes it', async () => {
+    await seedRivalMove({ from: '100000', to: '95000', hoursApart: 48 }); // -5.0%
+    expect(await rivalMoves({ ...DEFAULTS, threshold: 0.01 })).toHaveLength(1);
+  });
+
+  test('gapHours wider than the pair excludes it', async () => {
+    await seedRivalMove({ from: '100000', to: '95000', hoursApart: 48 });
+    expect(await rivalMoves({ ...DEFAULTS, gapHours: 72 })).toHaveLength(0);
+  });
+
+  test('maxLookbackDays shorter than the pair excludes it', async () => {
+    await seedRivalMove({ from: '100000', to: '95000', hoursApart: 48 });
+    expect(await rivalMoves({ ...DEFAULTS, maxLookbackDays: 1 })).toHaveLength(0);
+  });
+
+  test('windowDays shorter than the snapshot age excludes it', async () => {
+    await seedRivalMove({ from: '100000', to: '95000', hoursApart: 48 });
+    expect(await rivalMoves({ ...DEFAULTS, windowDays: 1 })).toHaveLength(0);
+  });
+});
+
+describe('rivalMoves — windowDays scopes both the page and the ceiling', () => {
+  /**
+   * `rivalMovesCeiling` shares `qualifyingMoves` with `rivalMoves` precisely so
+   * the two cannot disagree about which rows qualify. If the freshness
+   * predicate were dropped from that shared fragment — or from only one of the
+   * two exports — a marker could advance past a row that had already aged out
+   * of the page, or the ceiling could stay silent about a row the page still
+   * shows. Every fixture elsewhere in this file sits at `MOVE_HOURS_AGO` = 30
+   * hours old, comfortably inside the default 14-day window, so nothing above
+   * exercises this predicate at all.
+   */
+
+  test('a move outside windowDays is absent from both the page and the ceiling', async () => {
+    await seedRivalMove({ from: '100000', to: '50000', hoursApart: 48 }); // -50%, 30h old
+    const narrowed = { ...DEFAULTS, windowDays: 1 }; // the move is 1.25 days old
+    expect(await rivalMoves(narrowed)).toEqual([]);
+    expect(await rivalMovesCeiling(narrowed)).toBeNull();
   });
 });
 
@@ -272,24 +343,58 @@ describe('rivalMoves — what a row says', () => {
   });
 });
 
+describe('rivalMoves — our price is the cheapest of our shops', () => {
+  /**
+   * Every other case in this file that sets `ourPrice` (`seedOurPrice`) only
+   * ever creates one own listing, so `min(latest.price)` and a wrong
+   * `max(latest.price)` are indistinguishable everywhere above. This seeds the
+   * SAME set in a second own shop at a dearer price and checks both that the
+   * cheaper of the two is reported, and — the same fixture answers both
+   * questions — that carrying a set in two own shops does not double the row
+   * count for a rival's single move on it.
+   */
+
+  test('ourPrice is the cheaper of two own shops, and the rival still yields one row', async () => {
+    await seedOurPrice('120000'); // OWN_ANCHOR, on OWN_STORE
+    const OWN_STORE_2 = 3;
+    await addStore(OWN_STORE_2, 'i-bricks-toko', true);
+    const secondOwnProduct = nextProductId++;
+    await addProduct(secondOwnProduct, OWN_STORE_2, SET);
+    await addSnapshot(secondOwnProduct, '80000', ago(1)); // cheaper than the anchor's 120000
+
+    const rivalId = await seedRivalMove({ from: '200000', to: '150000', hoursApart: 48 });
+
+    const rows = await rivalMoves(DEFAULTS);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].productId).toBe(rivalId);
+    expect(rows[0].ourPrice).toBe('80000');
+  });
+});
+
 describe('rivalMovesCeiling', () => {
   test('ceiling spans the whole window, not the page', async () => {
     await seedThreeRivalMoves();
     const page = await rivalMoves({ ...DEFAULTS, limit: 1 });
     const ceiling = await rivalMovesCeiling(DEFAULTS);
     expect(page).toHaveLength(1);
-    expect(Number(ceiling)).toBeGreaterThan(Number(page[0].snapshotId));
+    // snapshotId is a bigint as a string — compared as BigInt, never Number(),
+    // the exact conversion the type's own doc comment forbids.
+    expect(ceiling).not.toBeNull();
+    expect(BigInt(ceiling as string)).toBeGreaterThan(BigInt(page[0].snapshotId));
   });
 
   test('the ceiling is the largest qualifying id in the window', async () => {
     await seedThreeRivalMoves();
     const all = await rivalMoves(DEFAULTS);
     const largest = all
-      .map((row) => Number(row.snapshotId))
-      .reduce((a, b) => Math.max(a, b), 0);
+      .map((row) => BigInt(row.snapshotId))
+      .reduce((a, b) => (a > b ? a : b), BigInt(0));
 
     expect(all).toHaveLength(3);
-    expect(Number(await rivalMovesCeiling(DEFAULTS))).toBe(largest);
+    const ceiling = await rivalMovesCeiling(DEFAULTS);
+    expect(ceiling).not.toBeNull();
+    expect(BigInt(ceiling as string)).toBe(largest);
   });
 
   test('offset walks the same ordering the ceiling was taken over', async () => {

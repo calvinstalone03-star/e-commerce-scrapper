@@ -31,13 +31,20 @@ import { sql } from '@/lib/db';
  * when no listing has been captured since it moved is a form whose correctness
  * expires on a schedule nobody controls.
  *
- * **Why the comparison must be at least `gapHours` older.** Captures taken 1.5
- * to 3.5 hours apart in this database disagree about price without anything
- * having been repriced: 37 of 38 such pairs differ, against 3 of 1,335 pairs a
- * day apart. Comparing against the immediately preceding snapshot would
- * therefore report mostly noise. `maxLookbackDays` is the other end of the same
- * argument: a listing with no predecessor inside the window yields no row at
- * all, rather than a comparison against ancient history.
+ * **Why the comparison must be at least `gapHours` older.** Every consecutive
+ * pair of captures 1.5 to 3.5 hours apart in this database disagrees about
+ * price without anything having been repriced — 32 such pairs, and all 32
+ * differ. Comparing against the immediately preceding snapshot would therefore
+ * report mostly noise. This database has no consecutive pairs anywhere near 24
+ * hours apart to check that specific gap against — captures jump from about 3.5
+ * hours apart straight to about 3 days 6 hours apart, with nothing in between —
+ * so the 24-hour figure is not one this database can confirm directly. The
+ * nearest thing to a same-day control it does have is 4 days 16-18 hours apart:
+ * 1,335 such pairs, of which only 3 differ, consistent with disagreement being
+ * rare once captures are days apart rather than hours. `maxLookbackDays` is the
+ * other end of the same argument: a listing with no predecessor inside the
+ * window yields no row at all, rather than a comparison against ancient
+ * history.
  *
  * **The plan, checked with `EXPLAIN (ANALYZE, BUFFERS)` against the scraper's
  * own database** — 22,121 snapshots, 18,255 products, 4,285 rival listings
@@ -99,7 +106,7 @@ export type RivalMovesOptions = {
 };
 
 /** Everything that defines the window; what both exports must agree on. */
-type RivalMovesWindow = Omit<RivalMovesOptions, 'limit' | 'offset'>;
+export type RivalMovesWindow = Omit<RivalMovesOptions, 'limit' | 'offset'>;
 
 type Row = {
   id: string;
@@ -256,13 +263,20 @@ export async function rivalMoves(opts: RivalMovesOptions): Promise<RivalMove[]> 
  * The largest snapshot id in the **complete** window — no limit, no offset, no
  * user filter.
  *
- * Its own function, taking a type that cannot express `limit` or `offset`, so
- * that no caller can hand the marker a capped or filtered result. The read
- * marker advances to exactly this value; advancing it to the maximum of a
- * displayed page instead would jump the marker past rows further down that same
- * window and strand them as permanently unread. That is only safe because the
- * page always renders the full window regardless of read state — nothing is
- * hidden behind the marker for it to skip.
+ * Its own function, taking `RivalMovesWindow` — `RivalMovesOptions` with `limit`
+ * and `offset` omitted. That omission does not, by itself, stop a caller from
+ * handing it a full `RivalMovesOptions`: TypeScript's excess-property check only
+ * fires on a fresh object literal, and a variable of the wider type (this file's
+ * own tests pass `DEFAULTS`, `limit` and all) is structurally assignable without
+ * complaint. The actual guarantee lives in the body: `qualifyingMoves`
+ * destructures only `gapHours`, `threshold`, `windowDays` and `maxLookbackDays`
+ * off `opts`, and the SQL it builds has no `LIMIT` or `OFFSET` clause at all —
+ * so a `limit`/`offset` a caller happens to include rides along on the object
+ * but is never read. The read marker advances to exactly this value; advancing
+ * it to the maximum of a displayed page instead would jump the marker past rows
+ * further down that same window and strand them as permanently unread. That is
+ * only safe because the page always renders the full window regardless of read
+ * state — nothing is hidden behind the marker for it to skip.
  *
  * `null` when nothing in the window qualifies, which the caller must treat as
  * "leave the marker where it is". Not 0 — 0 is a legitimate starting marker,
