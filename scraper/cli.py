@@ -1498,7 +1498,7 @@ def sync(
     try:
         # A status line rather than a print per batch: this is one long
         # operation over a link that may be slow, so it needs to show progress
-        # without leaving 60 lines of it in logs/notify.log's neighbours.
+        # without leaving 60 lines of it in whatever is capturing stdout.
         with console.status("mirroring…") as status:
 
             def _progress(table_name: str, rows: int) -> None:
