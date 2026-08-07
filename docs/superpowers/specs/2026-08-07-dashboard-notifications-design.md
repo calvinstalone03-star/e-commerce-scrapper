@@ -29,7 +29,7 @@ harga.
 | Toko sendiri | `i_bricks` (Shopee, id 25), `i-bricks` (Tokopedia, id 164) |
 | Pemicu | Gerak absolut ≥ 5% |
 | Pembanding | Snapshot terbaru yang setidaknya 24 jam lebih tua |
-| Status baca | Satu penanda global, tanpa status per item |
+| Status baca | Satu penanda global, tanpa status per item. Tab Baru menahan satu gerakan sampai sudah dibaca **dan** lewat sehari |
 | Kanal | Halaman dashboard. Telegram dihapus seluruhnya |
 | Database | **Neon**, yang dibaca deployment Vercel |
 
@@ -168,9 +168,9 @@ mana", dan batas itu **tidak menyaring apa pun**.
 ```
 price_snapshots ──┐
 products ─────────┼──> rivalMoves({gapHours, threshold, windowDays,
-stores (is_own) ──┘        maxLookbackDays, limit, offset}) ──> /notifications
-                                                                    │
-notify_seen.last_seen_snapshot_id ──> hanya menentukan gaya "baru" ──┘
+stores (is_own) ──┘        maxLookbackDays, graceHours, limit, offset}) ──> /notifications
+                                                                               │
+notify_seen.last_seen_snapshot_id ──> gaya "baru" + separuh predikat tab Baru ──┘
 ```
 
 ### Penanda tidak menyaring
@@ -181,7 +181,8 @@ syarat. Penanda hanya memutuskan baris mana yang bergaya "baru".
 Dua tab dari fungsi yang sama, predikat penanda sebagai parameter:
 
 - **Semua** — jendela bergulir, penanda diabaikan. Ini yang jadi tampilan awal.
-- **Baru** — `id > last_seen_snapshot_id`.
+- **Baru** — `id > last_seen_snapshot_id` **ATAU**
+  `scraped_at > now() - graceHours` (default 24 jam).
 
 Tampilan awal sengaja **Semua**, supaya muat pertama membuktikan query-nya
 bekerja alih-alih menampilkan halaman kosong yang tidak bisa dibedakan dari
@@ -190,6 +191,41 @@ kerusakan.
 Ini sekaligus menyelesaikan tiga temuan pertama: tidak ada yang bisa disembunyikan
 oleh penandaan terbaca, seed jadi tidak menentukan isi, dan riwayat yang hilang
 bersama Telegram kembali dengan ongkos satu predikat yang tidak dipasang.
+
+#### Masa tenggang sehari di tab Baru
+
+Predikat tab Baru berbentuk **ATAU**, dan itu perbaikan atas cacat yang
+dilaporkan pemakainya, bukan hiasan. Membuka halaman ini mem-POST penanda ke
+ceiling jendela, jadi dengan `id > penanda` sebagai satu-satunya syarat **satu
+kali refresh mengosongkan tab Baru**: gerakan yang cuma sempat terlihat tiga
+detik hilang sebelum sempat dibaca.
+
+Satu gerakan keluar dari tab Baru hanya kalau **dua-duanya** sudah terjadi:
+sudah dibaca (penanda lewat) dan sudah lebih dari sehari.
+
+Sehari itu dihitung dari `scraped_at`, bukan dari kolom "pertama kali terlihat"
+per baris — kolom seperti itu tidak ada dan menambahkannya berarti menyimpan
+satu baris per kejadian, di fitur yang seluruh bentuknya justru tidak menyimpan
+apa pun. Substitusi itu sah selama urutan id dan urutan waktu sejalan, dan itu
+diperiksa, bukan diasumsikan: **nol dari 28.287 snapshot di Neon punya
+`scraped_at` lebih tua daripada pendahulu ber-id lebih kecil**. Karena sejalan,
+tidak ada baris di atas penanda yang lebih tua daripada baris di bawahnya, jadi
+kedua cabang ATAU itu bersarang — isi tab selalu satu runtun dalam urutan id,
+baris keluar dari yang paling tua dulu, dan tidak ada yang kembali. Kalau suatu
+saat ada backfill, impor, atau skew jam yang memasukkan snapshot ber-id besar
+dengan `scraped_at` lama, **predikat inilah yang patah**.
+
+`graceHours` adalah parameter `rivalMoves`, bukan interval yang dipaku di SQL —
+sejajar dengan `gapHours`, `threshold`, `windowDays` dan `maxLookbackDays`. Ia
+sengaja **tidak** ikut masuk `DEFAULT_WINDOW`: `rivalMovesCeiling` dan
+`unreadRivalMoves` tidak boleh melihatnya.
+
+**Lonceng tetap ketat `id > penanda`, dan itu keputusan.** Badge harus bisa
+nol begitu halaman dibuka; badge yang baru mau padam sehari kemudian adalah
+badge yang lama-lama tidak dilirik orang. Konsekuensinya: lonceng bisa
+menunjukkan 0 sementara tab Baru masih berisi, dan baris di dalamnya muncul
+tanpa label "baru". Dua-duanya benar, dan dua-duanya **wajib dikatakan di teks
+halaman** supaya tidak terbaca sebagai kerusakan.
 
 ### Penanda maju ke hasil lengkap, bukan ke yang ditampilkan
 
@@ -394,6 +430,11 @@ terbukti:
   lebih kecil dari hasil, tidak ada baris yang boleh tertandai terbaca tanpa
   dirender. Ini yang menangkapnya kalau nanti ada yang "menyederhanakan".
 - **Batas ambang tepat 5%** dan **jarak tepat 24 jam**, kedua sisinya.
+- **Empat kombinasi tab Baru**, satu kasus masing-masing, karena intinya justru
+  syarat DAN itu: belum dibaca + segar → masuk; belum dibaca + basi → masuk;
+  sudah dibaca + segar → **masuk** (ini yang dulu gagal); sudah dibaca + basi →
+  tidak masuk. Plus batas tepat di `graceHours`, dan bukti `unreadRivalMoves`
+  masih menghitung ketat lewat penanda.
 - **Pembagi nol** — `ingest.py` bisa memasok harga 0.
 - **Id tidak berurutan** — `scraped_at` datang tidak terurut di database ini.
 - **Penanda di atas `max(id)`** — keadaan setelah mirror destruktif; harus

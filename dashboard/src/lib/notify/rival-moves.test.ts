@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
 
 import { sql } from '@/lib/db';
 import {
+  DEFAULT_GRACE_HOURS,
   rivalMoves,
   rivalMovesCeiling,
   unreadRivalMoves,
@@ -43,13 +44,23 @@ const SET = '42218';
 const OWN_ANCHOR = 1;
 
 /**
- * How far back the newer capture of every seeded move sits.
+ * How far back the newer capture of every seeded move sits, unless a case says
+ * otherwise.
  *
  * Far enough that a capture a day later is still in the past, which is what
  * `seedUnchangedCapture` needs, and near enough that its `hoursApart`
  * predecessor stays inside the 14-day window for every case below.
+ *
+ * It is also, at 30 hours, **outside the default `graceHours` of 24**, and that
+ * is now load-bearing rather than incidental. Every marker case in this file
+ * that expects a seen row to disappear is relying on it: the "Baru" tab keeps a
+ * move that is younger than `graceHours` even after it has been read, so pull
+ * this below 24 and those cases stop testing the marker at all.
  */
 const MOVE_HOURS_AGO = 30;
+
+/** Younger than the default grace, for the cases that need a move to still be fresh. */
+const FRESH_HOURS_AGO = 2;
 
 const DEFAULTS: RivalMovesOptions = {
   gapHours: 24,
@@ -59,7 +70,7 @@ const DEFAULTS: RivalMovesOptions = {
   // The "Semua" tab, which is the page's landing view: the marker filters
   // nothing. Every case below that does not say otherwise is asking for the
   // whole window.
-  newerThanSnapshotId: null,
+  seenSnapshotId: null,
   limit: 50,
   offset: 0,
 };
@@ -127,10 +138,12 @@ type MoveSpec = {
   from: string;
   to: string;
   hoursApart: number;
+  /** How old the move itself is. `MOVE_HOURS_AGO` unless the case cares. */
+  hoursAgo?: number;
 };
 
 /**
- * One listing, two captures `hoursApart`, the newer one `MOVE_HOURS_AGO` old.
+ * One listing, two captures `hoursApart`, the newer one `hoursAgo` old.
  *
  * Both timestamps come from one `Date.now()` read, not two calls to `ago()`.
  * Two separate reads let the wall clock advance between them, so the true gap
@@ -143,9 +156,10 @@ type MoveSpec = {
 async function seedMove(spec: MoveSpec): Promise<number> {
   const productId = nextProductId++;
   await addProduct(productId, spec.isOwn ? OWN_STORE : RIVAL_STORE, spec.setCode ?? SET);
+  const hoursAgo = spec.hoursAgo ?? MOVE_HOURS_AGO;
   const reference = Date.now();
-  await addSnapshot(productId, spec.from, new Date(reference - (MOVE_HOURS_AGO + spec.hoursApart) * HOUR));
-  await addSnapshot(productId, spec.to, new Date(reference - MOVE_HOURS_AGO * HOUR));
+  await addSnapshot(productId, spec.from, new Date(reference - (hoursAgo + spec.hoursApart) * HOUR));
+  await addSnapshot(productId, spec.to, new Date(reference - hoursAgo * HOUR));
   lastMoveProductId = productId;
   return productId;
 }
@@ -437,6 +451,11 @@ describe('rivalMoves — the marker predicate is the second tab, and nothing els
    * on the marker unconditionally and, measured against the live database, would
    * have shipped an empty page on day one, because the marker's seed (22154)
    * sits above the highest qualifying event id (22089).
+   *
+   * Every case here seeds through `seedThreeRivalMoves`, so every move is
+   * `MOVE_HOURS_AGO` = 30 hours old — **past the default 24-hour grace**. That is
+   * what leaves the marker as the only thing deciding, which is what this block
+   * is about. The grace period itself is the block below.
    */
 
   /** The ids of every qualifying move, ascending. */
@@ -447,7 +466,7 @@ describe('rivalMoves — the marker predicate is the second tab, and nothing els
 
   test('null renders the whole window regardless of read state', async () => {
     await seedThreeRivalMoves();
-    expect(await rivalMoves({ ...DEFAULTS, newerThanSnapshotId: null })).toHaveLength(3);
+    expect(await rivalMoves({ ...DEFAULTS, seenSnapshotId: null })).toHaveLength(3);
   });
 
   test('a marker keeps only what is above it, and is exclusive', async () => {
@@ -456,7 +475,7 @@ describe('rivalMoves — the marker predicate is the second tab, and nothing els
 
     // Exclusive: the row AT the marker has been seen, so passing the middle id
     // must leave exactly the one above it.
-    const above = await rivalMoves({ ...DEFAULTS, newerThanSnapshotId: ids[1] });
+    const above = await rivalMoves({ ...DEFAULTS, seenSnapshotId: ids[1] });
     expect(above.map((row) => row.snapshotId)).toEqual([ids[2]]);
   });
 
@@ -465,8 +484,8 @@ describe('rivalMoves — the marker predicate is the second tab, and nothing els
     await seedThreeRivalMoves();
     const ids = await qualifyingIds();
 
-    expect(await rivalMoves({ ...DEFAULTS, newerThanSnapshotId: ids[2] })).toHaveLength(0);
-    expect(await rivalMoves({ ...DEFAULTS, newerThanSnapshotId: null })).toHaveLength(3);
+    expect(await rivalMoves({ ...DEFAULTS, seenSnapshotId: ids[2] })).toHaveLength(0);
+    expect(await rivalMoves({ ...DEFAULTS, seenSnapshotId: null })).toHaveLength(3);
   });
 
   test('the ceiling ignores the marker entirely', async () => {
@@ -484,8 +503,111 @@ describe('rivalMoves — the marker predicate is the second tab, and nothing els
     // a fresh literal carrying it. It does *not* refuse a variable of the wider
     // type — which is the shape a real caller has — so the runtime guarantee has
     // to hold on its own: `qualifyingMoves` never reads the field.
-    const wide: RivalMovesOptions = { ...DEFAULTS, newerThanSnapshotId: ids[2] };
+    const wide: RivalMovesOptions = { ...DEFAULTS, seenSnapshotId: ids[2] };
     expect(await rivalMovesCeiling(wide)).toBe(ids[2]);
+  });
+});
+
+describe('rivalMoves — "Baru" keeps a move for a day after it has been read', () => {
+  /**
+   * The reported defect, and the fix, as a truth table.
+   *
+   * Opening `/notifications` POSTs the marker to the window's ceiling, so while
+   * `m.id > marker` was the whole predicate one refresh emptied this tab: a move
+   * glimpsed for three seconds was gone before it had been read. The predicate is
+   * now an OR — above the marker, **or** younger than `graceHours` — and a move
+   * leaves "Baru" only once *both* have lapsed.
+   *
+   * All four combinations get a case of their own rather than a loop over a
+   * table, because the whole change is which combination survives, and exactly
+   * one of the four answers differently than it did before.
+   *
+   * The day is measured from `scraped_at`, there being no per-row "first seen"
+   * column and no intention of adding one. That is sound only while id order and
+   * time order agree — verified on the live database, 28,287 snapshots, zero
+   * inversions — and `rivalMoves`'s own header says what breaks if they stop.
+   */
+
+  /** The one qualifying move's snapshot id. Every case here seeds exactly one. */
+  async function onlyMoveId(): Promise<string> {
+    const rows = await rivalMoves(DEFAULTS);
+    expect(rows).toHaveLength(1);
+    return rows[0].snapshotId;
+  }
+
+  test('unseen and fresh is in "Baru"', async () => {
+    await seedRivalMove({ from: '100000', to: '50000', hoursApart: 48, hoursAgo: FRESH_HOURS_AGO });
+    expect(await rivalMoves({ ...DEFAULTS, seenSnapshotId: '0' })).toHaveLength(1);
+  });
+
+  test('unseen and stale is in "Baru"', async () => {
+    // The disjunct that must not be traded away for the new one. A reader who
+    // has been gone a week needs the backlog, and every row in it is stale.
+    await seedRivalMove({ from: '100000', to: '50000', hoursApart: 48, hoursAgo: MOVE_HOURS_AGO });
+    expect(await rivalMoves({ ...DEFAULTS, seenSnapshotId: '0' })).toHaveLength(1);
+  });
+
+  test('seen but still fresh is in "Baru" — the case that used to fail', async () => {
+    await seedRivalMove({ from: '100000', to: '50000', hoursApart: 48, hoursAgo: FRESH_HOURS_AGO });
+    const id = await onlyMoveId();
+
+    // A marker at the row's own id is what one refresh does to it:
+    // `/api/notifications/seen` advances to the ceiling of the whole window,
+    // which with one qualifying row is that row.
+    const rows = await rivalMoves({ ...DEFAULTS, seenSnapshotId: id });
+    expect(rows.map((row) => row.snapshotId)).toEqual([id]);
+  });
+
+  test('seen and stale has left "Baru"', async () => {
+    await seedRivalMove({ from: '100000', to: '50000', hoursApart: 48, hoursAgo: MOVE_HOURS_AGO });
+    const id = await onlyMoveId();
+    expect(await rivalMoves({ ...DEFAULTS, seenSnapshotId: id })).toHaveLength(0);
+  });
+
+  test('the boundary: exactly graceHours old is out, a minute inside is in', async () => {
+    // Both ages are taken from `Date.now()` and then compared against the
+    // query's own `now()`, a few milliseconds later. So the row seeded at
+    // exactly `DEFAULT_GRACE_HOURS` is a few milliseconds past the edge by the
+    // time it is asked about and falls out deterministically, rather than
+    // landing on a coin flip over which side of `>` it sits.
+    await seedRivalMove({
+      from: '100000',
+      to: '50000',
+      hoursApart: 48,
+      hoursAgo: DEFAULT_GRACE_HOURS,
+    });
+    const inside = await seedRivalMove({
+      from: '100000',
+      to: '50000',
+      hoursApart: 48,
+      hoursAgo: DEFAULT_GRACE_HOURS - 1 / 60,
+    });
+
+    // Both are now read, which is what the ceiling means.
+    const ceiling = await rivalMovesCeiling(DEFAULTS);
+    const rows = await rivalMoves({ ...DEFAULTS, seenSnapshotId: ceiling });
+
+    expect(rows.map((row) => row.productId)).toEqual([inside]);
+  });
+
+  test('graceHours is a parameter: widening it keeps a seen 30-hour-old move', async () => {
+    await seedRivalMove({ from: '100000', to: '50000', hoursApart: 48 }); // MOVE_HOURS_AGO
+    const id = await onlyMoveId();
+    expect(await rivalMoves({ ...DEFAULTS, seenSnapshotId: id, graceHours: 48 })).toHaveLength(1);
+  });
+
+  test('graceHours is a parameter: narrowing it drops a seen 2-hour-old move', async () => {
+    await seedRivalMove({ from: '100000', to: '50000', hoursApart: 48, hoursAgo: FRESH_HOURS_AGO });
+    const id = await onlyMoveId();
+    expect(await rivalMoves({ ...DEFAULTS, seenSnapshotId: id, graceHours: 1 })).toHaveLength(0);
+  });
+
+  test('"Semua" is not given a grace period, because it never filtered', async () => {
+    // `graceHours` is dead weight next to a null marker, and the point of
+    // checking is that it stays dead: a stale row must not start disappearing
+    // from the landing view because someone moved the OR out of its branch.
+    await seedRivalMove({ from: '100000', to: '50000', hoursApart: 48, hoursAgo: MOVE_HOURS_AGO });
+    expect(await rivalMoves({ ...DEFAULTS, seenSnapshotId: null, graceHours: 1 })).toHaveLength(1);
   });
 });
 
@@ -508,7 +630,7 @@ describe('unreadRivalMoves — what the bell says', () => {
     await seedRivalMove({ from: '100000', to: '99999', hoursApart: 48 }); // under threshold
     await seedMove({ isOwn: true, from: '100000', to: '50000', hoursApart: 48 }); // ours
 
-    const listed = await rivalMoves({ ...DEFAULTS, newerThanSnapshotId: '0' });
+    const listed = await rivalMoves({ ...DEFAULTS, seenSnapshotId: '0' });
     expect(await unreadRivalMoves(DEFAULTS, '0', 99)).toEqual({
       count: listed.length,
       capped: false,
@@ -530,5 +652,23 @@ describe('unreadRivalMoves — what the bell says', () => {
     await seedThreeRivalMoves();
     const narrowed = { ...DEFAULTS, windowDays: 1 }; // every fixture is 1.25 days old
     expect(await unreadRivalMoves(narrowed, '0', 99)).toEqual({ count: 0, capped: false });
+  });
+
+  test('does not get the tab\'s grace period, so it may read 0 over a non-empty "Baru"', async () => {
+    // The decision this pins down, rather than a coincidence to be tidied away
+    // later: the badge clears the moment the page is opened, while the tab holds
+    // its rows for another day. A badge that will not clear for a day is the
+    // kind of nagging that makes people stop looking at it. So the two numbers
+    // are allowed to disagree — and `(app)/notifications/page.tsx` says so in
+    // words, because on screen it otherwise reads as a bug.
+    await seedRivalMove({ from: '100000', to: '50000', hoursApart: 48, hoursAgo: FRESH_HOURS_AGO });
+    const ceiling = await rivalMovesCeiling(DEFAULTS);
+    expect(ceiling).not.toBeNull();
+
+    expect(await unreadRivalMoves(DEFAULTS, ceiling as string, 99)).toEqual({
+      count: 0,
+      capped: false,
+    });
+    expect(await rivalMoves({ ...DEFAULTS, seenSnapshotId: ceiling })).toHaveLength(1);
   });
 });

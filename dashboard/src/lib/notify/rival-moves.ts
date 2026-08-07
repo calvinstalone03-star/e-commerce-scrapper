@@ -9,6 +9,16 @@ import { sql } from '@/lib/db';
  * page is a pure derivation of `price_snapshots`, and the only stored state is
  * a marker saying how far the reader has got, which never filters anything.
  *
+ * **"Baru" is not "unread", and the difference is a day.** The landing view is
+ * still unfiltered, but the second tab *is* a filter, and it is an OR: a move
+ * belongs there while it sits above the marker, **and also** while it is
+ * younger than `graceHours`, even once the marker has passed it. It leaves only
+ * once both have lapsed. That is a repair rather than a flourish — opening the
+ * page POSTs the marker to the window's ceiling, so before this one refresh
+ * emptied the tab outright and a move glimpsed for three seconds was gone
+ * before it had been read. The bell is deliberately *not* widened to match; see
+ * `unreadRivalMoves`, which still counts strictly by the marker.
+ *
  * **One row per qualifying snapshot, never per product.** This is the point of
  * the shape, not a stylistic preference. An earlier draft took the newest
  * snapshot per product with `DISTINCT ON (product_ref)` and then compared that
@@ -103,16 +113,35 @@ export type RivalMovesOptions = {
   /** How stale a comparison may be before the move is not reported. 7. */
   maxLookbackDays: number;
   /**
-   * The read marker, when the caller wants only what is above it — the page's
-   * "Baru" tab — and `null` for the whole window, which is the "Semua" tab and
-   * the default landing view.
+   * The read marker, when the caller wants the page's "Baru" tab, and `null`
+   * for the whole window, which is the "Semua" tab and the default landing
+   * view.
+   *
+   * Not "everything above this id": that is only half of what the tab asks for
+   * now, the other half being `graceHours`. What this field says is *where the
+   * reader has got to*, and the tab decides what to do with that.
    *
    * Stated rather than optional, so a caller has to decide. This is the one
    * predicate in the feature that can hide a row, and a filter that could be
    * left off by accident is how the first draft shipped a page that rendered
    * empty on day one.
    */
-  newerThanSnapshotId: string | null;
+  seenSnapshotId: string | null;
+  /**
+   * How long a move keeps its place in "Baru" after the marker has passed it,
+   * measured from `scraped_at`. Whole hours — `make_interval` takes an int.
+   * Defaults to `DEFAULT_GRACE_HOURS`.
+   *
+   * Optional where `seenSnapshotId` is stated, and the asymmetry is the point:
+   * the two fields fail in opposite directions. Forgetting the marker hides
+   * rows, which is the failure this feature was rebuilt to avoid. Forgetting
+   * this one only ever shows *more* — the tab widens to a day's grace, which is
+   * the direction the page is allowed to be wrong in.
+   *
+   * Ignored entirely when `seenSnapshotId` is `null`; "Semua" already shows
+   * everything, so there is nothing for a grace period to rescue.
+   */
+  graceHours?: number;
   limit: number;
   offset: number;
 };
@@ -120,17 +149,22 @@ export type RivalMovesOptions = {
 /**
  * Everything that defines the window; what both exports must agree on.
  *
- * `newerThanSnapshotId` is omitted alongside `limit` and `offset`, and that
- * omission is the important one. The ceiling exists to say how far the marker
- * may advance; a ceiling taken over rows already filtered *by* the marker would
- * be a ceiling that could never move past the marker's own position, and the
- * rows above it would be stranded. The type says so, and `qualifyingMoves` never
+ * `seenSnapshotId` is omitted alongside `limit` and `offset`, and that omission
+ * is the important one. The ceiling exists to say how far the marker may
+ * advance; a ceiling taken over rows already filtered *by* the marker would be a
+ * ceiling that could never move past the marker's own position, and the rows
+ * above it would be stranded. The type says so, and `qualifyingMoves` never
  * reads the field regardless — the marker predicate lives in `rivalMoves`'s
  * outer SELECT, not in the shared fragment.
+ *
+ * `graceHours` is omitted for the same reason and travels with the marker
+ * rather than with the window: it is the other half of one predicate, in the
+ * same outer SELECT. Inside the shared fragment it would widen the ceiling and
+ * the bell too, and the bell is the one thing this grace period must not touch.
  */
 export type RivalMovesWindow = Omit<
   RivalMovesOptions,
-  'limit' | 'offset' | 'newerThanSnapshotId'
+  'limit' | 'offset' | 'seenSnapshotId' | 'graceHours'
 >;
 
 /**
@@ -160,6 +194,19 @@ export const DEFAULT_WINDOW: RivalMovesWindow = {
   windowDays: 14,
   maxLookbackDays: 7,
 };
+
+/**
+ * How long "Baru" holds on to a move after it has been read. A day, as asked
+ * for.
+ *
+ * Deliberately **not** a fifth field of `DEFAULT_WINDOW`, even though it is the
+ * same kind of number. That constant is the shared definition of the window
+ * `rivalMoves` renders and `rivalMovesCeiling` advances the marker over, and its
+ * whole job is to be the same value in both places. This is not part of that
+ * window: it belongs to one tab of one page, `rivalMovesCeiling` and
+ * `unreadRivalMoves` must not see it, and the type keeps them from doing so.
+ */
+export const DEFAULT_GRACE_HOURS = 24;
 
 /**
  * Past this the unread count stops counting and says "99+".
@@ -287,13 +334,38 @@ function qualifyingMoves({ gapHours, threshold, windowDays, maxLookbackDays }: R
  * on the first key puts the sets we have no price for after the ones we know we
  * are still winning — an unknown is not evidence of anything.
  *
- * `newerThanSnapshotId` is the page's second tab and the **only** predicate here
- * that depends on read state. It sits in this outer SELECT rather than in
+ * `seenSnapshotId` is the page's second tab and the **only** predicate here that
+ * depends on read state. It sits in this outer SELECT rather than in
  * `qualifyingMoves` for a reason that is easy to undo by accident: the shared
  * fragment is what `rivalMovesCeiling` counts over, and a marker predicate
  * inside it would cap the ceiling at the marker and strand everything above.
+ *
+ * **That predicate is an OR, and both halves are load-bearing.** A move is in
+ * "Baru" while it is unread, and *also* while it is younger than `graceHours`
+ * even after it has been read; it leaves only when both have lapsed. An AND
+ * would be the old behaviour with extra steps, and dropping either disjunct
+ * restores a bug that was reported rather than imagined: the page marks the
+ * whole window read on arrival, so with only `m.id > marker` one refresh emptied
+ * the tab, and with only the age test a backlog older than a day would never
+ * appear in it at all.
+ *
+ * **The day is anchored to `scraped_at`, not to a per-row "first seen" stamp.**
+ * There is no such column and adding one would mean storing a row per event, in
+ * a feature whose entire shape is that it stores none — so the capture time
+ * stands in for "when this could first have been read". That substitution is
+ * only sound because id order and time order agree here, which was checked
+ * rather than assumed: **zero of 28,287 snapshots on the live Neon database
+ * have a `scraped_at` older than any lower-id predecessor**. Because they agree,
+ * nothing above the marker is older than anything below it, so the two
+ * disjuncts nest — the tab is always a contiguous run in id order, rows leave it
+ * oldest-first, and none of them comes back. If a backfill, an import or a clock
+ * skew ever lands a snapshot whose `scraped_at` predates a lower id, **this
+ * predicate is what breaks**: a row already scrolled past would re-enter "Baru"
+ * out of order and sit there for a day, and the tab would stop being a run and
+ * start being a scatter.
  */
 export async function rivalMoves(opts: RivalMovesOptions): Promise<RivalMove[]> {
+  const graceHours = opts.graceHours ?? DEFAULT_GRACE_HOURS;
   const rows = await sql<Row[]>`
     ${qualifyingMoves(opts)}
     SELECT m.id,
@@ -313,9 +385,10 @@ export async function rivalMoves(opts: RivalMovesOptions): Promise<RivalMove[]> 
       JOIN rival_listings r ON r.id = m.product_ref
       LEFT JOIN our_price op ON op.set_code = r.set_code
      WHERE ${
-       opts.newerThanSnapshotId === null
+       opts.seenSnapshotId === null
          ? sql`true`
-         : sql`m.id > ${opts.newerThanSnapshotId}::bigint`
+         : sql`(m.id > ${opts.seenSnapshotId}::bigint
+                OR m.scraped_at > now() - make_interval(hours => ${graceHours}))`
      }
      ORDER BY (m.price < op.price) DESC NULLS LAST,
               abs(m.price - m.previous_price) / m.previous_price DESC,
@@ -389,6 +462,14 @@ export type UnreadRivalMoves = { count: number; capped: boolean };
  * on the overview, on the product table, on settings. Fetching the feed to count
  * it would put the page's whole cost on every screen in the app, ordering
  * included, to render a two-digit number.
+ *
+ * **Strictly `id > marker`, and it does not get the "Baru" tab's day of grace.**
+ * The two numbers are allowed to disagree, and that is the decision rather than
+ * an oversight: the bell has to be able to reach zero the moment the page is
+ * opened, because a badge that keeps nagging for a day after it has been
+ * answered is a badge people stop looking at. The tab may then list rows while
+ * the bell reads 0 — `(app)/notifications/page.tsx` says so in words, because
+ * otherwise it reads as a bug.
  *
  * Bounded twice over, and the two bounds are not the same bound. `LIMIT cap + 1`
  * bounds the *work*: `moves` is a plain CTE, so Postgres inlines it and the

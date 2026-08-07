@@ -31,6 +31,21 @@ import { getOwnShops } from '@/lib/queries';
  * predicate, and it is allowed to be empty, because the reader got there by
  * asking a question whose answer can honestly be "nothing".
  *
+ * **That extra predicate is an OR, and the reason is this page's own side
+ * effect.** Rendering the list POSTs the marker to the window's ceiling, so
+ * "above the marker" alone meant one refresh emptied "Baru" completely — a move
+ * seen for three seconds was gone before it had been read. A move now leaves the
+ * tab only once it has *both* been read and turned a day old
+ * (`DEFAULT_GRACE_HOURS`).
+ *
+ * The bell was deliberately left strict, so the two disagree on purpose: the
+ * badge clears the moment this page is opened, while the tab holds its rows for
+ * another day. A badge that will not clear for a day is the kind of nagging that
+ * makes people stop looking at it. The visible cost is that "Baru" can list rows
+ * while the bell reads 0 and while those rows carry no "baru" label — both are
+ * correct, and both are stated in the copy below rather than left to look like a
+ * bug.
+ *
  * Cross-marketplace by design, like `/products` and `/stores`: a rival's move
  * matters whichever marketplace it happens on, so this page is not `?kanal=`
  * scoped. It still carries the parameter through every link it builds, because
@@ -129,9 +144,13 @@ export default async function NotificationsPage({
   // One extra row, purely to find out whether the cap bound — cheaper and more
   // honest than a second `count(*)` that could disagree with the page it
   // describes.
+  //
+  // `graceHours` is left at its default, which is the day of grace "Baru" is
+  // built around; the tab is over-inclusive by design, so the value that gets
+  // used when nobody names one is the value this page wants.
   const fetched = await rivalMoves({
     ...DEFAULT_WINDOW,
-    newerThanSnapshotId: tab === 'baru' ? seen.id : null,
+    seenSnapshotId: tab === 'baru' ? seen.id : null,
     limit: PAGE_LIMIT + 1,
     offset: 0,
   });
@@ -164,7 +183,9 @@ export default async function NotificationsPage({
             Gerakan harga rival minimal 5% pada set yang toko kita jual, 14 hari terakhir.
             {tab === 'semua'
               ? ' Tab ini tidak menyaring apa pun — penanda baca hanya menentukan mana yang ditandai baru.'
-              : ' Tab ini hanya menampilkan yang di atas penanda baca.'}
+              : ' Tab ini menahan gerakan sampai dua-duanya terpenuhi: sudah lewat penanda baca' +
+                ' dan sudah lebih dari sehari. Jadi yang sudah terbaca tapi belum genap sehari' +
+                ' masih ada di sini — tanpa label “baru”, dan tidak lagi dihitung lonceng.'}
           </p>
 
           {moves.length === 0 ? (
@@ -240,11 +261,13 @@ function Empty({
   if (tab === 'baru') {
     return (
       <EmptyState
-        title="Tidak ada yang baru sejak terakhir dibuka"
+        title="Semuanya sudah terbaca, dan semuanya sudah lewat sehari"
         description={
           <>
-            Semua gerakan di jendela 14 hari sudah ditandai terbaca. Daftarnya tidak hilang — ia
-            tidak pernah disaring oleh penanda baca.{' '}
+            Satu gerakan keluar dari tab ini hanya kalau dua-duanya sudah terjadi — sudah ditandai
+            terbaca dan sudah lebih dari sehari — jadi tab yang kosong berarti keduanya sudah lewat
+            untuk seluruh jendela 14 hari. Daftarnya sendiri tidak hilang: tab Semua tidak pernah
+            disaring oleh penanda baca.{' '}
             <Link href={tabHref(params, 'semua')} className="text-accent hover:underline">
               Lihat semua
             </Link>
