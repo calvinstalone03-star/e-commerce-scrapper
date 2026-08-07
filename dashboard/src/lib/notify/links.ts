@@ -1,62 +1,58 @@
 import { CHANNEL_PARAM } from '@/lib/channel';
-import type { NewProduct, NewStore, PriceChange } from '@/lib/notify/events';
+// `import type`, deliberately: rival-moves.ts imports `server-only` at its top,
+// and a value import would pull that into this module's runtime graph. This file
+// is pure and stays that way — the type is erased at compile time, so nothing is
+// imported at all.
+import type { RivalMove } from '@/lib/notify/rival-moves';
 
 /**
- * Where a notification points.
+ * Where a row on the notifications page points.
  *
  * There is no uniform answer, because `/pricing/[id]` is scoped to our own
  * shops: `getPricePositionDetail` joins `AND s.is_own` (queries.ts:769) and a
- * rival's id 404s at `pricing/[id]/page.tsx:61`. Every price change observed so
- * far belongs to a rival, so the rival paths are the common case, not the
- * fallback.
+ * rival's id 404s at `pricing/[id]/page.tsx:61`. Every row this feature renders
+ * is a rival by construction — `rivalMoves` selects `WHERE NOT s.is_own` — so
+ * the rival paths are not the fallback, they are the whole of it.
  *
  * For a rival the useful destination is not their listing but ours: when a
  * competitor moves, the question is where that leaves us. `/pricing` searches
  * `set_code` by prefix (queries.ts:409), so a set number lands on exactly that
  * comparison.
  *
+ * **A path, never an absolute URL.** The Telegram digest needed `https://…`
+ * because a message is read outside the app, and it took a base URL, an
+ * environment-variable fallback chain and a join helper to produce one. Every
+ * link here is now an in-app `<Link>`, where an absolute URL would leave the
+ * client router and reload the page — so all of that is gone rather than
+ * unused.
+ *
  * No `server-only` and no database access — pure string work, so the choices
  * here are testable without a Postgres.
  */
 
-export function resolveBaseUrl(env: {
-  NOTIFY_BASE_URL?: string;
-  VERCEL_PROJECT_PRODUCTION_URL?: string;
-}): string {
-  // VERCEL_URL is deliberately not consulted: it names the individual
-  // deployment and changes on every push, so links already sent to Telegram
-  // would rot. VERCEL_PROJECT_PRODUCTION_URL is the stable production domain,
-  // and follows a custom domain if one is ever attached.
-  const explicit = env.NOTIFY_BASE_URL?.trim();
-  const vercel = env.VERCEL_PROJECT_PRODUCTION_URL?.trim();
+/**
+ * What a link needs from a move, and nothing else.
+ *
+ * Derived from `RivalMove` rather than restated, so a rename on the query side
+ * breaks this file rather than silently making it read a field that no longer
+ * exists. Narrowed to three fields because that is genuinely all a destination
+ * depends on: the price, the marker id and our own price decide what a row
+ * *says*, never where it goes.
+ */
+type Linkable = Pick<RivalMove, 'setCode' | 'marketplace' | 'name'>;
 
-  const chosen = explicit || (vercel ? `https://${vercel}` : '');
-  if (!chosen) {
-    throw new Error(
-      'No base URL for notification links. Set NOTIFY_BASE_URL, or deploy where ' +
-        'VERCEL_PROJECT_PRODUCTION_URL is set.',
-    );
-  }
-
-  return chosen.replace(/\/+$/, '');
-}
-
-export function priceChangeLink(change: PriceChange): string {
-  // Our own listing has a detail page, and it repairs its own `kanal` from the
-  // database (pricing/[id]/page.tsx:68), so a bare path lands correctly.
-  if (change.isOwn) return `/pricing/${change.productId}`;
-
+export function priceChangeLink(move: Linkable): string {
   // A rival with a set number: our position on that set.
-  if (change.setCode) {
-    const params = new URLSearchParams({ [CHANNEL_PARAM]: change.marketplace, q: change.setCode });
+  if (move.setCode) {
+    const params = new URLSearchParams({ [CHANNEL_PARAM]: move.marketplace, q: move.setCode });
     return `/pricing?${params.toString()}`;
   }
 
   // Accessories, bundles and knock-offs carry no set number, and `/pricing` has
   // nothing to match them on. `/products` searches names and spans both
   // marketplaces.
-  if (change.name) {
-    return `/products?${new URLSearchParams({ q: searchableName(change.name) }).toString()}`;
+  if (move.name) {
+    return `/products?${new URLSearchParams({ q: searchableName(move.name) }).toString()}`;
   }
 
   return '/products';
@@ -88,16 +84,4 @@ function searchableName(name: string): string {
   const last = cut.charCodeAt(cut.length - 1);
   const whole = last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
   return whole.trimEnd();
-}
-
-export function newStoreLink(store: NewStore): string {
-  return `/stores/${store.storeId}`;
-}
-
-export function newProductLink(product: NewProduct): string {
-  return `/products?${new URLSearchParams({ storeId: String(product.storeId) }).toString()}`;
-}
-
-export function absolute(baseUrl: string, path: string): string {
-  return `${baseUrl.replace(/\/+$/, '')}${path.startsWith('/') ? path : `/${path}`}`;
 }

@@ -10,7 +10,6 @@ import {
   renderStaleWarning,
   splitByOwnSets,
 } from '@/lib/notify/format';
-import { resolveBaseUrl } from '@/lib/notify/links';
 import { ownSetPositions } from '@/lib/notify/positions';
 // Shared with the product table's movement badge, so the two cannot come to
 // disagree about what counts as a price change. See lib/price-change.ts.
@@ -157,6 +156,37 @@ function wholeNumber(raw: string | undefined, fallback: number): number {
   if (!text) return fallback;
   const value = Number(text);
   return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+/**
+ * Which host the links in a Telegram message point at.
+ *
+ * Moved here from `links.ts` when that file was trimmed to what an in-app link
+ * needs: a path. This is the last caller, and it is Telegram-only by
+ * definition — a message is read outside the app, so it needs an absolute URL
+ * and therefore a host to build one from. It dies with this file in Task 11.
+ *
+ * VERCEL_URL is deliberately not consulted: it names the individual deployment
+ * and changes on every push, so links already sent to Telegram would rot.
+ * VERCEL_PROJECT_PRODUCTION_URL is the stable production domain, and follows a
+ * custom domain if one is ever attached.
+ */
+function resolveBaseUrl(env: {
+  NOTIFY_BASE_URL?: string;
+  VERCEL_PROJECT_PRODUCTION_URL?: string;
+}): string {
+  const explicit = env.NOTIFY_BASE_URL?.trim();
+  const vercel = env.VERCEL_PROJECT_PRODUCTION_URL?.trim();
+
+  const chosen = explicit || (vercel ? `https://${vercel}` : '');
+  if (!chosen) {
+    throw new Error(
+      'No base URL for notification links. Set NOTIFY_BASE_URL, or deploy where ' +
+        'VERCEL_PROJECT_PRODUCTION_URL is set.',
+    );
+  }
+
+  return chosen.replace(/\/+$/, '');
 }
 
 /**

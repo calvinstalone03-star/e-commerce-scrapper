@@ -1,5 +1,5 @@
 import type { Events, NewProduct, NewStore, PriceChange } from '@/lib/notify/events';
-import { absolute, newProductLink, newStoreLink, priceChangeLink } from '@/lib/notify/links';
+import { priceChangeLink } from '@/lib/notify/links';
 // `import type`, deliberately: positions.ts imports `server-only` at its top,
 // and a value import would pull that into this module's runtime graph. This
 // file is pure and stays that way — the type is erased at compile time, so
@@ -19,6 +19,28 @@ import type { SetPosition } from '@/lib/notify/positions';
  */
 
 export const TELEGRAM_MAX_CHARS = 4096;
+
+/**
+ * The three URL builders this file used to import from `links.ts`.
+ *
+ * They moved here when `links.ts` was trimmed to what an in-app link needs. All
+ * three exist to turn a path into something a Telegram message can carry — an
+ * absolute URL read outside the app — which is a requirement this file is the
+ * last holder of. They are dead the moment this file is (Task 11), and keeping
+ * them next to their only caller until then is what stops `api/notify/route.ts`
+ * from failing to build in the meantime.
+ */
+function absolute(baseUrl: string, path: string): string {
+  return `${baseUrl.replace(/\/+$/, '')}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+function newStoreLink(store: NewStore): string {
+  return `/stores/${store.storeId}`;
+}
+
+function newProductLink(product: NewProduct): string {
+  return `/products?${new URLSearchParams({ storeId: String(product.storeId) }).toString()}`;
+}
 
 /** Below this, listings that moved by the same amount are a coincidence. */
 export const FOLD_MIN_GROUP = 3;
