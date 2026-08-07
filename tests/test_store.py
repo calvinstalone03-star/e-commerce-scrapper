@@ -239,6 +239,54 @@ def test_init_db_applies_the_sql_migration_and_is_idempotent(engine):
     assert {"stores", "products", "price_snapshots", "scrape_runs"} <= tables
 
 
+def test_notify_seen_is_seeded_from_the_watermark_when_one_exists(engine):
+    """006 must not announce history that 005's notifier already reported.
+
+    Cleans up notify_seen/notify_watermark and clears price_snapshots itself
+    (rather than relying on a fixture) because neither table is ORM-mapped —
+    Base.metadata.drop_all in the ``session`` fixture never touches them, and
+    the ``engine`` fixture is session-scoped, so a run_migrations call from an
+    earlier test in this file would otherwise have already seeded notify_seen
+    and left the singleton row for ON CONFLICT DO NOTHING to protect.
+    """
+    with engine.begin() as tx:
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_seen")
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_watermark")
+        tx.exec_driver_sql("DELETE FROM price_snapshots")
+        tx.exec_driver_sql(
+            "INSERT INTO price_snapshots (id, scraped_at) VALUES "
+            "(101, now()), (102, now()), (103, now())"
+        )
+        tx.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS notify_watermark ("
+            "id integer PRIMARY KEY, last_snapshot_id bigint NOT NULL DEFAULT 0)"
+        )
+        tx.exec_driver_sql("INSERT INTO notify_watermark VALUES (1, 2)")
+    run_migrations(engine)
+    with engine.connect() as conn:
+        seed = conn.exec_driver_sql(
+            "SELECT last_seen_snapshot_id FROM notify_seen WHERE id = 1"
+        ).scalar()
+    assert seed == 2, "the watermark arm must win over max(price_snapshots.id)"
+
+
+def test_notify_seen_falls_back_to_max_snapshot_id_without_a_watermark(engine):
+    """A database 005 never reached must not report its whole history as unread."""
+    with engine.begin() as tx:
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_watermark")
+        tx.exec_driver_sql("DROP TABLE IF EXISTS notify_seen")
+        tx.exec_driver_sql("DELETE FROM price_snapshots")
+        tx.exec_driver_sql(
+            "INSERT INTO price_snapshots (id, scraped_at) VALUES "
+            "(5, now()), (6, now()), (7, now())"
+        )
+    run_migrations(engine)
+    with engine.connect() as conn:
+        assert conn.exec_driver_sql(
+            "SELECT last_seen_snapshot_id FROM notify_seen WHERE id = 1"
+        ).scalar() == 7
+
+
 def test_has_ddl_distinguishes_real_sql_from_a_comments_only_placeholder():
     """The switch init_db uses to choose between the migration and create_all."""
     assert _has_ddl("CREATE TABLE x (id serial);")
