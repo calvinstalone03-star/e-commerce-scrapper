@@ -1,6 +1,6 @@
 import 'server-only';
 
-import type { Sql } from '@/lib/notify/watermark';
+import type { Sql } from '@/lib/db';
 import { isExtremeGap } from '@/lib/queries';
 
 /**
@@ -31,10 +31,13 @@ import { isExtremeGap } from '@/lib/queries';
  *
  * No channel parameter, unlike `ourListings` in `queries.ts`. The dashboard
  * needs that split because the Shopee shop and the Tokopedia shop list the
- * same catalogue, and a channel screen must not blend their figures. A
- * per-product Telegram message asks a different question — are we priced
- * right on this set, anywhere — so the cheapest own listing wins regardless
- * of which of our shops carries it.
+ * same catalogue, and a channel screen must not blend their figures. This
+ * asks a different question — are we priced right on this set, anywhere — so
+ * the cheapest own listing wins regardless of which of our shops carries it.
+ *
+ * **No caller today.** Its one consumer was the per-product Telegram message,
+ * deleted with the rest of that path; what remains is this query, its test and
+ * the shape of an answer nothing currently asks for.
  */
 
 export type SetPosition = {

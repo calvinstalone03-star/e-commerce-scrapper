@@ -18,23 +18,25 @@ import type { RivalMove } from '@/lib/notify/rival-moves';
  * Pure: no database, no clock, no network. Everything that varies arrives as an
  * argument.
  *
- * What stayed behind in `format.ts` is everything that sized a Telegram
- * message — `MAX_ENTRIES_PER_GROUP`, `MAX_MESSAGES`, `escapeHtml`, and every
- * `render*`. A page has no 4,096-character limit and no 20-messages-a-minute
- * ceiling, so a cap on how many entries it prints would be a rule with no reason
- * behind it.
+ * Folding is all this does. The Telegram digest this was ported from also
+ * capped how many entries a group printed and how many messages a run could
+ * send, and escaped every string it emitted into HTML; none of that came with
+ * it. A page has no 4,096-character limit and no 20-messages-a-minute ceiling,
+ * so a cap on how many entries it prints would be a rule with no reason behind
+ * it, and React escapes what it renders.
  */
 
 /** Below this, listings that moved by the same amount are a coincidence. */
 export const FOLD_MOVE_MIN_GROUP = 3;
 
-// Named `FoldedMoveGroup`, not `FoldedGroup`: `format.ts` exports a
-// `FoldedGroup` of its own with an incompatible shape (`change`, not `move`).
-// `foldPriceChanges` was renamed to `foldRivalMoves` for exactly this reason —
-// two same-named exports with different types in one directory is a trap —
-// and a bare type import is the case most likely to fall into it, because the
-// type is what shows up in component props, not the function that produced
-// it. `format.ts` dies in a later task; until then both names stay distinct.
+// Named `FoldedMoveGroup`, not `FoldedGroup`, and `foldRivalMoves`, not
+// `foldPriceChanges`: `format.ts` exported both of those names with an
+// incompatible shape (`change`, not `move`) for as long as the two features
+// coexisted, and two same-named exports with different types in one directory
+// is a trap a bare type import falls into silently — the type is what shows up
+// in component props, not the function that produced it. `format.ts` is gone,
+// so the collision is too; the distinct names stay because they are the more
+// accurate ones for what this file returns.
 export type FoldedMoveGroup =
   | {
       kind: 'folded';

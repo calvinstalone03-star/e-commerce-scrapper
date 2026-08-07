@@ -28,7 +28,11 @@ export function proxy(request: NextRequest): NextResponse {
 }
 
 export const config = {
-  // Everything except Next's own assets and the notifier's trigger. The trigger
-  // is machine-to-machine and has no use for a path header.
-  matcher: ['/((?!_next/static|_next/image|favicon.ico|api/notify).*)'],
+  // Everything except Next's own assets.
+  //
+  // `api/notify` used to be excluded here as well — the notifier's trigger was
+  // machine-to-machine and had no use for a path header. That route is gone,
+  // and the exclusion goes with it rather than sitting here waiting for a path
+  // of that name to be reintroduced and silently skip this proxy.
+  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
 };

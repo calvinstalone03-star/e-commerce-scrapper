@@ -1,6 +1,7 @@
 import 'server-only';
 
 import postgres from 'postgres';
+import type { TransactionSql } from 'postgres';
 
 /**
  * Postgres access for the dashboard: read-only over everything it did not make.
@@ -13,8 +14,8 @@ import postgres from 'postgres';
  *
  * It does write, to exactly two tables, both of them its own and both still
  * created by a Python migration: `app_credentials` (`lib/auth.ts`, the login)
- * and `notify_watermark` (`lib/notify/watermark.ts`, where the notifier left
- * off). Neither is scraped data. That is the whole list.
+ * and `notify_seen` (`lib/notify/seen.ts`, how far the reader has read the
+ * notifications page). Neither is scraped data. That is the whole list.
  *
  * Raw SQL rather than an ORM for the same reason: an ORM here would mean a
  * second model definition to keep in step with `scraper/db.py`, for queries that
@@ -121,3 +122,13 @@ export const sql =
 if (process.env.NODE_ENV !== 'production') {
   globalThis.__ecomSql = sql;
 }
+
+/**
+ * The client, or a transaction handle over it. Both accept the same tags.
+ *
+ * Here rather than beside any one caller, because that is what it is: a fact
+ * about this module's export. It lived in `notify/watermark.ts` while the
+ * notifier was the only thing that took a transaction, and every query module
+ * that wants to run either inside `sql.begin` or on its own needs it.
+ */
+export type Sql = typeof sql | TransactionSql<Record<string, never>>;

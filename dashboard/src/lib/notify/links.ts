@@ -19,12 +19,13 @@ import type { RivalMove } from '@/lib/notify/rival-moves';
  * `set_code` by prefix (queries.ts:409), so a set number lands on exactly that
  * comparison.
  *
- * **A path, never an absolute URL.** The Telegram digest needed `https://…`
- * because a message is read outside the app, and it took a base URL, an
- * environment-variable fallback chain and a join helper to produce one. Every
- * link here is now an in-app `<Link>`, where an absolute URL would leave the
- * client router and reload the page — so all of that is gone rather than
- * unused.
+ * **A path, never an absolute URL.** Every link this builds is followed by an
+ * in-app `<Link>`, where an absolute URL would leave the client router and
+ * reload the page. The Telegram digest this was ported from needed the
+ * opposite — `https://…`, because a message is read outside the app — and it
+ * carried a base URL, an environment-variable fallback chain and a join helper
+ * to produce one. Those were deleted with it, so there is no absolute form of
+ * this function left to reach for by mistake.
  *
  * No `server-only` and no database access — pure string work, so the choices
  * here are testable without a Postgres.
