@@ -347,9 +347,17 @@ export async function rivalMoves(opts: RivalMovesOptions): Promise<RivalMove[]> 
  * so a `limit`/`offset` a caller happens to include rides along on the object
  * but is never read. The read marker advances to exactly this value; advancing
  * it to the maximum of a displayed page instead would jump the marker past rows
- * further down that same window and strand them as permanently unread. That is
- * only safe because the page always renders the full window regardless of read
- * state — nothing is hidden behind the marker for it to skip.
+ * further down that same window and strand them as permanently unread, because
+ * the feed is ordered by consequence and "what was shown" is therefore not a
+ * prefix of id order.
+ *
+ * Advancing over the complete window is also what turns the page's row cap into
+ * a real limit rather than a display one, and that is a cost rather than a
+ * defence. `(app)/notifications/page.tsx` prints the top `PAGE_LIMIT` rows and
+ * has no pager, so a row ranked past the cap is never rendered — and since the
+ * marker moved over the whole window anyway, `unreadRivalMoves` stops counting it
+ * too. The marker keeps its promise for every row the reader can reach; the cap
+ * is what decides which rows those are, and pagination is what would fix it.
  *
  * `null` when nothing in the window qualifies, which the caller must treat as
  * "leave the marker where it is". Not 0 — 0 is a legitimate starting marker,

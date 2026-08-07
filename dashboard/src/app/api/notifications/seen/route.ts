@@ -20,9 +20,13 @@ import { advanceSeen, readSeen } from '@/lib/notify/seen';
  * state, so a stranded row needs hand-written SQL to come back.
  *
  * `rivalMovesCeiling` answers over the complete window — no limit, no offset, no
- * user filter — and that is only safe because the page renders the complete
- * window too. Nothing is hidden behind the marker for it to skip; the marker
- * decides styling, never membership.
+ * user filter — because the marker decides styling, never membership: nothing is
+ * hidden *behind the marker* for it to skip. The one thing it does skip is what
+ * the page's row cap left off: `(app)/notifications/page.tsx` renders the window's
+ * top 200 and has no pager, so a row ranked past that is marked read here without
+ * having been shown. That is the cap's cost, documented at `PAGE_LIMIT`, and the
+ * alternative — a ceiling taken from the rendered page — is the worse trade
+ * measured above.
  *
  * **POST, and no GET.** Next answers 405 for a method a route module does not
  * export, which is the enforcement. A GET here would fire on a link prefetch and

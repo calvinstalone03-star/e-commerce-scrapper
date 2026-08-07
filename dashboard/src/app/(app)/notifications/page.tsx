@@ -51,13 +51,18 @@ const DEFAULT_TAB: Tab = 'semua';
 /**
  * How many rows are printed at once.
  *
- * A cap and no pager, which is safe here for one specific reason: the marker
- * advances over the **complete** window (`rivalMovesCeiling`), never over what
- * was rendered, so a row below the cap is hidden from this render but is not
- * stranded — it is still in the window tomorrow, still counted by the bell, and
- * still above the marker. The cap only bounds a page that the design expects to
- * reach "hundreds and growing" once the daily sweep covers the catalogue; today
- * the whole window is 56 rows.
+ * A cap and no pager, and it is a **real** limit rather than a display detail.
+ * The marker advances over the complete window (`rivalMovesCeiling`), never over
+ * what was rendered — which is what keeps it moving forward through a list
+ * ordered by consequence, but it also means a row ranked past this cap is both
+ * unrendered *and* no longer counted as new once the page has been opened. There
+ * is no second page to reach it from, so it comes back only when enough rows
+ * above it age out of the 14-day window.
+ *
+ * That trade is survivable at today's size and not beyond it: the whole window
+ * is 56 rows, so the cap does not bind at all yet. It starts costing real rows
+ * when the design's expected "hundreds and growing" arrives with the daily sweep
+ * over the catalogue. Pagination is the fix, and it is not built.
  */
 const PAGE_LIMIT = 200;
 
@@ -175,10 +180,12 @@ export default async function NotificationsPage({
                 markSeen
               />
               {truncated ? (
-                <p className="text-xs text-muted">
-                  Menampilkan {PAGE_LIMIT} teratas. Sisanya tetap ada di jendela 14 hari dan tetap
-                  dihitung lonceng — penanda baca maju ke seluruh jendela, bukan ke yang tampil, jadi
-                  tidak ada baris yang hilang karena batas ini.
+                <p className="rounded-md border border-line bg-surface-muted px-3 py-2 text-xs text-muted">
+                  Menampilkan {PAGE_LIMIT} teratas; sisanya tidak ditampilkan dan belum ada halaman
+                  berikutnya. Membuka halaman ini juga memajukan penanda baca ke{' '}
+                  <em>seluruh</em> jendela 14 hari, bukan hanya ke yang tampil, jadi sisanya berhenti
+                  dihitung sebagai baru meski belum pernah terlihat. Batas ini benar-benar membatasi:
+                  baris di bawahnya baru muncul lagi kalau yang di atasnya keluar dari jendela.
                 </p>
               ) : null}
             </>

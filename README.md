@@ -680,8 +680,15 @@ built around. A marker that filtered could only ever be read once: one glance on
 a phone would erase a 56-row worklist that then existed nowhere. It decides
 which rows are styled as new and what the bell counts, and nothing else. Opening
 the page advances it (`POST /api/notifications/seen`) to the top of the window
-rather than to the last row rendered, so a row below the display cap is not
-stranded — it is still in the window tomorrow.
+rather than to the last row rendered, which is the only way it moves forward
+through a list ordered by consequence instead of by id.
+
+That has a cost, and it lands on the **display cap**. The page prints the top 200
+rows and has no next page, so a row ranked below that is not shown — and because
+the marker advanced over the whole window regardless, it stops counting as new
+too. The cap is a real limit, not a display detail: such a row reappears only
+once enough rows above it age out of the 14-day window. Today the window is 56
+rows, so nothing is being lost; pagination is what fixes it when that changes.
 
 A row qualifies when a rival's price moved by at least **5%** against a
 comparison snapshot **at least 24 hours and at most 7 days** older. Rows where
