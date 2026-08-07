@@ -1,10 +1,11 @@
 -- Superseded by 006_notify_seen.sql on 2026-08-07.
 --
 -- This file created notify_watermark for the Telegram notifier, which no longer
--- exists. Its statements are removed rather than the file, because 006 seeds
--- from notify_watermark when it is present and this directory is re-run whole
--- on every initdb — leaving the CREATE here would resurrect the table after 006
--- had read it.
+-- exists. Its statements are removed rather than the file, because this
+-- directory is re-run whole on every initdb: leaving the CREATE here would
+-- take an ACCESS EXCLUSIVE lock on a remote database for a table nothing uses,
+-- on every single pass, and a resurrected table would permanently fight the
+-- deferred DROP below.
 --
 -- The table itself is dropped in a later migration, once the seed has been
 -- confirmed correct on both databases.

@@ -27,6 +27,7 @@ from sqlalchemy.exc import OperationalError
 
 from scraper.db import Base, get_engine, init_db
 from scraper.sync import (
+    OWNED_BY_TARGET,
     SCRAPED_TABLES,
     mirror,
     natural_keys,
@@ -71,10 +72,18 @@ def target_engine():
 
 
 def _reset(engine, url: str) -> None:
-    """Drop everything, including the tables the migrations own, and rebuild."""
+    """Drop everything, including the tables the migrations own, and rebuild.
+
+    ``notify_watermark`` is included even though nothing in this file creates
+    it: ``test_store.py``'s watermark-seeding test builds one on the same
+    database (the ``engine`` fixture there is session-scoped, same as this
+    module's), and dropping it here as well as on that test's own exit means
+    an ordering change or a ``-k`` selection can never leave it behind for a
+    later ``run_migrations`` to trip over.
+    """
     Base.metadata.drop_all(engine)
     with engine.begin() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS app_credentials, notify_seen"))
+        conn.execute(text("DROP TABLE IF EXISTS app_credentials, notify_seen, notify_watermark"))
     init_db(url)
 
 
@@ -154,8 +163,20 @@ def test_mirror_replaces_what_the_target_held(databases) -> None:
     assert natural_keys(target, "products") == {("shopee", 7001)}
 
 
+def test_owned_by_target_and_scraped_tables_do_not_overlap() -> None:
+    """OWNED_BY_TARGET is otherwise decorative — grep finds no other reader of it.
+
+    The mirror's actual protection is that these tables are absent from
+    SCRAPED_TABLES, so TRUNCATE and the batched inserts never reach them. This
+    pins the constant to that invariant, so a future edit that adds one of
+    these names to SCRAPED_TABLES fails loudly here instead of only in
+    production.
+    """
+    assert OWNED_BY_TARGET.isdisjoint(SCRAPED_TABLES)
+
+
 def test_mirror_leaves_the_targets_own_tables_alone(databases) -> None:
-    """A deployment's login is deliberately not the laptop's."""
+    """A deployment's login is deliberately not the laptop's — nor is its read marker."""
     source, target = databases
     seed(source)
     with target.begin() as conn:
@@ -166,12 +187,24 @@ def test_mirror_leaves_the_targets_own_tables_alone(databases) -> None:
                 "ON CONFLICT (id) DO UPDATE SET hash = EXCLUDED.hash"
             )
         )
+        conn.execute(
+            text(
+                "INSERT INTO notify_seen (id, last_seen_snapshot_id, updated_at) "
+                "VALUES (1, 777, now()) "
+                "ON CONFLICT (id) DO UPDATE SET "
+                "last_seen_snapshot_id = EXCLUDED.last_seen_snapshot_id"
+            )
+        )
 
     mirror(source, target)
 
     with target.connect() as conn:
         row = conn.execute(text("SELECT username, hash FROM app_credentials")).one()
+        seen = conn.execute(
+            text("SELECT last_seen_snapshot_id FROM notify_seen WHERE id = 1")
+        ).scalar()
     assert row.hash == "not-the-laptops-hash"
+    assert seen == 777, "mirror must not touch notify_seen — that is reseed_seen's job"
 
 
 def test_mirror_advances_the_sequences_past_the_copied_ids(databases) -> None:

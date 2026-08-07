@@ -70,8 +70,9 @@ SCRAPED_TABLES: tuple[str, ...] = (
     "scrape_runs",
 )
 
-#: Tables the target owns and this never writes. The dashboard makes both
-#: (``lib/auth.ts``, ``migrations/006_notify_seen.sql``), and a deployment's
+#: Tables the target owns and this never writes. ``app_credentials`` is the
+#: dashboard's, made by its ``lib/auth.ts``; ``notify_seen`` is this repo's,
+#: made by ``migrations/006_notify_seen.sql``. Either way, a deployment's
 #: login is not meant to be the laptop's.
 OWNED_BY_TARGET: frozenset[str] = frozenset({"app_credentials", "notify_seen"})
 
