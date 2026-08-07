@@ -28,12 +28,22 @@ importScripts('sites.js');
 const ENDPOINT_KEY = 'endpoint';
 const TOKEN_KEY = 'token';
 const PREFS_KEY = 'prefs';
+//: Which database the ingest server files this run into: 'local' (Postgres on
+//: the laptop) or 'neon' (the hosted one the deployed dashboard reads). Its own
+//: storage key rather than a field in PREFS_KEY, because starting a job
+//: overwrites that whole object and would take the choice with it.
+const DESTINATION_KEY = 'destination';
+const DEFAULT_DESTINATION = 'local';
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787';
 
-//: How many products a job collects when the user does not say. One search page
-//: is 60-ish cards on both sites, so this is "about one page" and keeps the
-//: default behaviour close to what the button used to do.
-const DEFAULT_TARGET = 60;
+//: How many products a job collects when the user does not say. Sized to a
+//: whole storefront rather than to one page: the largest shop tracked here
+//: holds ~1600 products, so a run that is not told otherwise walks the
+//: catalogue and stops when the shop runs out — which is what both the daily
+//: sweep and a hand-started shop run want. A page-sized default (60) meant
+//: every such run had to retype the number first, and the number box is the one
+//: control that is awkward to fill without a keyboard.
+const DEFAULT_TARGET = 2_000;
 
 //: Hard ceiling on pages per job, whatever the target. It exists so a bad stop
 //: condition cannot turn a click into an unbounded crawl — not to decide how
@@ -58,10 +68,11 @@ const PAGE_JITTER_MS = 1_500;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function getConfig() {
-  const stored = await chrome.storage.local.get([ENDPOINT_KEY, TOKEN_KEY]);
+  const stored = await chrome.storage.local.get([ENDPOINT_KEY, TOKEN_KEY, DESTINATION_KEY]);
   return {
     endpoint: stored[ENDPOINT_KEY] || DEFAULT_ENDPOINT,
     token: stored[TOKEN_KEY] || '',
+    destination: stored[DESTINATION_KEY] === 'neon' ? 'neon' : DEFAULT_DESTINATION,
   };
 }
 
@@ -71,6 +82,10 @@ async function getPrefs() {
   return {
     target: Number(prefs.target) > 0 ? Number(prefs.target) : DEFAULT_TARGET,
     shop: typeof prefs.shop === 'string' ? prefs.shop : '',
+    // Remembered like the other two, and for the same reason: someone who
+    // walks twenty storefronts looking for the same word should type it once,
+    // not twenty times. The tab still wins when it names a search of its own.
+    keyword: typeof prefs.keyword === 'string' ? prefs.keyword : '',
   };
 }
 
@@ -93,6 +108,10 @@ function newJob(keyword, target, mode, shopInput) {
     //            filter on the product name rather than trusted to the site.
     // 'page'   — whatever the tab already shows.
     mode,
+    // Which database this run files into. Set by the 'start' handler from the
+    // stored choice and never re-read, so the toggle cannot move a run that is
+    // already under way.
+    destination: DEFAULT_DESTINATION,
     keyword,
     shopInput: shopInput || null,
     slug: null, // the storefront that actually answered
@@ -291,14 +310,23 @@ function matchesKeyword(name, tokens) {
 }
 
 async function postItems(page, items) {
-  const { endpoint, token } = await getConfig();
+  const { endpoint, token, destination } = await getConfig();
   if (!token) return { ok: false, error: 'belum ada token ingest — buka pengaturan dan tempel token' };
+
+  // The running job's destination, not the stored one: switching the toggle
+  // mid-walk must not split one run across two databases, which would leave
+  // both holding half a shop and neither able to say so.
+  const target = job?.destination || destination;
 
   let response;
   try {
     response = await fetch(`${endpoint}/ingest-dom`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': token },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Ingest-Token': token,
+        'X-Ingest-Target': target,
+      },
       body: JSON.stringify({
         marketplace: page.marketplace,
         pageUrl: page.pageUrl,
@@ -315,6 +343,13 @@ async function postItems(page, items) {
   }
 
   if (response.status === 401) return { ok: false, error: 'token ingest ditolak' };
+  // 503 is the server saying the chosen database is not configured, and it says
+  // which variable is missing. Passing that through beats "HTTP 503", which
+  // would send the user looking at the network.
+  if (response.status === 503) {
+    const detail = await response.json().then((body) => body?.detail).catch(() => null);
+    return { ok: false, error: detail || `tujuan "${target}" belum dikonfigurasi di server` };
+  }
   if (!response.ok) return { ok: false, error: `server menjawab HTTP ${response.status}` };
 
   const body = await response.json().catch(() => ({}));
@@ -939,9 +974,14 @@ async function startJob({ keyword, shop, target }, resume = null) {
   const wanted = Number(target);
   const capped = Number.isFinite(wanted) && wanted > 0 ? Math.min(Math.floor(wanted), 5_000) : DEFAULT_TARGET;
 
-  await chrome.storage.local.set({ [PREFS_KEY]: { target: capped, shop: shopInput } });
+  await chrome.storage.local.set({
+    [PREFS_KEY]: { target: capped, shop: shopInput, keyword: typed },
+  });
 
   job = newJob(term, mode === 'page' ? Number.MAX_SAFE_INTEGER : capped, mode, shopInput);
+  // Fixed for the life of the run, and shown in the popup while it walks: a
+  // half-hour catalogue job must end up in the database it started in.
+  job.destination = (await getConfig()).destination;
   if (resume) {
     // Carry the counts across so the popup keeps reporting the run, not the
     // fragment of it that happens to be running now.
@@ -1018,8 +1058,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'context') {
     (async () => {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      const { endpoint, token } = await getConfig();
+      const { endpoint, token, destination } = await getConfig();
       const prefs = await getPrefs();
+      // A run under way owns the destination: showing the stored one next to
+      // its progress would name a database the run is not writing to.
+      const showing = job?.running ? job.destination : destination;
 
       let site = null;
       try {
@@ -1028,10 +1071,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         /* not a URL we recognise */
       }
 
+      // Counted in the database the popup is showing, not always the laptop's:
+      // "18,256 produk" under a Neon destination would be the wrong answer to
+      // the only question these totals exist to answer.
       let stats = null;
       try {
         const response = await fetch(`${endpoint}/stats`, {
-          headers: { 'X-Ingest-Token': token },
+          headers: { 'X-Ingest-Token': token, 'X-Ingest-Target': showing },
         });
         if (response.ok) stats = await response.json();
       } catch (err) {
@@ -1043,9 +1089,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       // process that predates it keeps filing the rows the fix was meant to
       // stop — twice now, and both times it looked like the fix had failed.
       let stale = false;
+      // Which destinations the server can actually write to. Offering a Neon
+      // button on a server with no NEON_DATABASE_URL would turn a click into a
+      // failed scrape instead of a disabled control.
+      let targets = { local: true, neon: false };
       try {
         const response = await fetch(`${endpoint}/health`);
-        if (response.ok) stale = Boolean((await response.json()).stale);
+        if (response.ok) {
+          const health = await response.json();
+          stale = Boolean(health.stale);
+          if (health.targets) targets = health.targets;
+        }
       } catch (err) {
         /* server down; already reported through `stats` */
       }
@@ -1069,9 +1123,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         endpoint,
         hasToken: Boolean(token),
         marketplace: site ? site.label : null,
-        keyword: globalThis.ecomKeywordFromUrl(tab?.url || ''),
+        // The tab first — a search the user is looking at is what they mean —
+        // then the last word they searched for. Same shape as `shop` below.
+        keyword: globalThis.ecomKeywordFromUrl(tab?.url || '') || prefs.keyword,
         shop: shopFromTab || prefs.shop,
         target: prefs.target,
+        destination: showing,
+        targets,
         stats,
         stale,
         job: snapshot(),

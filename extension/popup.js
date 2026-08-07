@@ -13,6 +13,10 @@
 
 const $ = (id) => document.getElementById(id);
 
+//: Labels for the two destinations, used in the totals caption. The buttons
+//: carry their own text; this is the prose version.
+const DESTINATION_LABEL = { local: 'lokal', neon: 'Neon' };
+
 let running = false;
 
 function setResult(text, kind = 'muted') {
@@ -26,6 +30,9 @@ function renderJob(job) {
   $('scrape').textContent = running ? 'Batal' : 'Mulai scrape';
   $('scrape').classList.toggle('stop', running);
   for (const id of ['keyword', 'shop', 'target']) $(id).disabled = running;
+  // Locked while a job runs, because the job's destination is fixed at its
+  // start: a control that moved but changed nothing would be a lie.
+  for (const id of ['dlocal', 'dneon']) $(id).disabled = running || $(id).dataset.off === '1';
 
   if (!job) {
     $('progress').classList.remove('on');
@@ -73,6 +80,29 @@ function renderJob(job) {
   setResult(parts.join(' · '), job.cancelled ? 'muted' : 'ok');
 }
 
+// Which database this run files into, and which one the totals below are
+// counted in. Availability comes from the server rather than from a guess here:
+// the Neon destination exists only when the ingest server has NEON_DATABASE_URL,
+// and a button that accepted the click and then failed the scrape would be worse
+// than one that is visibly off.
+function renderDestination(context) {
+  const chosen = context.destination || 'local';
+  const available = context.targets || { local: true, neon: false };
+
+  for (const [id, name] of [['dlocal', 'local'], ['dneon', 'neon']]) {
+    const button = $(id);
+    const off = available[name] === false;
+    button.classList.toggle('on', chosen === name);
+    button.dataset.off = off ? '1' : '0';
+    button.disabled = off || running;
+    button.title = off
+      ? 'server ingest belum punya NEON_DATABASE_URL di .env'
+      : `simpan hasil scrape ke database ${DESTINATION_LABEL[name]}`;
+  }
+
+  $('tlabel').textContent = `isi database ${DESTINATION_LABEL[chosen] || chosen}`;
+}
+
 async function refresh() {
   const context = await chrome.runtime.sendMessage({ type: 'context' });
   if (!context) return;
@@ -95,6 +125,8 @@ async function refresh() {
     if (!$('shop').value) $('shop').value = context.shop || '';
     $('target').value = context.target;
   }
+
+  renderDestination(context);
 
   $('endpoint').value = context.endpoint;
   $('token').placeholder = context.hasToken
@@ -179,6 +211,16 @@ $('rgo').addEventListener('click', async () => {
   const answer = await chrome.runtime.sendMessage({ type: 'resume' });
   if (!answer?.ok) setResult(answer?.error || 'gagal melanjutkan', 'bad');
 });
+
+// Switching destination re-reads the totals, because they are counted in the
+// database that was just chosen — the fastest way to see that the two differ.
+for (const id of ['dlocal', 'dneon']) {
+  $(id).addEventListener('click', async () => {
+    if (running) return;
+    await chrome.storage.local.set({ destination: $(id).dataset.destination });
+    refresh();
+  });
+}
 
 $('gear').addEventListener('click', () => {
   $('settings').classList.toggle('open');
