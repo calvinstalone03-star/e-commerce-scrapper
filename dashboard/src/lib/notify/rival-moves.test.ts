@@ -19,9 +19,9 @@ import {
  *
  * **Everything is anchored on `now()`, not on a calendar date.** The query's
  * freshness predicate is `scraped_at > now() - windowDays`, so a fixture pinned
- * to a fixed `BASE` the way `positions.test.ts` pins its own would silently age
- * out of the window and this suite would start failing on its own, on a date
- * nobody chose, with no code change to blame.
+ * to a fixed calendar constant — which is what a query with no time window can
+ * afford — would silently age out of that window, and this suite would start
+ * failing on its own, on a date nobody chose, with no code change to blame.
  *
  * **The moving listing's newer capture sits 30 hours in the past**, not at
  * `now()`. A later unchanged capture has to land *after* it and still be in the

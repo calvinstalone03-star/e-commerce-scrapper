@@ -59,13 +59,14 @@ import { sql } from '@/lib/db';
  * probes the same index once per own listing, 2,530 times, each an index scan
  * plus a 25kB incremental sort to break a `scraped_at` tie by id.
  *
- * The scoping CTEs are `MATERIALIZED` for the same reason as in `positions.ts`:
- * narrowing to the products that can possibly matter before `price_snapshots`
- * is touched at all. Note what the freshness predicate is not doing yet — every
- * snapshot in this database is currently inside the 14-day window, so it removes
- * nothing and the driving scan is the whole table. That is the cheap plan at
- * this size, and the predicate is what will keep the plan bounded rather than
- * the table when it is not.
+ * The scoping CTEs are `MATERIALIZED` so that the narrowing is done before
+ * `price_snapshots` is touched at all: `own_sets` and `rival_listings` settle
+ * which products can possibly matter, and the LATERALs then only ever walk
+ * those products' history. Note what the freshness predicate is not doing yet:
+ * every snapshot in this database is currently inside the 14-day window, so it
+ * removes nothing and the driving scan is the whole table. That is the cheap
+ * plan at this size, and the predicate is what will keep the plan bounded
+ * rather than the table when it is not.
  *
  * **Money is a string end to end.** `price` is a Postgres NUMERIC and snapshot
  * ids are bigint; both arrive from postgres.js as strings and stay strings.
@@ -256,6 +257,12 @@ function qualifyingMoves({ gapHours, threshold, windowDays, maxLookbackDays }: R
           -- datum out of consideration entirely, instead of turning the
           -- division into a NULL that some later predicate has to remember to
           -- handle.
+          --
+          -- The id tiebreak matches the our_price LATERAL above. Nothing in the
+          -- live data ties on (product_ref, scraped_at) today, but rivalMoves
+          -- and rivalMovesCeiling are separate queries over this same fragment:
+          -- an undetermined pick could hand them different predecessors for one
+          -- snapshot, and the two would then disagree about whether it moved 5%.
           SELECT o.price, o.scraped_at
             FROM price_snapshots o
            WHERE o.product_ref = ps.product_ref
@@ -263,7 +270,7 @@ function qualifyingMoves({ gapHours, threshold, windowDays, maxLookbackDays }: R
              AND o.price > 0
              AND o.scraped_at <= ps.scraped_at - make_interval(hours => ${gapHours})
              AND o.scraped_at >= ps.scraped_at - make_interval(days => ${maxLookbackDays})
-           ORDER BY o.scraped_at DESC
+           ORDER BY o.scraped_at DESC, o.id DESC
            LIMIT 1
         ) older
        WHERE ps.price IS NOT NULL
