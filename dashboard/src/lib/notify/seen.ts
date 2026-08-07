@@ -37,7 +37,8 @@ const MISSING_ROW =
   '(`ecom-scraper initdb`).';
 
 /**
- * Where the reader has got, clamped to what the database can actually show.
+ * Where the reader has got, clamped to what the database can actually show —
+ * and whether that clamp fired.
  *
  * The clamp is not defensive tidiness, it is the state after `scraper/sync.py`
  * mirrors into this database: `mirror` TRUNCATEs the target and copies ids
@@ -53,21 +54,37 @@ const MISSING_ROW =
  * `price_snapshots` gives 0, which is right for the same reason: there is
  * nothing above it to be unread.
  *
+ * `COALESCE(..., 0)` on that `max(id)` is load-bearing, not decoration: a
+ * database with no rows in `price_snapshots` — freshly migrated, or caught in
+ * the window inside `sync.py mirror` between the TRUNCATE and the copy — makes
+ * the subquery NULL. `LEAST` and `GREATEST` in Postgres *ignore* a NULL
+ * argument rather than propagating it (unlike a plain comparison), so without
+ * the `COALESCE` the clamp does not fail loud, it fails silent: `LEAST(marker,
+ * NULL)` returns `marker` untouched, so a marker left over from a truncated
+ * table passes straight through instead of being capped to 0, and `clamped`
+ * — a plain `>` against that same NULL — comes back SQL NULL rather than a
+ * usable boolean.
+ *
+ * The caller gets both halves of what happened, because a clamped id alone
+ * looks identical to a reader who is legitimately caught up — the page has to
+ * say so rather than silently rendering as if nothing were wrong.
+ *
  * Read-only, deliberately. The stored marker is left where it is rather than
  * corrected in place, because this runs on every page load and a read that
  * writes is a read that can deadlock with the POST that advances it.
  */
-export async function readSeen(): Promise<string> {
-  const [row] = await sql<{ last_seen_snapshot_id: string }[]>`
-    SELECT LEAST(
-             s.last_seen_snapshot_id,
-             COALESCE((SELECT max(id) FROM price_snapshots), 0)
-           ) AS last_seen_snapshot_id
-      FROM notify_seen s
+export async function readSeen(): Promise<{ id: string; clamped: boolean }> {
+  const [row] = await sql<{ id: string; clamped: boolean }[]>`
+      WITH capped AS (
+        SELECT COALESCE((SELECT max(id) FROM price_snapshots), 0) AS max_id
+      )
+    SELECT LEAST(s.last_seen_snapshot_id, capped.max_id)    AS id,
+           s.last_seen_snapshot_id > capped.max_id          AS clamped
+      FROM notify_seen s, capped
      WHERE s.id = 1`;
 
   if (!row) throw new Error(MISSING_ROW);
-  return String(row.last_seen_snapshot_id);
+  return { id: String(row.id), clamped: row.clamped };
 }
 
 /**
@@ -78,6 +95,15 @@ export async function readSeen(): Promise<string> {
  * The whole guarantee is in that one function — it makes the write idempotent
  * and order-independent, so no lock and no read-modify-write is needed around
  * it.
+ *
+ * That no-lock argument rests on this running as a single autocommit
+ * statement: under READ COMMITTED, a blocked UPDATE re-reads the just-committed
+ * tuple and re-evaluates its `SET` expression, so `GREATEST` sees the winner's
+ * value rather than the one it started against. Wrap this call in a
+ * REPEATABLE READ or SERIALIZABLE transaction alongside other work and that
+ * stops being true — two simultaneous tabs would get a 40001 serialization
+ * error instead of converging. Keep it a single statement, or repeat this
+ * reasoning for whatever isolation level replaces it.
  *
  * It returns the resulting marker rather than the id it was handed, because
  * those differ in exactly the case the `GREATEST` exists for, and the caller

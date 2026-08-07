@@ -81,14 +81,50 @@ describe('the read marker', () => {
   test('advance is monotonic', async () => {
     await advanceSeen('500');
     await advanceSeen('300');
-    expect(await readSeen()).toBe('500');
+    const { id, clamped } = await readSeen();
+    expect(id).toBe('500');
+    // The marker (500) sits well under MAX_SEEDED (1000): nothing here should
+    // trip the clamp this suite otherwise exists to catch.
+    expect(clamped).toBe(false);
   });
 
-  test('a marker above max(id) is clamped on read', async () => {
+  test('a marker above max(id) is clamped on read, and readSeen says so', async () => {
     // The state after a destructive mirror: sync TRUNCATEs and copies ids
     // verbatim, so the target's max(id) can fall below its own marker.
     await sql`UPDATE notify_seen SET last_seen_snapshot_id = 999999 WHERE id = 1`;
-    expect(await readSeen()).toBe(String(await maxSnapshotId()));
+    const { id, clamped } = await readSeen();
+    expect(id).toBe(String(await maxSnapshotId()));
+    // The id alone can't tell a caught-up reader from a clamped one — a
+    // legitimately caught-up reader also gets back max(id). Without this flag
+    // the page has nothing to say and drops the spec requirement silently.
+    expect(clamped).toBe(true);
+  });
+
+  test('an empty price_snapshots table still clamps, to 0', async () => {
+    // Reachable two ways: a freshly migrated database that has never been
+    // scraped, and the window inside `sync.py mirror` between its TRUNCATE and
+    // its copy. max(id) is NULL there; without COALESCE(..., 0) Postgres's
+    // NULL-ignoring LEAST/GREATEST let the marker pass straight through
+    // unclamped instead of capping it to 0 — the read marker for a table with
+    // nothing in it.
+    await advanceSeen('500');
+    await sql`TRUNCATE price_snapshots`;
+    const { id, clamped } = await readSeen();
+    expect(id).toBe('0');
+    expect(clamped).toBe(true);
+  });
+
+  test('reading does not write the clamp back', async () => {
+    // seen.ts is explicit that this must stay read-only: it runs on every page
+    // load, and a read that writes is a read that can deadlock with the POST
+    // that advances the marker.
+    await sql`UPDATE notify_seen SET last_seen_snapshot_id = 999999 WHERE id = 1`;
+    const before = await sql`SELECT last_seen_snapshot_id, updated_at FROM notify_seen WHERE id = 1`;
+
+    await readSeen();
+
+    const after = await sql`SELECT last_seen_snapshot_id, updated_at FROM notify_seen WHERE id = 1`;
+    expect(after[0]).toEqual(before[0]);
   });
 
   test('a missing row is an error, not a silent zero', async () => {

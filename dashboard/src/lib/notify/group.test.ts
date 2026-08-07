@@ -35,6 +35,12 @@ describe('foldRivalMoves', () => {
     const folded = foldRivalMoves(moves);
     expect(folded).toHaveLength(1);
     expect(folded[0]).toMatchObject({ kind: 'folded', delta: 25000, username: 'lego.indonesia' });
+    // The whole point of folding is reversibility — the page renders
+    // `members.length` and expands the group from it, so every member has to
+    // survive the fold, not just the first.
+    const entry = folded[0];
+    if (entry.kind !== 'folded') throw new Error('expected a folded entry');
+    expect(entry.members.map((m) => m.productId)).toEqual([1, 2, 3]);
   });
 
   test('leaves two identical deltas alone — a coincidence is not a pattern', () => {

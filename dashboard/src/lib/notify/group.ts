@@ -26,9 +26,16 @@ import type { RivalMove } from '@/lib/notify/rival-moves';
  */
 
 /** Below this, listings that moved by the same amount are a coincidence. */
-export const FOLD_MIN_GROUP = 3;
+export const FOLD_MOVE_MIN_GROUP = 3;
 
-export type FoldedGroup =
+// Named `FoldedMoveGroup`, not `FoldedGroup`: `format.ts` exports a
+// `FoldedGroup` of its own with an incompatible shape (`change`, not `move`).
+// `foldPriceChanges` was renamed to `foldRivalMoves` for exactly this reason —
+// two same-named exports with different types in one directory is a trap —
+// and a bare type import is the case most likely to fall into it, because the
+// type is what shows up in component props, not the function that produced
+// it. `format.ts` dies in a later task; until then both names stay distinct.
+export type FoldedMoveGroup =
   | {
       kind: 'folded';
       username: string | null;
@@ -86,7 +93,7 @@ function magnitude(move: RivalMove): number {
  * each other, and the alternative — one key per row — would only mean they never
  * fold at all.
  */
-export function foldRivalMoves(moves: RivalMove[]): FoldedGroup[] {
+export function foldRivalMoves(moves: RivalMove[]): FoldedMoveGroup[] {
   const groups = new Map<string, RivalMove[]>();
   for (const move of moves) {
     const key = `${move.storeId ?? 'null'}|${delta(move)}`;
@@ -95,9 +102,9 @@ export function foldRivalMoves(moves: RivalMove[]): FoldedGroup[] {
     else groups.set(key, [move]);
   }
 
-  const folded: FoldedGroup[] = [];
+  const folded: FoldedMoveGroup[] = [];
   for (const members of groups.values()) {
-    if (members.length >= FOLD_MIN_GROUP) {
+    if (members.length >= FOLD_MOVE_MIN_GROUP) {
       folded.push({
         kind: 'folded',
         username: members[0].username,
@@ -112,7 +119,7 @@ export function foldRivalMoves(moves: RivalMove[]): FoldedGroup[] {
 
   // Biggest proportional move first, whether folded or not: a listing that moved
   // 66,7% deserves to be read before one that moved 1,3%.
-  const weight = (entry: FoldedGroup): number =>
+  const weight = (entry: FoldedMoveGroup): number =>
     magnitude(entry.kind === 'folded' ? entry.members[0] : entry.move);
 
   return folded.sort((left, right) => weight(right) - weight(left));
