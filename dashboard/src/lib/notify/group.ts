@@ -166,6 +166,47 @@ export function groupUndercutsUs(entry: FoldedMoveGroup): boolean | null {
  * is exactly what this page exists to show one at a time.
  */
 export function foldByConsequence(moves: RivalMove[]): FoldedMoveGroup[] {
+  return foldPartitioned(moves);
+}
+
+/**
+ * Fold, then order newest capture first.
+ *
+ * The page's question changed once a daily sweep started refilling the
+ * database: with stores walked one after another over an afternoon, "which of
+ * these numbers is current?" comes before "which matters most?", and a
+ * consequence-ordered page answers the second while hiding the first — an
+ * undercut priced from a week-old capture outranks the reprice the sweep found
+ * ten minutes ago, and nothing on the page says which is which except a
+ * timestamp the reader has to hunt for.
+ *
+ * Partitioning by undercut state still happens, so this keeps what that was
+ * for: every folded group stays homogeneous, `groupUndercutsUs` can read the
+ * answer off any member, and no group headline claims something false about
+ * half its rows. Only the ordering of the finished groups changes — by their
+ * newest member's capture, then by magnitude where two groups were captured in
+ * the same instant.
+ *
+ * The undercut signal is not lost, it moves: it is a badge on every row rather
+ * than a position on the page.
+ */
+export function foldByRecency(moves: RivalMove[]): FoldedMoveGroup[] {
+  const captured = (entry: FoldedMoveGroup): number => {
+    const members = entry.kind === 'folded' ? entry.members : [entry.move];
+    // The newest capture in the group: a fold stands for the moment its news
+    // was last confirmed, not the moment the oldest member was taken.
+    return Math.max(...members.map((move) => new Date(move.scrapedAt).getTime()));
+  };
+  const weight = (entry: FoldedMoveGroup): number =>
+    magnitude(entry.kind === 'folded' ? entry.members[0] : entry.move);
+
+  return foldPartitioned(moves).sort(
+    (left, right) => captured(right) - captured(left) || weight(right) - weight(left),
+  );
+}
+
+/** Fold within each undercut partition, so no group straddles one. */
+function foldPartitioned(moves: RivalMove[]): FoldedMoveGroup[] {
   // `true`, then `false`, then `null` — the same `DESC NULLS LAST` the query
   // orders by. An unknown is not evidence that we are safe, so it goes last
   // rather than being treated as a `false`.

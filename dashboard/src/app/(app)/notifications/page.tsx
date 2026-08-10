@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { EmptyState } from '@/components/EmptyState';
 import { NotificationsList } from '@/components/NotificationsList';
 import { Card, CardContent, cn } from '@/components/ui';
-import { foldByConsequence } from '@/lib/notify/group';
+import { foldByRecency } from '@/lib/notify/group';
 import { BADGE_CAP, DEFAULT_WINDOW, rivalMoves, unreadRivalMoves } from '@/lib/notify/rival-moves';
 import { readSeen } from '@/lib/notify/seen';
 import { getOwnShops } from '@/lib/queries';
@@ -68,11 +68,16 @@ const DEFAULT_TAB: Tab = 'semua';
  *
  * A cap and no pager, and it is a **real** limit rather than a display detail.
  * The marker advances over the complete window (`rivalMovesCeiling`), never over
- * what was rendered — which is what keeps it moving forward through a list
- * ordered by consequence, but it also means a row ranked past this cap is both
- * unrendered *and* no longer counted as new once the page has been opened. There
- * is no second page to reach it from, so it comes back only when enough rows
- * above it age out of the 14-day window.
+ * what was rendered — which is what keeps it moving forward through a list whose
+ * order is not the marker's, but it also means a row ranked past this cap is
+ * both unrendered *and* no longer counted as new once the page has been opened.
+ * There is no second page to reach it from, so it comes back only when enough
+ * rows above it age out of the 14-day window.
+ *
+ * The cap binds differently now that the list leads with the newest capture: it
+ * cuts the oldest rows rather than the least consequential, so what a big sweep
+ * pushes past the edge is last week's news rather than this week's smallest
+ * moves.
  *
  * That trade is survivable at today's size and not beyond it: the whole window
  * is 56 rows, so the cap does not bind at all yet. It starts costing real rows
@@ -193,7 +198,7 @@ export default async function NotificationsPage({
           ) : (
             <>
               <NotificationsList
-                groups={foldByConsequence(moves)}
+                groups={foldByRecency(moves)}
                 seenSnapshotId={seen.id}
                 // Reading either tab is reading the window, and the marker
                 // advances over the whole window either way — so the POST is not
