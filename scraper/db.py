@@ -83,12 +83,15 @@ models of the same concept in :mod:`scraper.models`.
 
 from __future__ import annotations
 
+import os
+
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
+from sqlalchemy.pool import NullPool
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -336,7 +339,15 @@ def get_engine(database_url: str | None = None, *, echo: bool = False) -> Engine
     if engine is None:
         # pool_pre_ping guards against connections killed while the scraper was
         # sleeping out its inter-request delay (a scrape run is mostly waiting).
-        engine = create_engine(url, echo=echo, pool_pre_ping=True, future=True)
+        #
+        # Pooling is worth having in a long-lived process and is actively wrong
+        # in a serverless one: every concurrent invocation is its own process
+        # with its own pool, so the pools multiply while each serves a single
+        # request, and Postgres runs out of connections long before the platform
+        # runs out of instances. On Vercel the pooler in front of the database is
+        # what should be holding connections, so this holds none.
+        extra = {"poolclass": NullPool} if os.environ.get("VERCEL") else {"pool_pre_ping": True}
+        engine = create_engine(url, echo=echo, future=True, **extra)
         _ENGINES[key] = engine
     return engine
 

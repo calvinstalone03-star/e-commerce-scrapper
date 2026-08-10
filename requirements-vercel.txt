@@ -1,0 +1,10 @@
+# Runtime dependencies of the ingest server, and nothing else.
+#
+# Deliberately not pyproject.toml: that file describes the whole project, whose
+# scraping path pulls in Playwright — a browser download that would dominate the
+# function bundle without a single line of it being reachable from `build_app`.
+fastapi>=0.117
+pydantic>=2
+pydantic-settings>=2
+sqlalchemy>=2
+psycopg[binary]>=3

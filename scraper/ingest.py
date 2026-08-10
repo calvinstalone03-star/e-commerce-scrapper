@@ -109,6 +109,36 @@ PAIRING_WINDOW_S = 300
 #: would have closed months before the extension existed.
 PAIRED_FILENAME = ".ingest-paired"
 
+#: Set by Vercel on every deployment, and by nothing on a laptop. What tells
+#: this module it is reachable from the internet rather than from loopback only.
+#:
+#: An environment flag rather than an inspection of the client address, and that
+#: is the safer of the two: behind a proxy the peer address is the proxy, and
+#: `x-forwarded-for` is a header the caller writes. A deployment cannot forget to
+#: set this, because the platform sets it.
+HOSTED_ENV = ("VERCEL", "INGEST_PUBLIC")
+
+#: Which browser extensions may call a hosted deployment, comma separated, e.g.
+#: `chrome-extension://fkcf…`. Loopback needs none of this — a page served from
+#: 127.0.0.1 and a request to 127.0.0.1 are same-origin — but a hosted server is
+#: a cross-origin request from the extension, and the browser will not send it
+#: without permission.
+#:
+#: No default and no wildcard. An allowlist that defaults to "anyone" is the
+#: same as no allowlist, and this one guards a write path into the database.
+ORIGINS_ENV = "INGEST_ALLOWED_ORIGINS"
+
+
+def allowed_origins() -> list[str]:
+    raw = os.environ.get(ORIGINS_ENV, "")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+def is_hosted() -> bool:
+    """Whether this process is serving something other than loopback."""
+    return any(os.environ.get(name, "").strip() for name in HOSTED_ENV)
+
+
 #: Reopens the window on demand — `ecom-scraper pair` writes it, `/pair` reads
 #: and honours it while it is fresh. What a second machine, a reinstalled
 #: browser, or a cleared profile uses instead of restarting the server.
@@ -204,6 +234,12 @@ def pairing_open(settings: Settings | None = None, *, started_at: float | None =
     * `ecom-scraper pair` was run within the window — a second browser, a
       reinstalled profile, a machine that has paired before.
     """
+    # Never, when this server is on the internet. Pairing hands over a write
+    # credential to whoever asks, and its whole safety argument is that only
+    # software on this machine can ask.
+    if is_hosted():
+        return False
+
     directory = _state_dir(settings)
     now = time.time()
 
@@ -842,6 +878,24 @@ def build_app(
     }
 
     app = FastAPI(title="ecom-scraper ingest", docs_url=None, redoc_url=None)
+
+    # Cross-origin only matters for a hosted deployment: a popup talking to
+    # 127.0.0.1 is already same-origin, while the same popup talking to a
+    # Vercel URL is not, and the browser will not send that request without
+    # permission. No wildcard — this guards a write path into the database.
+    origins = allowed_origins()
+    if origins:
+        from fastapi.middleware.cors import CORSMiddleware
+
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            # The token rides in a header of its own, so no cookie is involved
+            # and credentialed CORS would only widen what this accepts.
+            allow_credentials=False,
+            allow_headers=["Content-Type", "X-Ingest-Token", "X-Ingest-Target"],
+        )
     # Published so `serve` can say at startup which targets exist.
     app.state.services = services
 
@@ -935,6 +989,14 @@ def build_app(
         up*, which is the most this design can honestly claim — the token file
         is readable by the same processes either way.
         """
+        if is_hosted():
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "server ini publik — token tidak dibagikan lewat /pair. "
+                    "Ambil token dari halaman Panduan di dashboard."
+                ),
+            )
         if not pairing_open(settings):
             raise HTTPException(
                 status_code=403,
