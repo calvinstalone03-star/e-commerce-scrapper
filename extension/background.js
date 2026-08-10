@@ -309,6 +309,32 @@ function matchesKeyword(name, tokens) {
   });
 }
 
+//: Collect the ingest token from the server instead of asking a person to copy
+//: it out of a terminal. The server only answers while its pairing window is
+//: open — see `pairing_open` in scraper/ingest.py — so this is an attempt, not
+//: an entitlement, and the popup renders whichever answer comes back.
+async function pairWithServer() {
+  const { endpoint } = await getConfig();
+  let response;
+  try {
+    response = await fetch(`${endpoint}/pair`);
+  } catch (err) {
+    return { ok: false, error: `tidak bisa menghubungi ${endpoint} — server ingest jalan?` };
+  }
+
+  if (response.status === 403) {
+    const detail = await response.json().catch(() => null);
+    return { ok: false, error: detail?.detail || 'pairing sedang ditutup' };
+  }
+  if (!response.ok) return { ok: false, error: `server menjawab HTTP ${response.status}` };
+
+  const body = await response.json().catch(() => null);
+  if (!body?.token) return { ok: false, error: 'server tidak mengirim token' };
+
+  await chrome.storage.local.set({ [TOKEN_KEY]: body.token });
+  return { ok: true };
+}
+
 async function postItems(page, items) {
   const { endpoint, token, destination } = await getConfig();
   if (!token) return { ok: false, error: 'belum ada token ingest — buka pengaturan dan tempel token' };
@@ -1046,6 +1072,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === 'pair') {
+    pairWithServer().then(sendResponse);
+    return true;
+  }
+
   if (message?.type === 'cancel') {
     if (job?.running) {
       job.cancelled = true;
@@ -1089,6 +1120,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       // process that predates it keeps filing the rows the fix was meant to
       // stop — twice now, and both times it looked like the fix had failed.
       let stale = false;
+      // Whether the server will still hand over a token. The popup offers
+      // pairing on the strength of this rather than showing a token box that
+      // most users have no way to fill.
+      let pairing = false;
       // Which destinations the server can actually write to. Offering a Neon
       // button on a server with no NEON_DATABASE_URL would turn a click into a
       // failed scrape instead of a disabled control.
@@ -1098,6 +1133,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         if (response.ok) {
           const health = await response.json();
           stale = Boolean(health.stale);
+          pairing = Boolean(health.pairing);
           if (health.targets) targets = health.targets;
         }
       } catch (err) {
@@ -1132,6 +1168,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         targets,
         stats,
         stale,
+        pairing,
         job: snapshot(),
         resume: resume
           ? {
