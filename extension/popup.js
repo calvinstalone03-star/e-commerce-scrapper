@@ -144,7 +144,9 @@ function renderJob(job) {
 // and a button that accepted the click and then failed the scrape would be worse
 // than one that is visibly off.
 function renderDestination(context) {
-  const chosen = context.destination || 'local';
+  // The worker resolves this; the fallback only covers a context that arrived
+  // without one, and it agrees with the worker's own default.
+  const chosen = context.destination || 'neon';
   const available = context.targets || { local: true, neon: false };
 
   // One configured database is not a choice. Hiding the switch is what lets a
