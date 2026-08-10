@@ -16,6 +16,10 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 .ingest-token
+# Pairing state: whether an extension has ever collected the token, and whether
+# `ecom-scraper pair` has reopened the window. Local facts about one machine.
+.ingest-paired
+.ingest-pairing
 
 # launchd logs
 logs/

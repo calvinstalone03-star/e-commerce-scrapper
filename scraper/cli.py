@@ -930,7 +930,7 @@ def serve(
     Raises:
         typer.Exit: Code 2 if FastAPI/uvicorn are missing.
     """
-    from scraper.ingest import build_app, resolve_token
+    from scraper.ingest import PAIRING_WINDOW_S, build_app, resolve_token
 
     settings = _settings()
     try:
@@ -966,7 +966,10 @@ def serve(
 
     console.print(table)
     console.print(
-        "Paste that token into the extension popup, then browse Shopee normally.\n"
+        "The extension pairs itself: open its popup within "
+        f"[bold]{PAIRING_WINDOW_S // 60} minutes[/bold] and it collects that token "
+        "over loopback — there is nothing to copy. Past that, run "
+        "[bold]ecom-scraper pair[/bold] to reopen the window.\n"
         "The extension sends [bold]no requests of its own[/bold] — it only files away "
         "what the pages you visit already fetched."
     )
@@ -977,6 +980,31 @@ def serve(
         )
 
     uvicorn.run(application, host=host, port=port, log_level="warning")
+
+
+@app.command("pair")
+def pair() -> None:
+    """Reopen the window in which the extension can collect its token.
+
+    The extension asks the server for the token itself, so nothing has to be
+    copied by hand — but only while pairing is open: for a few minutes after the
+    server starts, until the first extension has ever paired, and for a few
+    minutes after this command. That is what keeps a loopback endpoint that
+    hands out write access from being a permanent offer.
+
+    Run this when adding a second browser, a reinstalled profile, or another
+    machine's Chrome to a server that has already paired once.
+    """
+    from scraper.ingest import PAIRING_WINDOW_S, open_pairing
+
+    settings = _settings()
+    marker = open_pairing(settings)
+
+    console.print(
+        f"Pairing open for [bold]{PAIRING_WINDOW_S // 60} minutes[/bold]. "
+        "Open the extension popup now — it collects the token itself.\n"
+        f"[dim]{marker}[/dim]"
+    )
 
 
 @app.command("import-cookies")

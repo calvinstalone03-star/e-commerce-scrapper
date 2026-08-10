@@ -9,12 +9,17 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui';
 /**
  * How to use this thing, and where to get the half of it that is not a website.
  *
- * The dashboard is only the reading end. Collection happens in the user's own
- * Chrome, through an extension they have to install by hand and point at an
- * ingest server running on their own machine — three moving parts, none of them
- * discoverable from the screens that show the results. Until this page existed
- * that knowledge lived in the repository README, which is exactly where the
- * person looking at a half-empty product table is not.
+ * Three steps, and the length is the design. An earlier draft explained the
+ * architecture, the token, and every field in the popup — accurate, and exactly
+ * the shape of thing nobody reads before clicking. What made it shortenable was
+ * removing the steps rather than the words: the extension pairs itself over
+ * loopback (`GET /pair`), and a storefront tab fills the popup's fields, so what
+ * is left to say is install, start the server once, press the button.
+ *
+ * What is deliberately still here is the "kalau ada yang aneh" card. Every row
+ * in it is a real failure someone hit — a run that read one page because the
+ * shop box was empty, an empty notifications list that was working correctly —
+ * and each is indistinguishable from a broken product until it is named.
  *
  * The download is a committed zip (`scripts/pack-extension.mjs`), not a link to
  * the repository: `dashboard/` is the Vercel root, so the extension source is
@@ -56,29 +61,10 @@ export default function DocsPage() {
       <header className="space-y-1">
         <h1 className="text-2xl font-semibold tracking-tight text-foreground">Panduan</h1>
         <p className="text-sm text-muted">
-          Dashboard ini hanya sisi baca. Pengumpulan datanya terjadi di Chrome kamu sendiri lewat
-          extension — halaman ini cara memasang dan memakainya.
+          Tiga langkah. Data dikumpulkan oleh Chrome kamu sendiri lewat extension — dashboard ini
+          hanya membacanya.
         </p>
       </header>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Alurnya</CardTitle>
-          <span className="text-xs text-muted">tiga bagian, satu arah</span>
-        </CardHeader>
-        <CardContent className="space-y-3 text-sm leading-relaxed text-foreground">
-          <pre className="overflow-x-auto rounded-md border border-line bg-canvas px-3 py-2.5 text-xs text-muted">
-            {`extension (Chrome kamu)  →  server ingest (mesin kamu)  →  database  →  dashboard`}
-          </pre>
-          <p>
-            Marketplace menolak diakses langsung oleh skrip, tapi tidak menolak halaman yang memang
-            sedang kamu buka. Karena itu extension membaca halaman yang sudah dirender browser, lalu
-            mengirimkannya ke server ingest di <Code>127.0.0.1:8787</Code>, yang menulis ke database
-            yang dibaca dashboard ini. Tidak ada permintaan tambahan ke marketplace selain halaman
-            yang memang dibuka.
-          </p>
-        </CardContent>
-      </Card>
 
       <Card>
         <CardHeader>
@@ -99,42 +85,31 @@ export default function DocsPage() {
 
           <Steps>
             <Step n={1}>
-              Ekstrak zip-nya ke folder yang <em>tidak akan kamu pindahkan</em>. Chrome memuat
-              extension dari folder itu terus-menerus, dan ID extension diturunkan dari letaknya —
-              memindahkan folder sama dengan memasang extension baru.
+              Ekstrak ke folder yang tidak akan dipindahkan — Chrome memuat extension dari folder itu
+              terus-menerus.
             </Step>
             <Step n={2}>
-              Buka <Code>chrome://extensions</Code>, nyalakan <b>Developer mode</b> di kanan atas.
+              Buka <Code>chrome://extensions</Code>, nyalakan <b>Developer mode</b>, klik{' '}
+              <b>Load unpacked</b>, pilih folder tadi.
             </Step>
-            <Step n={3}>
-              Klik <b>Load unpacked</b>, pilih folder hasil ekstrak tadi. Kartu &ldquo;ecom-scraper
-              collector&rdquo; akan muncul.
-            </Step>
-            <Step n={4}>
-              Klik ikon puzzle 🧩 di toolbar, lalu pin extension-nya supaya ikonnya selalu terlihat.
-            </Step>
+            <Step n={3}>Klik ikon puzzle di toolbar, lalu pin extension-nya.</Step>
           </Steps>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>2. Nyalakan server ingest</CardTitle>
+          <CardTitle>2. Nyalakan penyimpannya</CardTitle>
           <span className="text-xs text-muted">sekali per mesin</span>
         </CardHeader>
         <CardContent className="space-y-3 text-sm leading-relaxed text-foreground">
-          <p>
-            Extension tidak memegang kredensial database. Ia mengirim hasil bacaannya ke server
-            lokal, dan server itu yang menulis ke database. Jalankan dari folder repo:
-          </p>
           <pre className="overflow-x-auto rounded-md border border-line bg-canvas px-3 py-2.5 text-xs text-foreground">
             ecom-scraper serve
           </pre>
           <p>
-            Perintah itu mencetak sebuah <b>token</b>. Buka popup extension, klik ikon ⚙, tempel
-            token tersebut, lalu <b>Simpan</b>. Kalau popup menulis
-            <em> &ldquo;server tidak aktif&rdquo;</em>, server ingest-nya belum jalan; kalau menulis
-            <em> &ldquo;token ingest ditolak&rdquo;</em>, token yang tersimpan bukan yang terbaru.
+            Extension memasangkan dirinya sendiri: buka popup-nya dalam lima menit setelah perintah
+            di atas jalan, dan token diambil otomatis lewat jaringan lokal. Tidak ada yang perlu
+            disalin. Kalau lewat, jalankan <Code>ecom-scraper pair</Code> lalu buka popup lagi.
           </p>
         </CardContent>
       </Card>
@@ -142,67 +117,22 @@ export default function DocsPage() {
       <Card>
         <CardHeader>
           <CardTitle>3. Ambil data</CardTitle>
-          <span className="text-xs text-muted">satu job pada satu waktu</span>
-        </CardHeader>
-        <CardContent className="space-y-4 text-sm leading-relaxed text-foreground">
-          <p>
-            Buka tab Shopee atau Tokopedia lebih dulu — extension membaca tab yang sedang aktif,
-            jadi tombolnya mati kalau tab-nya bukan marketplace. Lalu klik ikon extension.
-          </p>
-          <dl className="divide-y divide-line rounded-md border border-line">
-            <Field name="toko">
-              Username toko, URL storefront, atau nama tokonya. Diisi = extension menelusuri seluruh
-              katalog toko itu, halaman demi halaman. Kalau tab yang aktif sudah berada di halaman
-              toko, kotak ini terisi sendiri.
-            </Field>
-            <Field name="kata kunci">
-              Dibiarkan kosong = seluruh katalog. Diisi bersama <b>toko</b> = pencarian di dalam toko
-              itu saja (misalnya <Code>lego</Code>). Diisi tanpa toko = pencarian biasa di seluruh
-              marketplace.
-            </Field>
-            <Field name="jumlah produk">
-              Batas atas, bukan target yang harus tercapai. Penelusuran berhenti lebih awal begitu
-              produk toko habis.
-            </Field>
-            <Field name="Lokal / Neon">
-              Database tujuan. Terkunci begitu job dimulai, jadi pastikan benar sebelum menekan
-              mulai — dashboard yang di-deploy membaca Neon.
-            </Field>
-          </dl>
-          <p>
-            Tekan <b>Mulai scrape</b>. Popup boleh ditutup: job hidup di service worker, dan popup
-            yang dibuka lagi akan menyambung ke job yang sedang jalan. Tombol yang sama berubah jadi
-            <b> Batal</b> selama job berjalan. Kalau job sempat terputus, popup menawarkan
-            <b> Lanjutkan</b> — itu menyambung dari halaman terakhir yang sudah tersimpan, bukan
-            mengulang dari awal.
-          </p>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>4. Membaca hasilnya</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3 text-sm leading-relaxed text-foreground">
-          <dl className="divide-y divide-line rounded-md border border-line">
-            <Field name="Produk">
-              Semua listing yang pernah terbaca, terbaru di atas. Tiap baris menyimpan riwayat
-              harganya, bukan hanya harga hari ini.
-            </Field>
-            <Field name="Posisi harga">
-              Set yang toko sendiri jual, disandingkan dengan harga rival pada set yang sama.
-            </Field>
-            <Field name="Notifikasi">
-              Rival yang <em>menggerakkan harga</em> pada set yang kita jual juga. Bukan catatan
-              scraping: sebuah baris baru muncul kalau set-nya cocok dengan katalog toko sendiri,
-              ada capture pembanding berumur 24 jam–7 hari, dan selisihnya minimal 5%. Karena itu
-              men-scrape satu toko dua kali dalam sehari tidak memunculkan apa pun — pembandingnya
-              terlalu muda.
-            </Field>
-            <Field name="Toko & Analitik">
-              Ringkasan per toko dan pergerakan lintas waktu.
-            </Field>
-          </dl>
+          <Steps>
+            <Step n={1}>Buka halaman toko di Shopee atau Tokopedia.</Step>
+            <Step n={2}>
+              Klik ikon extension. Popup menyebut toko yang akan diambil.
+            </Step>
+            <Step n={3}>
+              Klik <b>Scrape toko ini</b>. Popup boleh ditutup — prosesnya lanjut sendiri, dan
+              hasilnya muncul di <b>Produk</b> dalam beberapa menit.
+            </Step>
+          </Steps>
+          <p className="text-muted">
+            Perlu mengambil sebagian saja, atau memilih database lain? Buka <b>Opsi</b> di popup:
+            kotak toko, kata kunci, jumlah produk, dan tujuan penyimpanan ada di sana.
+          </p>
         </CardContent>
       </Card>
 
@@ -212,23 +142,24 @@ export default function DocsPage() {
         </CardHeader>
         <CardContent className="text-sm leading-relaxed text-foreground">
           <dl className="divide-y divide-line rounded-md border border-line">
-            <Field name="Hasilnya cuma ±30 produk lalu selesai">
-              Kotak <b>toko</b> kosong saat tombol ditekan, jadi extension hanya membaca halaman yang
-              sedang terbuka. Baris progres yang benar berbentuk <Code>0/2000 produk · hal 1</Code>;
-              kalau hanya tertulis <Code>34 produk</Code> tanpa pembagi, itu mode halaman.
+            <Field name="Popup minta pairing">
+              Server ingest belum jalan, atau jendela pairing sudah tutup. Jalankan{' '}
+              <Code>ecom-scraper pair</Code> di mesin tempat servernya jalan.
             </Field>
-            <Field name="Muncul halaman verifikasi / CAPTCHA">
-              Marketplace sedang meminta verifikasi manusia. Selesaikan di tab itu, lalu mulai lagi.
-              Extension tidak menembus verifikasi apa pun.
+            <Field name="Hasilnya cuma ±30 produk">
+              Kotak toko kosong saat tombol ditekan, jadi hanya halaman yang terbuka yang dibaca.
+              Baris progres yang benar menyebut dua angka, misalnya <Code>0/2000 produk</Code>.
             </Field>
-            <Field name="Angka di dashboard tidak bertambah">
-              Produk yang harganya tidak berubah tidak menulis snapshot baru — itu deduplikasi
-              bekerja, bukan scrape yang gagal. Yang selalu ikut naik adalah waktu terakhir produk
-              terlihat.
+            <Field name="Muncul verifikasi / CAPTCHA">
+              Selesaikan di tab itu, lalu mulai lagi. Extension tidak menembus verifikasi apa pun.
             </Field>
-            <Field name="Extension baru di-update tapi perilakunya lama">
-              Buka <Code>chrome://extensions</Code> lalu tekan Reload (⟳) pada kartunya. Chrome
-              memakai kode yang dimuat, bukan yang ada di folder.
+            <Field name="Angka tidak bertambah">
+              Produk yang harganya tidak berubah tidak menulis baris baru — itu deduplikasi bekerja,
+              bukan scrape yang gagal.
+            </Field>
+            <Field name="Notifikasi kosong padahal baru scrape">
+              Notifikasi butuh pembanding berumur 24 jam–7 hari dan selisih harga minimal 5%.
+              Men-scrape toko yang sama dua kali sehari tidak memunculkan apa pun.
             </Field>
           </dl>
         </CardContent>

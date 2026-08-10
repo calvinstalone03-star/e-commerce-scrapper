@@ -18,10 +18,62 @@ const $ = (id) => document.getElementById(id);
 const DESTINATION_LABEL = { local: 'lokal', neon: 'Neon' };
 
 let running = false;
+//: One pairing attempt per popup. A refused window would otherwise be retried
+//: on every re-render the pairing failure itself triggers.
+let paired = false;
+//: The last context the worker answered with. Kept so the plan line can be
+//: redrawn as the user types without re-asking the server — that answer costs a
+//: /health and a /stats round trip, and it does not change between keystrokes.
+let lastContext = null;
 
 function setResult(text, kind = 'muted') {
   $('result').textContent = text;
   $('result').className = kind;
+}
+
+/**
+ * What pressing the button will do, said in words.
+ *
+ * The inputs are collapsed now, so the button carries arguments the reader
+ * cannot see. This is the line that keeps that honest — and it reads off the
+ * same three fields the run will use, not off what the tab looks like.
+ */
+function renderPlan(context) {
+  const shop = $('shop').value.trim() || context.shop || '';
+  const keyword = $('keyword').value.trim() || context.keyword || '';
+  const target = Number($('target').value) || context.target;
+
+  if (!context.marketplace) {
+    $('plan').textContent = 'Buka halaman Shopee atau Tokopedia dulu.';
+    return;
+  }
+
+  const what = shop
+    ? `toko <b>${escapeHtml(shop)}</b>`
+    : keyword
+      ? `pencarian <b>${escapeHtml(keyword)}</b>`
+      : 'halaman yang sedang terbuka';
+  const filter = shop && keyword ? ` · kata kunci <b>${escapeHtml(keyword)}</b>` : '';
+  const limit = shop || keyword ? ` · sampai <b>${target}</b> produk` : '';
+  $('plan').innerHTML = `Akan mengambil ${what}${filter}${limit}.`;
+}
+
+//: The three fields are user input rendered back as HTML, so they are escaped.
+//: A shop name is not markup.
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (ch) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
+}
+
+//: What the primary button says. "Scrape toko ini" is the whole point of the
+//: collapsed form: on a storefront the shop is already known, so the button can
+//: name the thing rather than the mechanism.
+function scrapeLabel(context) {
+  if (running) return 'Batal';
+  const shop = $('shop').value.trim() || context?.shop;
+  if (shop) return 'Scrape toko ini';
+  if ($('keyword').value.trim() || context?.keyword) return 'Cari & scrape';
+  return 'Scrape halaman ini';
 }
 
 function renderJob(job) {
@@ -89,6 +141,12 @@ function renderDestination(context) {
   const chosen = context.destination || 'local';
   const available = context.targets || { local: true, neon: false };
 
+  // One configured database is not a choice. Hiding the switch is what lets a
+  // fresh install have nothing to decide: the server already knows where its
+  // rows go.
+  const configured = Object.values(available).filter(Boolean).length;
+  $('dest').classList.toggle('solo', configured < 2);
+
   for (const [id, name] of [['dlocal', 'local'], ['dneon', 'neon']]) {
     const button = $(id);
     const off = available[name] === false;
@@ -106,6 +164,7 @@ function renderDestination(context) {
 async function refresh() {
   const context = await chrome.runtime.sendMessage({ type: 'context' });
   if (!context) return;
+  lastContext = context;
 
   const site = $('site');
   if (context.marketplace) {
@@ -127,11 +186,27 @@ async function refresh() {
   }
 
   renderDestination(context);
+  renderPlan(context);
+
+  // No token yet: ask the server for one rather than showing a box only a
+  // developer could fill. The server answers while its pairing window is open;
+  // when it refuses it says why, and that sentence is more useful than an empty
+  // field. Guarded so a closed window cannot loop: one attempt per popup.
+  if (!context.hasToken && context.pairing && !paired) {
+    paired = true;
+    const answer = await chrome.runtime.sendMessage({ type: 'pair' });
+    if (answer?.ok) return refresh();
+    setResult(answer?.error || 'gagal mengambil token', 'bad');
+  } else if (!context.hasToken && !context.pairing) {
+    setResult('extension belum berpasangan — jalankan `ecom-scraper pair`, lalu buka popup ini lagi', 'bad');
+  }
 
   $('endpoint').value = context.endpoint;
+  // Pairing fills this by itself; the box stays for the case pairing cannot
+  // cover — a server on another machine, or a window that has closed.
   $('token').placeholder = context.hasToken
     ? '•••••••• tersimpan'
-    : 'dari: ecom-scraper serve';
+    : 'jalankan: ecom-scraper pair';
 
   // A run the worker lost — MV3 evicted it, or the tab went away mid-walk. The
   // database already holds every page it filed, so this offers the rest rather
@@ -169,6 +244,9 @@ async function refresh() {
   }
 
   renderJob(context.job);
+  // After renderJob, which owns the running/cancel state and would otherwise
+  // overwrite the label with the generic one.
+  $('scrape').textContent = scrapeLabel(context);
 }
 
 async function start() {
@@ -196,6 +274,17 @@ $('scrape').addEventListener('click', () => {
     start();
   }
 });
+
+// The plan line reads off these fields, so it has to follow them. Without this
+// it would state the tab's shop while the box says something else. Redrawn from
+// the cached context rather than by refreshing: no server round trip per key.
+for (const id of ['keyword', 'shop', 'target']) {
+  $(id).addEventListener('input', () => {
+    if (!lastContext) return;
+    renderPlan(lastContext);
+    if (!running) $('scrape').textContent = scrapeLabel(lastContext);
+  });
+}
 
 // Enter in either field starts the run, because that is what Enter does in a
 // search box.

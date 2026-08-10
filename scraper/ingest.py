@@ -88,6 +88,32 @@ TOKEN_ENV = "INGEST_TOKEN"
 #: across restarts without the user copying it every time.
 TOKEN_FILENAME = ".ingest-token"
 
+#: How long `/pair` hands the token to the extension after the server starts.
+#:
+#: Pairing exists so nobody has to copy a token out of a terminal — the step that
+#: made installing this a developer task rather than a download. The window is
+#: what keeps that from being a standing offer: a token fetched by anything on
+#: this machine at any time would make the local write path effectively
+#: unauthenticated for the life of the process.
+#:
+#: It is honest about what it is worth. Anything running as this user can read
+#: `.ingest-token` off disk regardless, so the window does not defend against a
+#: hostile local process; it defends against every long-lived thing that merely
+#: *could* have asked. Five minutes is enough for a person who just started the
+#: server to open a popup.
+PAIRING_WINDOW_S = 300
+
+#: Records that an extension has paired, so first-run pairing can stay open
+#: until it happens. A server installed as a background service was started long
+#: before its user ever opened Chrome, and a window measured only from start-up
+#: would have closed months before the extension existed.
+PAIRED_FILENAME = ".ingest-paired"
+
+#: Reopens the window on demand — `ecom-scraper pair` writes it, `/pair` reads
+#: and honours it while it is fresh. What a second machine, a reinstalled
+#: browser, or a cleared profile uses instead of restarting the server.
+PAIRING_FILENAME = ".ingest-pairing"
+
 
 @dataclass
 class IngestResult:
@@ -159,6 +185,53 @@ def resolve_token(settings: Settings | None = None) -> str:
     cache.chmod(0o600)
     log.info("generated a new ingest token at %s", cache)
     return token
+
+
+def _state_dir(settings: Settings | None = None) -> Path:
+    """Where pairing state lives: beside the cookie jar and the token."""
+    return Path((settings or get_settings()).cookies_path).parent
+
+
+def pairing_open(settings: Settings | None = None, *, started_at: float | None = None) -> bool:
+    """Whether `/pair` may hand out the token right now.
+
+    Three ways in, and each answers a case the others cannot:
+
+    * the server started less than `PAIRING_WINDOW_S` ago — someone is setting
+      this up right now;
+    * nothing has ever paired — a service installed months ago is still on its
+      first run as far as its user is concerned;
+    * `ecom-scraper pair` was run within the window — a second browser, a
+      reinstalled profile, a machine that has paired before.
+    """
+    directory = _state_dir(settings)
+    now = time.time()
+
+    if now - (started_at if started_at is not None else _STARTED_AT) < PAIRING_WINDOW_S:
+        return True
+    if not (directory / PAIRED_FILENAME).exists():
+        return True
+    try:
+        asked = (directory / PAIRING_FILENAME).stat().st_mtime
+    except OSError:
+        return False
+    return now - asked < PAIRING_WINDOW_S
+
+
+def open_pairing(settings: Settings | None = None) -> Path:
+    """Reopen the pairing window. What `ecom-scraper pair` does."""
+    marker = _state_dir(settings) / PAIRING_FILENAME
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("", encoding="utf-8")
+    marker.chmod(0o600)
+    return marker
+
+
+def mark_paired(settings: Settings | None = None) -> None:
+    """Record that an extension took the token, closing first-run pairing."""
+    directory = _state_dir(settings)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / PAIRED_FILENAME).write_text("", encoding="utf-8")
 
 
 #: Keys that identify a Shopee listing object wherever it is buried. ``itemid``
@@ -842,7 +915,37 @@ def build_app(
             # True means: restart me. `launchctl kickstart -k
             # gui/$UID/com.ecomscraper.ingest`
             "stale": newest > _STARTED_AT,
+            # So the popup can offer pairing instead of a token box, and say why
+            # when it cannot.
+            "pairing": pairing_open(settings),
         }
+
+    @app.get("/pair")
+    def pair() -> dict[str, Any]:
+        """Hand the extension its token, while the pairing window is open.
+
+        This is the step that used to be "copy the token the terminal printed
+        and paste it into the popup's settings" — the one that made installing
+        this a developer task. The extension asks for it itself now, and the
+        window (`pairing_open`) is what keeps that from being a permanent offer.
+
+        Bound to loopback like the rest of this server, so "who can ask" is
+        already "software running as this user". The window narrows that to
+        software running as this user *while someone is setting the extension
+        up*, which is the most this design can honestly claim — the token file
+        is readable by the same processes either way.
+        """
+        if not pairing_open(settings):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "pairing ditutup. Jalankan `ecom-scraper pair` di mesin ini, "
+                    f"lalu coba lagi dalam {PAIRING_WINDOW_S // 60} menit."
+                ),
+            )
+        mark_paired(settings)
+        log.info("paired an extension over loopback")
+        return {"token": token, "targets": {name: chosen is not None for name, chosen in services.items()}}
 
     @app.post("/ingest")
     def ingest(

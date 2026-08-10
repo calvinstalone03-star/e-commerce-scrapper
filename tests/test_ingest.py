@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import time
+
 import pytest
 
 from scraper.config import Settings
@@ -891,3 +893,65 @@ def test_an_absent_keyword_is_forwarded_as_none_not_an_empty_string(client) -> N
 
     assert response.status_code == 200
     assert service.dom_calls[0]["keyword"] is None
+
+
+# ----------------------------------------------------------------------
+# Pairing
+# ----------------------------------------------------------------------
+
+
+def test_pair_hands_over_the_token_on_first_run(client) -> None:
+    """The step that used to be "copy this token out of the terminal"."""
+    http, _service = client
+
+    response = http.get("/pair")
+
+    assert response.status_code == 200
+    assert response.json()["token"] == "test-token"
+
+
+def test_pair_closes_once_something_has_paired(client, settings, monkeypatch) -> None:
+    """First-run pairing is a one-off, not a standing offer.
+
+    The window is what keeps a loopback endpoint that hands out write access
+    from being permanently open, so the interesting case is the second ask —
+    with the start-up window pushed into the past, since a server installed as a
+    background service started long before its user opened a browser.
+    """
+    from scraper import ingest
+
+    http, _service = client
+    assert http.get("/pair").status_code == 200
+
+    monkeypatch.setattr(ingest, "_STARTED_AT", time.time() - ingest.PAIRING_WINDOW_S - 1)
+
+    refused = http.get("/pair")
+    assert refused.status_code == 403
+    assert "ecom-scraper pair" in refused.json()["detail"]
+
+
+def test_pair_command_reopens_the_window(client, settings, monkeypatch) -> None:
+    """What a second browser or a reinstalled profile uses."""
+    from scraper import ingest
+
+    http, _service = client
+    http.get("/pair")
+    monkeypatch.setattr(ingest, "_STARTED_AT", time.time() - ingest.PAIRING_WINDOW_S - 1)
+    assert http.get("/pair").status_code == 403
+
+    ingest.open_pairing(settings)
+
+    assert http.get("/pair").status_code == 200
+
+
+def test_health_reports_whether_pairing_is_open(client, monkeypatch) -> None:
+    """So the popup can offer pairing instead of a token box, and say why not."""
+    from scraper import ingest
+
+    http, _service = client
+    assert http.get("/health").json()["pairing"] is True
+
+    http.get("/pair")
+    monkeypatch.setattr(ingest, "_STARTED_AT", time.time() - ingest.PAIRING_WINDOW_S - 1)
+
+    assert http.get("/health").json()["pairing"] is False
