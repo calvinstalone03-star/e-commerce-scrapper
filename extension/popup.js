@@ -359,10 +359,22 @@ $('save').addEventListener('click', async () => {
   await chrome.storage.local.set(patch);
   $('token').value = '';
 
+  // Tested against `/stats`, which needs the token, rather than `/health`,
+  // which does not. There are two servers now and they hold different tokens,
+  // so "server terhubung" was true of a pairing that could never file a single
+  // row: the token from one server pasted against the address of the other.
+  // That combination stayed silent until the first scrape failed with a 401
+  // naming nothing.
+  const saved = token || (await chrome.storage.local.get(['token'])).token || '';
   try {
-    const response = await fetch(`${endpoint}/health`);
-    setResult(response.ok ? 'tersimpan, server terhubung' : `server balas HTTP ${response.status}`,
-      response.ok ? 'ok' : 'bad');
+    const response = await fetch(`${endpoint}/stats`, { headers: { 'X-Ingest-Token': saved } });
+    if (response.ok) {
+      setResult('tersimpan — token diterima server ini', 'ok');
+    } else if (response.status === 401) {
+      setResult(`tersimpan, tapi ${endpoint} menolak token ini — token milik server lain?`, 'bad');
+    } else {
+      setResult(`tersimpan, server balas HTTP ${response.status}`, 'bad');
+    }
   } catch (err) {
     setResult(`tersimpan, tapi ${endpoint} tidak bisa dihubungi`, 'bad');
   }
