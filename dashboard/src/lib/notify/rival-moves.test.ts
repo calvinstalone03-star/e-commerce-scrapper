@@ -176,11 +176,24 @@ async function seedUnchangedCapture(spec: { price: string; hoursAfter: number })
   await addSnapshot(lastMoveProductId, spec.price, ago(MOVE_HOURS_AGO - spec.hoursAfter));
 }
 
-/** Three rival moves, largest first, so the top of the page is not the largest id. */
+/**
+ * Three rival moves, oldest capture first, each an hour apart.
+ *
+ * The ages are stated rather than left at the default because the page is
+ * ordered by `scraped_at` now: three moves seeded "at the same time" are
+ * actually milliseconds apart, whichever way the wall clock happened to fall
+ * between two INSERTs, and a test that reads the first row of that page was
+ * asserting against a coin toss. Spacing them by an hour makes the order the
+ * test is about a property of the data.
+ *
+ * Insertion order matches capture order, so ids ascend with time — the same
+ * agreement the live database has, and the one `rivalMoves`'s own doc comment
+ * depends on.
+ */
 async function seedThreeRivalMoves(): Promise<void> {
-  await seedRivalMove({ from: '100000', to: '40000', hoursApart: 48 }); // -60%
-  await seedRivalMove({ from: '100000', to: '70000', hoursApart: 48 }); // -30%
-  await seedRivalMove({ from: '100000', to: '90000', hoursApart: 48 }); // -10%
+  await seedRivalMove({ from: '100000', to: '40000', hoursApart: 48, hoursAgo: 32 }); // -60%
+  await seedRivalMove({ from: '100000', to: '70000', hoursApart: 48, hoursAgo: 31 }); // -30%
+  await seedRivalMove({ from: '100000', to: '90000', hoursApart: 48, hoursAgo: 30 }); // -10%
 }
 
 describe('rivalMoves — which snapshots qualify', () => {
@@ -398,7 +411,11 @@ describe('rivalMoves — our price is the cheapest of our shops', () => {
 describe('rivalMovesCeiling', () => {
   test('ceiling spans the whole window, not the page', async () => {
     await seedThreeRivalMoves();
-    const page = await rivalMoves({ ...DEFAULTS, limit: 1 });
+    // The last page, not the first. With the list ordered newest capture first,
+    // the first page holds the newest row — which is also the largest id, since
+    // the two agree — and "the ceiling is past what was rendered" cannot be
+    // stated there at all. The oldest row is where the claim has teeth.
+    const page = await rivalMoves({ ...DEFAULTS, limit: 1, offset: 2 });
     const ceiling = await rivalMovesCeiling(DEFAULTS);
     expect(page).toHaveLength(1);
     // snapshotId is a bigint as a string — compared as BigInt, never Number(),

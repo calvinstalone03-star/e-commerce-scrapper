@@ -773,10 +773,31 @@ app = build_app()
 ```
 
 **A second Vercel project**, root set to this repository — not the dashboard's
-project, whose root is `dashboard/` and which none of this touches. Vercel
-detects FastAPI, `vercel.json` points the install at `requirements-vercel.txt`
-(no Playwright, which would otherwise dominate the bundle) and excludes
-everything the server does not import.
+project, whose root is `dashboard/`. Vercel detects FastAPI from `app.py` and
+installs `requirements.txt`, which lists only what the ingest server imports;
+Playwright stays out because it is imported lazily and never loads here.
+
+Two settings on that project, both in its own **Project Settings** and not in a
+file:
+
+| setting | value |
+|---|---|
+| Framework Preset | FastAPI |
+| Install Command | `pip install -r requirements.txt` |
+
+Neither belongs in a `vercel.json`, and that is load-bearing rather than tidy: a
+`vercel.json` at the repository root applies to **every** project built out of
+this repository, the dashboard included, whose Root Directory being `dashboard/`
+does not exempt it. One with a Python `installCommand` in it took the
+dashboard's production build down with `externally-managed-environment` — it ran
+`pip install` where `npm install` belonged.
+
+The install command has to be stated because this repository ships a
+`pyproject.toml`, and Vercel reads it in preference to `requirements.txt`. That
+file describes the scraper, not the ingest server, and does not list FastAPI —
+so the deployment built cleanly and then failed at import with `No module named
+fastapi`. Without a framework preset it is worse and quieter: the build finishes
+in 200ms, produces no function at all, and every path answers 404.
 
 Three environment variables:
 
