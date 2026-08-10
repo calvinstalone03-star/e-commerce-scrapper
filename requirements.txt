@@ -1,5 +1,13 @@
 # Runtime dependencies of the ingest server, and nothing else.
 #
+# Named `requirements.txt` rather than pointed at by an `installCommand` in a
+# root `vercel.json`, because that file is read by BOTH projects built out of
+# this repository — the dashboard included, whose Root Directory is `dashboard/`
+# and which does not stop it applying. Its production build ran `pip install`
+# instead of `npm install` and failed with `externally-managed-environment`.
+# Vercel's Python builder finds this file on its own, so no shared config is
+# needed to point at it.
+#
 # Deliberately not pyproject.toml: that file describes the whole project, and
 # its scraping path pulls in Playwright — a browser download that would dominate
 # the function bundle. Playwright is imported lazily inside `_sync_playwright`,
