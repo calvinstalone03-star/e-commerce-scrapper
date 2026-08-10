@@ -36,6 +36,44 @@ const DESTINATION_KEY = 'destination';
 const DEFAULT_DESTINATION = 'local';
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787';
 
+//: Where a browser with no server of its own files what it reads. The same
+//: application as DEFAULT_ENDPOINT, deployed once so that installing this needs
+//: neither Python nor a terminal — see README section 9.
+const HOSTED_ENDPOINT = 'https://ecom-ingest.vercel.app';
+
+//: How long to wait for a local server before concluding there is none. Short,
+//: because a loopback server either answers immediately or does not exist, and
+//: this runs before the first popup can render.
+const LOCAL_PROBE_MS = 1_200;
+
+//: Which server this browser uses, decided once and then remembered.
+//:
+//: Asked rather than configured: the two audiences want opposite defaults — the
+//: machine running the ingest server wants loopback (faster, no quota, token
+//: never leaves the machine), and every other machine has nothing there at all.
+//: A default that served one of them would make the other edit a settings field
+//: before anything worked, and that field is the thing this release exists to
+//: remove.
+async function resolveEndpoint() {
+  const stored = await chrome.storage.local.get([ENDPOINT_KEY]);
+  if (stored[ENDPOINT_KEY]) return stored[ENDPOINT_KEY];
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LOCAL_PROBE_MS);
+  let endpoint = HOSTED_ENDPOINT;
+  try {
+    const response = await fetch(`${DEFAULT_ENDPOINT}/health`, { signal: controller.signal });
+    if (response.ok) endpoint = DEFAULT_ENDPOINT;
+  } catch (err) {
+    /* nothing on loopback; the hosted one it is */
+  } finally {
+    clearTimeout(timer);
+  }
+
+  await chrome.storage.local.set({ [ENDPOINT_KEY]: endpoint });
+  return endpoint;
+}
+
 //: How many products a job collects when the user does not say. Sized to a
 //: whole storefront rather than to one page: the largest shop tracked here
 //: holds ~1600 products, so a run that is not told otherwise walks the
@@ -68,9 +106,10 @@ const PAGE_JITTER_MS = 1_500;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function getConfig() {
-  const stored = await chrome.storage.local.get([ENDPOINT_KEY, TOKEN_KEY, DESTINATION_KEY]);
+  const endpoint = await resolveEndpoint();
+  const stored = await chrome.storage.local.get([TOKEN_KEY, DESTINATION_KEY]);
   return {
-    endpoint: stored[ENDPOINT_KEY] || DEFAULT_ENDPOINT,
+    endpoint,
     token: stored[TOKEN_KEY] || '',
     destination: stored[DESTINATION_KEY] === 'neon' ? 'neon' : DEFAULT_DESTINATION,
   };

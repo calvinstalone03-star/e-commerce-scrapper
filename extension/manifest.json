@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "ecom-scraper collector",
   "version": "0.5.0",
-  "description": "Reads Shopee and Tokopedia listings off pages you have open — one page or a keyword walked across as many result pages as you ask for — and files them into your local ecom-scraper database.",
+  "description": "Reads Shopee and Tokopedia listings off pages you have open \u2014 one page or a keyword walked across as many result pages as you ask for \u2014 and files them into your local ecom-scraper database.",
   "permissions": [
     "storage",
     "tabs",
@@ -10,6 +10,7 @@
   ],
   "host_permissions": [
     "http://127.0.0.1:8787/*",
+    "https://ecom-ingest.vercel.app/*",
     "*://shopee.co.id/*",
     "*://*.tokopedia.com/*"
   ],
