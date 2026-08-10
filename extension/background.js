@@ -33,7 +33,12 @@ const PREFS_KEY = 'prefs';
 //: storage key rather than a field in PREFS_KEY, because starting a job
 //: overwrites that whole object and would take the choice with it.
 const DESTINATION_KEY = 'destination';
-const DEFAULT_DESTINATION = 'local';
+//: Where a run files when nobody has chosen: the hosted database the deployed
+//: dashboard reads. It used to be the laptop's Postgres, from when that was the
+//: only one there was — but a scrape that lands somewhere the dashboard cannot
+//: see is a scrape nobody asked for, and every browser this extension is
+//: installed in now has a dashboard and may not have a Postgres at all.
+const DEFAULT_DESTINATION = 'neon';
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787';
 
 //: Where a browser with no server of its own files what it reads. The same
@@ -111,7 +116,13 @@ async function getConfig() {
   return {
     endpoint,
     token: stored[TOKEN_KEY] || '',
-    destination: stored[DESTINATION_KEY] === 'neon' ? 'neon' : DEFAULT_DESTINATION,
+    // Both names honoured, not just one. Written as `=== 'neon' ? 'neon' :
+    // DEFAULT` this quietly ignored a stored value once the default became
+    // 'neon' — the Lokal button would set the key and the next read would hand
+    // back 'neon' anyway, leaving a control that moved and changed nothing.
+    destination: stored[DESTINATION_KEY] === 'local' || stored[DESTINATION_KEY] === 'neon'
+      ? stored[DESTINATION_KEY]
+      : DEFAULT_DESTINATION,
   };
 }
 
