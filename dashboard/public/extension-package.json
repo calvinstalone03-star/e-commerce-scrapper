@@ -1,0 +1,11 @@
+{
+  "version": "0.5.0",
+  "files": {
+    "background.js": "9e15a10d0c244a421b9c6af97f9849a4f2567f6f9bcc3aa8b5eb30216d04f28f",
+    "dom-scraper.js": "56efdc475ac2e3ddae98c84c557e310071d0315ca36ce716ceb6eee16a7ef896",
+    "manifest.json": "f155c1b82e277a51c41c336b8ce7698d268d92038d304ec591671315b09bbe33",
+    "popup.html": "3d79fe9032d1ca9110618ad9a2cd8ef18de7d2a46e55467ee6bcd71386cfa9b2",
+    "popup.js": "f9d4388fd1753262b3527753cfb81395b44fd5ff3016b753382017d8dc4ed144",
+    "sites.js": "66d0018f2b2ddde9160637559797f04b3434969db93e559bd1720bab166758c2"
+  }
+}
