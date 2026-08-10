@@ -1,10 +1,17 @@
 # Runtime dependencies of the ingest server, and nothing else.
 #
-# Deliberately not pyproject.toml: that file describes the whole project, whose
-# scraping path pulls in Playwright — a browser download that would dominate the
-# function bundle without a single line of it being reachable from `build_app`.
+# Deliberately not pyproject.toml: that file describes the whole project, and
+# its scraping path pulls in Playwright — a browser download that would dominate
+# the function bundle. Playwright is imported lazily inside `_sync_playwright`,
+# so it never loads here; httpx and tenacity are not so lucky, and this list
+# reflects what the import chain actually reaches rather than what the ingest
+# path uses. `scraper.ingest` imports the Shopee parser, which imports
+# `scraper.client` for the types it shares, which imports both at module level.
+# Measured, not assumed: the first deployment failed on `No module named httpx`.
 fastapi>=0.117
 pydantic>=2
 pydantic-settings>=2
 sqlalchemy>=2
 psycopg[binary]>=3
+httpx>=0.27
+tenacity>=8

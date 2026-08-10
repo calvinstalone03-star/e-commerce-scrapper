@@ -783,8 +783,15 @@ Three environment variables:
 | variable | value |
 |---|---|
 | `DATABASE_URL` | the Neon **pooled** endpoint — the one with `-pooler` in the host |
+| `NEON_DATABASE_URL` | the same pooled endpoint, so both destinations the popup offers resolve |
 | `INGEST_TOKEN` | a token you generate; every extension sends it back |
 | `INGEST_ALLOWED_ORIGINS` | `chrome-extension://<your extension id>` |
+
+Both database variables point at the same place on a hosted deployment, and that
+is not redundancy: the popup's destination switch sends `local` or `neon`, and a
+server that only understands one of them turns the other into a failed scrape.
+Locally they stay what they have always been — the laptop's Postgres and the
+hosted one.
 
 What the code does differently when it is up there, keyed off the `VERCEL`
 variable the platform sets on every deployment:
