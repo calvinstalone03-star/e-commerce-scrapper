@@ -292,7 +292,13 @@ export const productFilterSchema = z.object({
   minSold: intFromQuery.nonnegative().optional().catch(undefined),
   minRating: z.coerce.number().min(0).max(5).optional().catch(undefined),
   hasImage: z.coerce.boolean().optional().catch(undefined),
-  sort: sortFieldSchema.default('sold').catch('sold'),
+  // Newest reading first. The list is a time series being refilled every day,
+  // so the question it answers on arrival is "what did the last sweep see?" —
+  // and a best-sellers default buried today's rows under the same evergreen
+  // listings every time. Sorting by the latest snapshot's `scraped_at` also
+  // makes a half-finished sweep legible: the stores already walked sit at the
+  // top, in the order they were walked.
+  sort: sortFieldSchema.default('scrapedAt').catch('scrapedAt'),
   dir: sortDirSchema.default('desc').catch('desc'),
   page: intFromQuery.min(1).default(1).catch(1),
   pageSize: intFromQuery.min(1).max(200).default(50).catch(50),
