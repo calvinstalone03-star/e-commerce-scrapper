@@ -955,3 +955,77 @@ def test_health_reports_whether_pairing_is_open(client, monkeypatch) -> None:
     monkeypatch.setattr(ingest, "_STARTED_AT", time.time() - ingest.PAIRING_WINDOW_S - 1)
 
     assert http.get("/health").json()["pairing"] is False
+
+
+# ----------------------------------------------------------------------
+# Hosted mode
+# ----------------------------------------------------------------------
+
+
+def test_pair_is_refused_on_a_hosted_deployment(settings, monkeypatch) -> None:
+    """The whole safety argument for /pair is that only this machine can ask.
+
+    Deployed to Vercel it is reachable by anyone, and an endpoint that hands a
+    database write credential to whoever asks is not a smaller version of the
+    same feature — it is a giveaway. The platform sets VERCEL on every
+    deployment, so this cannot be forgotten by a careless deploy.
+    """
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("INGEST_TOKEN", "test-token")
+    monkeypatch.setenv("VERCEL", "1")
+    http = TestClient(build_app(settings, service=RecordingService()))
+
+    refused = http.get("/pair")
+
+    assert refused.status_code == 403
+    assert "publik" in refused.json()["detail"]
+    # And the popup is told, so it offers the dashboard's token instead of
+    # silently retrying something that will never work.
+    assert http.get("/health").json()["pairing"] is False
+
+
+def test_ingest_still_works_when_hosted(settings, monkeypatch) -> None:
+    """Only pairing is refused. The write path is the point of deploying it."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("INGEST_TOKEN", "test-token")
+    monkeypatch.setenv("VERCEL", "1")
+    service = RecordingService()
+    http = TestClient(build_app(settings, service=service))
+
+    response = http.post(
+        "/ingest",
+        json={"url": "https://shopee.co.id/api/v4/search/search_items?keyword=lego", "payload": {}},
+        headers={"X-Ingest-Token": "test-token"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_cross_origin_is_off_unless_configured(settings, monkeypatch) -> None:
+    """No allowlist, no CORS. A default of "anyone" would be no guard at all."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("INGEST_TOKEN", "test-token")
+    monkeypatch.delenv("INGEST_ALLOWED_ORIGINS", raising=False)
+    http = TestClient(build_app(settings, service=RecordingService()))
+
+    response = http.get("/health", headers={"Origin": "chrome-extension://whatever"})
+
+    assert "access-control-allow-origin" not in {k.lower() for k in response.headers}
+
+
+def test_named_extension_is_allowed_across_origins(settings, monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    origin = "chrome-extension://fkcfblocmhlfbkdgfmgbaogfglmgfmkf"
+    monkeypatch.setenv("INGEST_TOKEN", "test-token")
+    monkeypatch.setenv("INGEST_ALLOWED_ORIGINS", origin)
+    http = TestClient(build_app(settings, service=RecordingService()))
+
+    allowed = http.get("/health", headers={"Origin": origin})
+    other = http.get("/health", headers={"Origin": "https://example.com"})
+
+    assert allowed.headers["access-control-allow-origin"] == origin
+    assert "access-control-allow-origin" not in {k.lower() for k in other.headers}

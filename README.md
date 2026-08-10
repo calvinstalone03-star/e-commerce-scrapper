@@ -756,6 +756,63 @@ deployment.
 
 Suitable for cron: `1` means "look at the log", `2` means "the setup is broken".
 
+## 9. Deploy the ingest server (optional, for other people's machines)
+
+The ingest server is a local service by default, and for your own machine it
+should stay one: the extension reaches it over loopback, nothing crosses the
+internet, and a twenty-shop sweep costs nothing. This section is for the other
+case — someone else's Chrome, on someone else's laptop, with no Python on it.
+
+It is the **same application**, deployed a second time. `app.py` is the whole
+port:
+
+```python
+from scraper.ingest import build_app
+
+app = build_app()
+```
+
+**A second Vercel project**, root set to this repository — not the dashboard's
+project, whose root is `dashboard/` and which none of this touches. Vercel
+detects FastAPI, `vercel.json` points the install at `requirements-vercel.txt`
+(no Playwright, which would otherwise dominate the bundle) and excludes
+everything the server does not import.
+
+Three environment variables:
+
+| variable | value |
+|---|---|
+| `DATABASE_URL` | the Neon **pooled** endpoint — the one with `-pooler` in the host |
+| `NEON_DATABASE_URL` | the same pooled endpoint, so both destinations the popup offers resolve |
+| `INGEST_TOKEN` | a token you generate; every extension sends it back |
+| `INGEST_ALLOWED_ORIGINS` | `chrome-extension://<your extension id>` |
+
+Both database variables point at the same place on a hosted deployment, and that
+is not redundancy: the popup's destination switch sends `local` or `neon`, and a
+server that only understands one of them turns the other into a failed scrape.
+Locally they stay what they have always been — the laptop's Postgres and the
+hosted one.
+
+What the code does differently when it is up there, keyed off the `VERCEL`
+variable the platform sets on every deployment:
+
+* **`/pair` is refused.** It hands a database write credential to whoever asks,
+  and its only safety argument is that nothing off this machine can ask. Hosted,
+  the token comes from the dashboard's Panduan page instead.
+* **The engine stops pooling** (`NullPool`). Every invocation is its own
+  process, so per-process pools multiply while each serves one request; Neon's
+  pooler is what should be holding connections.
+
+`INGEST_ALLOWED_ORIGINS` has no default and takes no wildcard. Loopback needs no
+CORS at all — the popup and the server share an origin — so an allowlist that
+defaulted to "anyone" would only ever weaken the hosted case it exists for.
+
+Worth being plain about the trade: on loopback the token is a second lock behind
+a door only this machine can reach. Hosted, it is the *only* lock on a write
+path into the shared catalogue. Rotate it by changing the variable and
+re-issuing it; add a Vercel WAF rate-limit rule on the ingest paths (the Hobby
+plan allows three).
+
 ## Configuration
 
 All settings come from the environment, backed by `.env` (see `.env.example`).
