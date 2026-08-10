@@ -253,8 +253,28 @@ async function refresh() {
     $('tstores').textContent = context.stats.stores ?? '–';
   } else {
     for (const id of ['tproducts', 'tsnapshots', 'tstores']) $(id).textContent = '–';
+    // Three different reasons the totals are blank, and they take three
+    // different actions. Collapsing them into "server tidak aktif" was wrong
+    // twice over: the server was answering, and the fix it named does not exist
+    // on a machine with no Python.
     if (!$('result').textContent) {
-      setResult('server tidak aktif — jalankan: ecom-scraper serve', 'bad');
+      if (!context.serverUp) {
+        setResult(
+          isLocal(context.endpoint)
+            ? 'server ingest tidak bisa dihubungi — jalankan: ecom-scraper serve'
+            : `tidak bisa menghubungi ${context.endpoint}`,
+          'bad',
+        );
+      } else if (context.statsStatus === 401) {
+        setResult(
+          isLocal(context.endpoint)
+            ? 'token ingest belum ada atau ditolak — jalankan: ecom-scraper pair, lalu buka popup ini lagi'
+            : 'token ingest belum ada atau ditolak — ambil di halaman Panduan dashboard, lalu tempel lewat ikon ⚙',
+          'bad',
+        );
+      } else if (context.statsStatus) {
+        setResult(`server menjawab HTTP ${context.statsStatus} untuk /stats`, 'bad');
+      }
     }
   }
 
