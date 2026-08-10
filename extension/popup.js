@@ -17,6 +17,11 @@ const $ = (id) => document.getElementById(id);
 //: carry their own text; this is the prose version.
 const DESTINATION_LABEL = { local: 'lokal', neon: 'Neon' };
 
+//: Loopback or not — the one distinction that changes what the popup can offer
+//: and what advice is true.
+const isLocal = (endpoint) =>
+  /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(String(endpoint || ''));
+
 let running = false;
 //: One pairing attempt per popup. A refused window would otherwise be retried
 //: on every re-render the pairing failure itself triggers.
@@ -55,7 +60,8 @@ function renderPlan(context) {
       : 'halaman yang sedang terbuka';
   const filter = shop && keyword ? ` · kata kunci <b>${escapeHtml(keyword)}</b>` : '';
   const limit = shop || keyword ? ` · sampai <b>${target}</b> produk` : '';
-  $('plan').innerHTML = `Akan mengambil ${what}${filter}${limit}.`;
+  const where = isLocal(context.endpoint) ? 'server lokal' : 'server awan';
+  $('plan').innerHTML = `Akan mengambil ${what}${filter}${limit}. <span class="muted">→ ${where}</span>`;
 }
 
 //: The three fields are user input rendered back as HTML, so they are escaped.
@@ -198,7 +204,16 @@ async function refresh() {
     if (answer?.ok) return refresh();
     setResult(answer?.error || 'gagal mengambil token', 'bad');
   } else if (!context.hasToken && !context.pairing) {
-    setResult('extension belum berpasangan — jalankan `ecom-scraper pair`, lalu buka popup ini lagi', 'bad');
+    // Two different servers, two different answers. Loopback can hand the token
+    // over by itself and just refused, so `pair` is the fix; a hosted server
+    // never will, and telling that user to run a command they do not have is
+    // how a working install looks broken.
+    setResult(
+      isLocal(context.endpoint)
+        ? 'extension belum berpasangan — jalankan `ecom-scraper pair`, lalu buka popup ini lagi'
+        : 'belum ada token — ambil di halaman Panduan dashboard, lalu tempel lewat ikon ⚙',
+      'bad',
+    );
   }
 
   $('endpoint').value = context.endpoint;

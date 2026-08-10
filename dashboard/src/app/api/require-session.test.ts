@@ -2,7 +2,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { NextRequest } from 'next/server';
-import { beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import { sql } from '@/lib/db';
 
@@ -45,6 +45,16 @@ function postRequest(path: string): NextRequest {
 type Route = {
   path: string;
   call: () => Promise<Response>;
+  /**
+   * Environment a handler needs before it can answer 200 at all.
+   *
+   * `/api/ingest-token` reads its answer out of the environment and reports 404
+   * when a deployment has no hosted ingest server — a supported arrangement,
+   * not a broken one. Without this the shared "serves the request once signed
+   * in" case would be asserting that configuration exists, which is not what
+   * this file is about.
+   */
+  env?: Record<string, string>;
 };
 
 const ROUTES: Route[] = [
@@ -71,6 +81,14 @@ const ROUTES: Route[] = [
       ),
   },
   {
+    env: { INGEST_ENDPOINT: 'https://ingest.example', INGEST_TOKEN: 'test-token' },
+    // The credential for the hosted ingest server. Unguarded this is the write
+    // path into the shared catalogue, handed to whoever finds the URL.
+    path: '/api/ingest-token',
+    call: async () =>
+      (await import('@/app/api/ingest-token/route')).GET(request('/api/ingest-token')),
+  },
+  {
     // The one handler here that writes. Unguarded it would let anyone who finds
     // the URL clear the owner's unread badge — silently, and only forward.
     path: '/api/notifications/seen',
@@ -92,7 +110,15 @@ beforeEach(async () => {
   await sql`DELETE FROM app_credentials`;
 });
 
-describe.each(ROUTES)('$path', ({ call }) => {
+describe.each(ROUTES)('$path', ({ call, env }) => {
+  beforeEach(() => {
+    for (const [name, value] of Object.entries(env ?? {})) vi.stubEnv(name, value);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   test('refuses a request with no session', async () => {
     const response = await call();
     expect(response.status).toBe(401);

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { Metadata } from 'next';
 import type { ReactNode } from 'react';
 
+import { IngestToken } from '@/components/IngestToken';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui';
 
 /**
@@ -99,17 +100,21 @@ export default function DocsPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>2. Nyalakan penyimpannya</CardTitle>
-          <span className="text-xs text-muted">sekali per mesin</span>
+          <CardTitle>2. Hubungkan ke penyimpannya</CardTitle>
+          <span className="text-xs text-muted">sekali per browser</span>
         </CardHeader>
-        <CardContent className="space-y-3 text-sm leading-relaxed text-foreground">
-          <pre className="overflow-x-auto rounded-md border border-line bg-canvas px-3 py-2.5 text-xs text-foreground">
-            ecom-scraper serve
-          </pre>
+        <CardContent className="space-y-4 text-sm leading-relaxed text-foreground">
           <p>
-            Extension memasangkan dirinya sendiri: buka popup-nya dalam lima menit setelah perintah
-            di atas jalan, dan token diambil otomatis lewat jaringan lokal. Tidak ada yang perlu
-            disalin. Kalau lewat, jalankan <Code>ecom-scraper pair</Code> lalu buka popup lagi.
+            Extension mengirim hasil bacaannya ke server yang menulis ke database bersama. Ambil
+            alamat dan tokennya di sini, lalu tempel di popup extension → ikon ⚙ → <b>Simpan</b>.
+          </p>
+
+          <IngestToken />
+
+          <p className="text-muted">
+            Punya server sendiri di mesin ini (<Code>ecom-scraper serve</Code>)? Extension
+            memakainya otomatis tanpa token — ia mendeteksi server lokal saat pertama dibuka, dan
+            hanya memakai server awan kalau tidak menemukannya.
           </p>
         </CardContent>
       </Card>
