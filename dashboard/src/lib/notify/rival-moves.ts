@@ -329,10 +329,28 @@ function qualifyingMoves({ gapHours, threshold, windowDays, maxLookbackDays }: R
 /**
  * One page of the window.
  *
- * Ordered by consequence rather than by time: a rival who has gone under our
- * price first, then by the size of the move, and only then by id. `NULLS LAST`
- * on the first key puts the sets we have no price for after the ones we know we
- * are still winning — an unknown is not evidence of anything.
+ * **Ordered by capture time, newest first**, then by consequence — undercutting
+ * us, then the size of the move, then id. It used to lead with consequence, and
+ * that was right while the database was filled by hand: whatever was in it was
+ * equally current, so the only useful axis was which row demanded a decision.
+ *
+ * A daily sweep changes the question. Stores are now walked one after another
+ * across an afternoon, so at any moment the page holds rows captured minutes ago
+ * beside rows a week old, and a consequence-first order interleaves them with no
+ * signal but a timestamp per row. "Is this price current?" has to be answerable
+ * before "does this price matter", because acting on a stale undercut is worse
+ * than reading a fresh one late.
+ *
+ * The consequence keys are kept as tiebreaks rather than deleted, so rows
+ * captured in the same instant — which one sweep of one store produces in bulk —
+ * still lead with the ones that went under us. `NULLS LAST` on that key puts the
+ * sets we have no price for after the ones we know we are still winning; an
+ * unknown is not evidence of anything.
+ *
+ * This ordering and `foldByRecency` in `group.ts` are one decision in two
+ * places: SQL decides which rows a page holds, the fold decides how they read.
+ * Changing one without the other gives a page whose first rows are not the ones
+ * the query selected first.
  *
  * `seenSnapshotId` is the page's second tab and the **only** predicate here that
  * depends on read state. It sits in this outer SELECT rather than in
@@ -390,7 +408,8 @@ export async function rivalMoves(opts: RivalMovesOptions): Promise<RivalMove[]> 
          : sql`(m.id > ${opts.seenSnapshotId}::bigint
                 OR m.scraped_at > now() - make_interval(hours => ${graceHours}))`
      }
-     ORDER BY (m.price < op.price) DESC NULLS LAST,
+     ORDER BY m.scraped_at DESC,
+              (m.price < op.price) DESC NULLS LAST,
               abs(m.price - m.previous_price) / m.previous_price DESC,
               m.id DESC
      LIMIT ${opts.limit} OFFSET ${opts.offset}`;

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 
-import { foldByConsequence, foldRivalMoves, groupUndercutsUs } from '@/lib/notify/group';
+import { foldByConsequence, foldByRecency, foldRivalMoves, groupUndercutsUs } from '@/lib/notify/group';
 import type { RivalMove } from '@/lib/notify/rival-moves';
 
 /**
@@ -222,5 +222,89 @@ describe('foldByConsequence', () => {
     const [lone] = foldByConsequence([move({ productId: 9, undercutsUs: null })]);
     expect(lone.kind).toBe('single');
     expect(groupUndercutsUs(lone)).toBeNull();
+  });
+});
+
+describe('foldByRecency', () => {
+  /**
+   * What the page orders by now that a daily sweep refills the database.
+   *
+   * The sweep walks stores one after another over an afternoon, so the list
+   * holds rows captured minutes ago beside rows a week old. Freshest first is
+   * what makes "is this price current?" answerable without reading every
+   * timestamp; consequence survives as the tiebreak and as a per-row badge.
+   */
+
+  const ids = (entries: ReturnType<typeof foldByRecency>): number[] =>
+    entries.flatMap((entry) =>
+      entry.kind === 'folded' ? entry.members.map((m) => m.productId) : [entry.move.productId],
+    );
+
+  test('the newest capture leads, even when an older row undercuts us', () => {
+    // The exact inversion the change is for: yesterday's undercut used to sit
+    // above the reprice this afternoon's sweep just found.
+    const oldUndercut = move({
+      productId: 1,
+      undercutsUs: true,
+      scrapedAt: new Date('2026-08-01T02:00:00Z'),
+    });
+    const freshSafe = move({
+      productId: 2,
+      undercutsUs: false,
+      scrapedAt: new Date('2026-08-06T09:00:00Z'),
+    });
+
+    expect(ids(foldByRecency([oldUndercut, freshSafe]))).toEqual([2, 1]);
+    // And this is the ordering it replaces.
+    expect(ids(foldByConsequence([oldUndercut, freshSafe]))).toEqual([1, 2]);
+  });
+
+  test('rows captured in the same instant still lead with the undercut', () => {
+    const at = new Date('2026-08-06T09:00:00Z');
+    const safe = move({ productId: 1, undercutsUs: false, scrapedAt: at });
+    const under = move({ productId: 2, undercutsUs: true, scrapedAt: at });
+
+    expect(ids(foldByRecency([safe, under]))).toEqual([2, 1]);
+  });
+
+  test('a fold is dated by its newest member, not its oldest', () => {
+    // One store's catalogue-wide reprice folds into a single entry; it should
+    // rank by when that news was last confirmed.
+    const catalogue = [1, 2, 3].map((id) =>
+      move({
+        productId: id,
+        storeId: 7,
+        scrapedAt: new Date(id === 3 ? '2026-08-06T10:00:00Z' : '2026-08-01T02:00:00Z'),
+      }),
+    );
+    const lone = move({
+      productId: 9,
+      storeId: 8,
+      previousPrice: '100000',
+      price: '90000',
+      scrapedAt: new Date('2026-08-06T09:00:00Z'),
+    });
+
+    const entries = foldByRecency([...catalogue, lone]);
+    expect(entries[0].kind).toBe('folded');
+    expect(ids(entries)).toEqual([1, 2, 3, 9]);
+  });
+
+  test('groups stay homogeneous — a fold never straddles the undercut line', () => {
+    const shared = { storeId: 5, previousPrice: '100000', price: '90000' };
+    const mixed = [
+      move({ ...shared, productId: 1, undercutsUs: true }),
+      move({ ...shared, productId: 2, undercutsUs: true }),
+      move({ ...shared, productId: 3, undercutsUs: true }),
+      move({ ...shared, productId: 4, undercutsUs: false }),
+      move({ ...shared, productId: 5, undercutsUs: false }),
+      move({ ...shared, productId: 6, undercutsUs: false }),
+    ];
+
+    for (const entry of foldByRecency(mixed)) {
+      const members = entry.kind === 'folded' ? entry.members : [entry.move];
+      expect(new Set(members.map((m) => m.undercutsUs)).size).toBe(1);
+      expect(groupUndercutsUs(entry)).toBe(members[0].undercutsUs);
+    }
   });
 });
