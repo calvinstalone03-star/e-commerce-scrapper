@@ -1145,10 +1145,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       // "18,256 produk" under a Neon destination would be the wrong answer to
       // the only question these totals exist to answer.
       let stats = null;
+      //: Why the totals are missing, which is not the same question as whether
+      //: they are missing. A 401 means the server answered and refused; only a
+      //: throw means there is nothing there to answer.
+      let statsStatus = 0;
       try {
         const response = await fetch(`${endpoint}/stats`, {
           headers: { 'X-Ingest-Token': token, 'X-Ingest-Target': showing },
         });
+        statsStatus = response.status;
         if (response.ok) stats = await response.json();
       } catch (err) {
         /* server down; the popup renders that state */
@@ -1163,6 +1168,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       // pairing on the strength of this rather than showing a token box that
       // most users have no way to fill.
       let pairing = false;
+      //: Whether anything answered at `endpoint` at all. `/health` needs no
+      //: token, so it separates "server is not running" from "server refused
+      //: me" — a distinction the popup used to collapse into one wrong
+      //: instruction.
+      let serverUp = false;
       // Which destinations the server can actually write to. Offering a Neon
       // button on a server with no NEON_DATABASE_URL would turn a click into a
       // failed scrape instead of a disabled control.
@@ -1171,6 +1181,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const response = await fetch(`${endpoint}/health`);
         if (response.ok) {
           const health = await response.json();
+          serverUp = true;
           stale = Boolean(health.stale);
           pairing = Boolean(health.pairing);
           if (health.targets) targets = health.targets;
@@ -1206,6 +1217,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         destination: showing,
         targets,
         stats,
+        statsStatus,
+        serverUp,
         stale,
         pairing,
         job: snapshot(),

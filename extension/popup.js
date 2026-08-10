@@ -253,8 +253,28 @@ async function refresh() {
     $('tstores').textContent = context.stats.stores ?? '–';
   } else {
     for (const id of ['tproducts', 'tsnapshots', 'tstores']) $(id).textContent = '–';
+    // Three different reasons the totals are blank, and they take three
+    // different actions. Collapsing them into "server tidak aktif" was wrong
+    // twice over: the server was answering, and the fix it named does not exist
+    // on a machine with no Python.
     if (!$('result').textContent) {
-      setResult('server tidak aktif — jalankan: ecom-scraper serve', 'bad');
+      if (!context.serverUp) {
+        setResult(
+          isLocal(context.endpoint)
+            ? 'server ingest tidak bisa dihubungi — jalankan: ecom-scraper serve'
+            : `tidak bisa menghubungi ${context.endpoint}`,
+          'bad',
+        );
+      } else if (context.statsStatus === 401) {
+        setResult(
+          isLocal(context.endpoint)
+            ? 'token ingest belum ada atau ditolak — jalankan: ecom-scraper pair, lalu buka popup ini lagi'
+            : 'token ingest belum ada atau ditolak — ambil di halaman Panduan dashboard, lalu tempel lewat ikon ⚙',
+          'bad',
+        );
+      } else if (context.statsStatus) {
+        setResult(`server menjawab HTTP ${context.statsStatus} untuk /stats`, 'bad');
+      }
     }
   }
 
@@ -339,10 +359,22 @@ $('save').addEventListener('click', async () => {
   await chrome.storage.local.set(patch);
   $('token').value = '';
 
+  // Tested against `/stats`, which needs the token, rather than `/health`,
+  // which does not. There are two servers now and they hold different tokens,
+  // so "server terhubung" was true of a pairing that could never file a single
+  // row: the token from one server pasted against the address of the other.
+  // That combination stayed silent until the first scrape failed with a 401
+  // naming nothing.
+  const saved = token || (await chrome.storage.local.get(['token'])).token || '';
   try {
-    const response = await fetch(`${endpoint}/health`);
-    setResult(response.ok ? 'tersimpan, server terhubung' : `server balas HTTP ${response.status}`,
-      response.ok ? 'ok' : 'bad');
+    const response = await fetch(`${endpoint}/stats`, { headers: { 'X-Ingest-Token': saved } });
+    if (response.ok) {
+      setResult('tersimpan — token diterima server ini', 'ok');
+    } else if (response.status === 401) {
+      setResult(`tersimpan, tapi ${endpoint} menolak token ini — token milik server lain?`, 'bad');
+    } else {
+      setResult(`tersimpan, server balas HTTP ${response.status}`, 'bad');
+    }
   } catch (err) {
     setResult(`tersimpan, tapi ${endpoint} tidak bisa dihubungi`, 'bad');
   }
