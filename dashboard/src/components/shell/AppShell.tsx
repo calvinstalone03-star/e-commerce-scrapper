@@ -597,4 +597,9 @@ const NAV: NavItem[] = [
   { href: '/products', label: 'Produk', icon: <Icon path="M4 7l8-4 8 4-8 4zM4 7v10l8 4 8-4V7" /> },
   { href: '/stores', label: 'Toko', icon: <Icon path="M4 9h16l-1 11H5zM9 9V6a3 3 0 016 0v3" /> },
   { href: '/settings', label: 'Pengaturan', icon: <Icon path="M12 15a3 3 0 100-6 3 3 0 000 6zM19 12a7 7 0 00-.1-1l2-1.6-2-3.4-2.4 1a7 7 0 00-1.7-1L14.4 3H9.6l-.4 2.6a7 7 0 00-1.7 1l-2.4-1-2 3.4L5.1 11a7 7 0 000 2l-2 1.6 2 3.4 2.4-1a7 7 0 001.7 1l.4 2.6h4.8l.4-2.6a7 7 0 001.7-1l2.4 1 2-3.4-2-1.6c.1-.3.1-.7.1-1z" /> },
+  // Last, and deliberately not first: it is the entry a new user needs once and
+  // an existing one never — but it is also where the extension is downloaded
+  // from, which is the only part of this product that cannot be reached from
+  // any other screen.
+  { href: '/docs', label: 'Panduan', icon: <Icon path="M4 5a2 2 0 012-2h11v18H6a2 2 0 01-2-2zM9 7h5M9 11h5" /> },
 ];

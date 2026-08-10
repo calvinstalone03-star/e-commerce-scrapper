@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "vitest run"
+    "test": "vitest run",
+    "pack:extension": "node scripts/pack-extension.mjs",
+    "prebuild": "node scripts/pack-extension.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",
