@@ -147,17 +147,21 @@ function renderDestination(context) {
   // The worker resolves this; the fallback only covers a context that arrived
   // without one, and it agrees with the worker's own default.
   const chosen = context.destination || 'neon';
-  const available = context.targets || { local: true, neon: false };
+  // Null until the server answers, and that is not the same as "neon is not
+  // configured". Assuming the pessimistic shape while the answer is in flight
+  // greyed out the button the user was reaching for, and hid the switch
+  // entirely for the moment before it arrived.
+  const available = context.targets;
 
   // One configured database is not a choice. Hiding the switch is what lets a
   // fresh install have nothing to decide: the server already knows where its
-  // rows go.
-  const configured = Object.values(available).filter(Boolean).length;
+  // rows go. Unknown is not one choice, so the switch stays.
+  const configured = available ? Object.values(available).filter(Boolean).length : 2;
   $('dest').classList.toggle('solo', configured < 2);
 
   for (const [id, name] of [['dlocal', 'local'], ['dneon', 'neon']]) {
     const button = $(id);
-    const off = available[name] === false;
+    const off = available ? available[name] === false : false;
     button.classList.toggle('on', chosen === name);
     button.dataset.off = off ? '1' : '0';
     button.disabled = off || running;
@@ -195,27 +199,11 @@ async function refresh() {
 
   renderDestination(context);
   renderPlan(context);
-
-  // No token yet: ask the server for one rather than showing a box only a
-  // developer could fill. The server answers while its pairing window is open;
-  // when it refuses it says why, and that sentence is more useful than an empty
-  // field. Guarded so a closed window cannot loop: one attempt per popup.
-  if (!context.hasToken && context.pairing && !paired) {
-    paired = true;
-    const answer = await chrome.runtime.sendMessage({ type: 'pair' });
-    if (answer?.ok) return refresh();
-    setResult(answer?.error || 'gagal mengambil token', 'bad');
-  } else if (!context.hasToken && !context.pairing) {
-    // Two different servers, two different answers. Loopback can hand the token
-    // over by itself and just refused, so `pair` is the fix; a hosted server
-    // never will, and telling that user to run a command they do not have is
-    // how a working install looks broken.
-    setResult(
-      isLocal(context.endpoint)
-        ? 'extension belum berpasangan — jalankan `ecom-scraper pair`, lalu buka popup ini lagi'
-        : 'belum ada token — ambil di halaman Panduan dashboard, lalu tempel lewat ikon ⚙',
-      'bad',
-    );
+  // Not '–': that is what "the server said zero" looks like. A run of dots says
+  // the answer is still in flight, which on a hosted server it will be for a
+  // moment.
+  for (const id of ['tproducts', 'tsnapshots', 'tstores']) {
+    if (!$(id).dataset.filled) $(id).textContent = '…';
   }
 
   $('endpoint').value = context.endpoint;
@@ -238,46 +226,6 @@ async function refresh() {
     $('resume').classList.add('on');
   } else {
     $('resume').classList.remove('on');
-  }
-
-  // A server running code older than the file on disk will keep reproducing
-  // bugs that are already fixed, and nothing else in this popup would say so.
-  if (context.stale) {
-    setResult(
-      'server ingest memakai kode lama — jalankan: launchctl kickstart -k gui/$UID/com.ecomscraper.ingest',
-      'bad',
-    );
-  }
-
-  if (context.stats) {
-    $('tproducts').textContent = context.stats.products ?? '–';
-    $('tsnapshots').textContent = context.stats.snapshots ?? '–';
-    $('tstores').textContent = context.stats.stores ?? '–';
-  } else {
-    for (const id of ['tproducts', 'tsnapshots', 'tstores']) $(id).textContent = '–';
-    // Three different reasons the totals are blank, and they take three
-    // different actions. Collapsing them into "server tidak aktif" was wrong
-    // twice over: the server was answering, and the fix it named does not exist
-    // on a machine with no Python.
-    if (!$('result').textContent) {
-      if (!context.serverUp) {
-        setResult(
-          isLocal(context.endpoint)
-            ? 'server ingest tidak bisa dihubungi — jalankan: ecom-scraper serve'
-            : `tidak bisa menghubungi ${context.endpoint}`,
-          'bad',
-        );
-      } else if (context.statsStatus === 401) {
-        setResult(
-          isLocal(context.endpoint)
-            ? 'token ingest belum ada atau ditolak — jalankan: ecom-scraper pair, lalu buka popup ini lagi'
-            : 'token ingest belum ada atau ditolak — ambil di halaman Panduan dashboard, lalu tempel lewat ikon ⚙',
-          'bad',
-        );
-      } else if (context.statsStatus) {
-        setResult(`server menjawab HTTP ${context.statsStatus} untuk /stats`, 'bad');
-      }
-    }
   }
 
   renderJob(context.job);
@@ -343,7 +291,13 @@ $('rgo').addEventListener('click', async () => {
 for (const id of ['dlocal', 'dneon']) {
   $(id).addEventListener('click', async () => {
     if (running) return;
-    await chrome.storage.local.set({ destination: $(id).dataset.destination });
+    const destination = $(id).dataset.destination;
+    // Drawn before it is stored, not after. Writing to chrome.storage and
+    // re-asking the worker is fast, but it is not instant, and a toggle that
+    // waits to move reads as a toggle that did not register — which is exactly
+    // what it looked like while this also waited on the server.
+    if (lastContext) renderDestination({ ...lastContext, destination });
+    await chrome.storage.local.set({ destination });
     refresh();
   });
 }
@@ -367,6 +321,7 @@ $('save').addEventListener('click', async () => {
   // row: the token from one server pasted against the address of the other.
   // That combination stayed silent until the first scrape failed with a 401
   // naming nothing.
+  setResult('menyimpan…', 'muted');
   const saved = token || (await chrome.storage.local.get(['token'])).token || '';
   try {
     const response = await fetch(`${endpoint}/stats`, { headers: { 'X-Ingest-Token': saved } });
@@ -383,7 +338,99 @@ $('save').addEventListener('click', async () => {
   refresh();
 });
 
+/**
+ * The half of the popup that needs the server, applied when the server answers.
+ *
+ * Separated from `refresh` because the two have completely different costs. The
+ * tab, the prefs and the destination are already on this machine and render in
+ * a frame; totals, pairing and staleness are a round trip to an ingest server
+ * that may be a continent away. Waiting for the second before drawing the first
+ * made every click — Neon, Lokal, Simpan — look like it had not registered.
+ */
+async function applyServer(state) {
+  if (!state || !lastContext) return;
+  const context = { ...lastContext, ...state };
+  lastContext = context;
+
+  renderDestination(context);
+
+  // No token yet: ask the server for one rather than showing a box only a
+  // developer could fill. The server answers while its pairing window is open;
+  // when it refuses it says why, and that sentence is more useful than an empty
+  // field. Guarded so a closed window cannot loop: one attempt per popup.
+  if (!state.hasToken && state.pairing && !paired) {
+    paired = true;
+    const answer = await chrome.runtime.sendMessage({ type: 'pair' });
+    if (answer?.ok) return refresh();
+    setResult(answer?.error || 'gagal mengambil token', 'bad');
+  } else if (!state.hasToken && !state.pairing) {
+    // Two different servers, two different answers. Loopback can hand the token
+    // over by itself and just refused, so `pair` is the fix; a hosted server
+    // never will, and telling that user to run a command they do not have is
+    // how a working install looks broken.
+    setResult(
+      isLocal(state.endpoint)
+        ? 'extension belum berpasangan — jalankan `ecom-scraper pair`, lalu buka popup ini lagi'
+        : 'belum ada token — ambil di halaman Panduan dashboard, lalu tempel lewat ikon ⚙',
+      'bad',
+    );
+  }
+
+
+  $('token').placeholder = context.hasToken
+    ? '•••••••• tersimpan'
+    : isLocal(context.endpoint)
+      ? 'jalankan: ecom-scraper pair'
+      : 'ambil di halaman Panduan dashboard';
+
+  // A server running code older than the file on disk will keep reproducing
+  // bugs that are already fixed, and nothing else in this popup would say so.
+  if (state.stale) {
+    setResult(
+      'server ingest memakai kode lama — jalankan: launchctl kickstart -k gui/$UID/com.ecomscraper.ingest',
+      'bad',
+    );
+  }
+
+  if (state.stats) {
+    $('tproducts').textContent = state.stats.products ?? '–';
+    $('tsnapshots').textContent = state.stats.snapshots ?? '–';
+    $('tstores').textContent = state.stats.stores ?? '–';
+    for (const id of ['tproducts', 'tsnapshots', 'tstores']) $(id).dataset.filled = '1';
+  } else {
+    for (const id of ['tproducts', 'tsnapshots', 'tstores']) $(id).textContent = '–';
+    // Three different reasons the totals are blank, and they take three
+    // different actions. Collapsing them into "server tidak aktif" was wrong
+    // twice over: the server was answering, and the fix it named does not exist
+    // on a machine with no Python.
+    if (!$('result').textContent) {
+      if (!state.serverUp) {
+        setResult(
+          isLocal(state.endpoint)
+            ? 'server ingest tidak bisa dihubungi — jalankan: ecom-scraper serve'
+            : `tidak bisa menghubungi ${state.endpoint}`,
+          'bad',
+        );
+      } else if (state.statsStatus === 401) {
+        setResult(
+          isLocal(state.endpoint)
+            ? 'token ingest belum ada atau ditolak — jalankan: ecom-scraper pair, lalu buka popup ini lagi'
+            : 'token ingest belum ada atau ditolak — ambil di halaman Panduan dashboard, lalu tempel lewat ikon ⚙',
+          'bad',
+        );
+      } else if (state.statsStatus) {
+        setResult(`server menjawab HTTP ${state.statsStatus} untuk /stats`, 'bad');
+      }
+    }
+  }
+
+}
+
 chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === 'server') {
+    applyServer(message.server);
+    return;
+  }
   if (message?.type !== 'progress') return;
   renderJob(message.job);
   // The totals only move when a page has been filed, so refreshing them per
