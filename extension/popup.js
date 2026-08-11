@@ -428,6 +428,10 @@ async function applyServer(state) {
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'server') {
+    // Ignore an answer to a question that has since been asked again. Without
+    // this, saving a token showed "tersimpan" and then, a second later, the
+    // previous request's "belum ada token".
+    if (message.seq !== lastContext?.seq) return;
     applyServer(message.server);
     return;
   }
