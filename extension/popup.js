@@ -353,6 +353,9 @@ async function applyServer(state) {
   lastContext = context;
 
   renderDestination(context);
+  // Re-decided from scratch every time the server answers: whatever was said
+  // last time described the state it saw then.
+  clearDiagnostic();
 
   // No token yet: ask the server for one rather than showing a box only a
   // developer could fill. The server answers while its pairing window is open;
@@ -362,17 +365,16 @@ async function applyServer(state) {
     paired = true;
     const answer = await chrome.runtime.sendMessage({ type: 'pair' });
     if (answer?.ok) return refresh();
-    setResult(answer?.error || 'gagal mengambil token', 'bad');
+    setDiagnostic(answer?.error || 'gagal mengambil token');
   } else if (!state.hasToken && !state.pairing) {
     // Two different servers, two different answers. Loopback can hand the token
     // over by itself and just refused, so `pair` is the fix; a hosted server
     // never will, and telling that user to run a command they do not have is
     // how a working install looks broken.
-    setResult(
+    setDiagnostic(
       isLocal(state.endpoint)
         ? 'extension belum berpasangan — jalankan `ecom-scraper pair`, lalu buka popup ini lagi'
         : 'belum ada token — ambil di halaman Panduan dashboard, lalu tempel lewat ikon ⚙',
-      'bad',
     );
   }
 
@@ -386,9 +388,8 @@ async function applyServer(state) {
   // A server running code older than the file on disk will keep reproducing
   // bugs that are already fixed, and nothing else in this popup would say so.
   if (state.stale) {
-    setResult(
+    setDiagnostic(
       'server ingest memakai kode lama — jalankan: launchctl kickstart -k gui/$UID/com.ecomscraper.ingest',
-      'bad',
     );
   }
 
@@ -405,21 +406,19 @@ async function applyServer(state) {
     // on a machine with no Python.
     if (!$('result').textContent) {
       if (!state.serverUp) {
-        setResult(
+        setDiagnostic(
           isLocal(state.endpoint)
             ? 'server ingest tidak bisa dihubungi — jalankan: ecom-scraper serve'
             : `tidak bisa menghubungi ${state.endpoint}`,
-          'bad',
         );
       } else if (state.statsStatus === 401) {
-        setResult(
+        setDiagnostic(
           isLocal(state.endpoint)
             ? 'token ingest belum ada atau ditolak — jalankan: ecom-scraper pair, lalu buka popup ini lagi'
             : 'token ingest belum ada atau ditolak — ambil di halaman Panduan dashboard, lalu tempel lewat ikon ⚙',
-          'bad',
         );
       } else if (state.statsStatus) {
-        setResult(`server menjawab HTTP ${state.statsStatus} untuk /stats`, 'bad');
+        setDiagnostic(`server menjawab HTTP ${state.statsStatus} untuk /stats`, 'bad');
       }
     }
   }
