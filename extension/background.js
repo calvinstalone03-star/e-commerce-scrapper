@@ -115,6 +115,50 @@ async function getConfig() {
   };
 }
 
+/**
+ * What the server says about itself: totals, which databases it can write to,
+ * whether it will still pair, and whether it is running stale code.
+ *
+ * Both requests go out together rather than one after the other. They share
+ * nothing and always both ran; awaiting them in sequence simply added one
+ * round trip to every popup open, which is free on loopback and is not on a
+ * deployment a thousand kilometres from its database.
+ */
+async function readServerState(endpoint, token, showing) {
+  const [statsResult, healthResult] = await Promise.allSettled([
+    fetch(`${endpoint}/stats`, {
+      headers: { 'X-Ingest-Token': token, 'X-Ingest-Target': showing },
+    }),
+    fetch(`${endpoint}/health`),
+  ]);
+
+  let stats = null;
+  //: Why the totals are missing, which is not the same question as whether they
+  //: are. A 401 means the server answered and refused; a rejection means there
+  //: was nothing there to answer.
+  let statsStatus = 0;
+  if (statsResult.status === 'fulfilled') {
+    statsStatus = statsResult.value.status;
+    if (statsResult.value.ok) stats = await statsResult.value.json().catch(() => null);
+  }
+
+  let serverUp = false;
+  let stale = false;
+  let pairing = false;
+  let targets = { local: true, neon: false };
+  if (healthResult.status === 'fulfilled' && healthResult.value.ok) {
+    const health = await healthResult.value.json().catch(() => null);
+    if (health) {
+      serverUp = true;
+      stale = Boolean(health.stale);
+      pairing = Boolean(health.pairing);
+      if (health.targets) targets = health.targets;
+    }
+  }
+
+  return { stats, statsStatus, serverUp, stale, pairing, targets };
+}
+
 async function getPrefs() {
   const stored = await chrome.storage.local.get([PREFS_KEY]);
   const prefs = stored[PREFS_KEY] || {};
@@ -1141,54 +1185,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         /* not a URL we recognise */
       }
 
-      // Counted in the database the popup is showing, not always the laptop's:
-      // "18,256 produk" under a Neon destination would be the wrong answer to
-      // the only question these totals exist to answer.
-      let stats = null;
-      //: Why the totals are missing, which is not the same question as whether
-      //: they are missing. A 401 means the server answered and refused; only a
-      //: throw means there is nothing there to answer.
-      let statsStatus = 0;
-      try {
-        const response = await fetch(`${endpoint}/stats`, {
-          headers: { 'X-Ingest-Token': token, 'X-Ingest-Target': showing },
-        });
-        statsStatus = response.status;
-        if (response.ok) stats = await response.json();
-      } catch (err) {
-        /* server down; the popup renders that state */
-      }
-
-      // Whether the server is running the code that is on disk. It runs under
-      // launchd and survives edits, so a fix can land in the source while the
-      // process that predates it keeps filing the rows the fix was meant to
-      // stop — twice now, and both times it looked like the fix had failed.
-      let stale = false;
-      // Whether the server will still hand over a token. The popup offers
-      // pairing on the strength of this rather than showing a token box that
-      // most users have no way to fill.
-      let pairing = false;
-      //: Whether anything answered at `endpoint` at all. `/health` needs no
-      //: token, so it separates "server is not running" from "server refused
-      //: me" — a distinction the popup used to collapse into one wrong
-      //: instruction.
-      let serverUp = false;
-      // Which destinations the server can actually write to. Offering a Neon
-      // button on a server with no NEON_DATABASE_URL would turn a click into a
-      // failed scrape instead of a disabled control.
-      let targets = { local: true, neon: false };
-      try {
-        const response = await fetch(`${endpoint}/health`);
-        if (response.ok) {
-          const health = await response.json();
-          serverUp = true;
-          stale = Boolean(health.stale);
-          pairing = Boolean(health.pairing);
-          if (health.targets) targets = health.targets;
-        }
-      } catch (err) {
-        /* server down; already reported through `stats` */
-      }
+      // Everything that needs the server is gone from this reply. It used to be
+      // fetched here — `/stats`, then `/health`, awaited in that order — and the
+      // popup could not paint until both had answered. On loopback that was
+      // invisible; against a deployment it is seconds, and it was seconds on
+      // *every* click, because pressing Neon or Save re-asks for context.
+      //
+      // So the reply is now what this machine already knows, and the two
+      // requests are fired without being awaited: whichever popup is open gets
+      // a `server` message when they land, and one that has since closed simply
+      // does not.
+      readServerState(endpoint, token, showing).then((server) => {
+        chrome.runtime.sendMessage({ type: 'server', server }).catch(() => {});
+      });
 
       // A tab already sitting on a storefront pre-fills the shop box: that is
       // the shop the user is looking at, and retyping it would be busywork.
@@ -1215,12 +1224,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         shop: shopFromTab || prefs.shop,
         target: prefs.target,
         destination: showing,
-        targets,
-        stats,
-        statsStatus,
-        serverUp,
-        stale,
-        pairing,
         job: snapshot(),
         resume: resume
           ? {
