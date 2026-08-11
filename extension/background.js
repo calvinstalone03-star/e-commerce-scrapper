@@ -192,6 +192,10 @@ async function getPrefs() {
 //: while nothing is running would be a worse lie than showing nothing.
 let job = null;
 let keepAlive = null;
+//: Counts context requests, so a popup can tell a stale answer from the one it
+//: is waiting for. Server state arrives out of band and the requests are not
+//: cancellable, so ordering has to be stated rather than assumed.
+let contextSeq = 0;
 
 function newJob(keyword, target, mode, shopInput) {
   return {
@@ -1206,8 +1210,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       // requests are fired without being awaited: whichever popup is open gets
       // a `server` message when they land, and one that has since closed simply
       // does not.
+      // Stamped with the request it answers. Saving a token triggers a fresh
+      // context, and the reply to the *previous* one — taken before the token
+      // existed — was still in flight: it landed afterwards and overwrote
+      // "tersimpan" with "belum ada token", which was true when it was asked
+      // and false by the time it arrived.
+      contextSeq += 1;
+      const seq = contextSeq;
       readServerState(endpoint, token, showing).then((server) => {
-        chrome.runtime.sendMessage({ type: 'server', server }).catch(() => {});
+        chrome.runtime.sendMessage({ type: 'server', seq, server }).catch(() => {});
       });
 
       // A tab already sitting on a storefront pre-fills the shop box: that is
@@ -1235,6 +1246,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         shop: shopFromTab || prefs.shop,
         target: prefs.target,
         destination: showing,
+        seq,
         job: snapshot(),
         resume: resume
           ? {

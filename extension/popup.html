@@ -184,23 +184,12 @@
         font-variant-numeric: tabular-nums;
       }
       #plan {
-        margin-top: 10px;
+        margin-top: 12px;
         font-size: 12px;
         line-height: 1.45;
         color: var(--muted);
       }
       #plan b { color: var(--fg); font-weight: 600; }
-      #opts { margin-top: 10px; }
-      #opts summary {
-        cursor: pointer;
-        font-size: 11px;
-        color: var(--muted);
-        list-style: none;
-      }
-      #opts summary::-webkit-details-marker { display: none; }
-      #opts summary::before { content: '▸ '; }
-      #opts[open] summary::before { content: '▾ '; }
-      #opts summary:hover { color: var(--fg); }
       /* Hidden entirely when the server has only one database configured: a
          choice with one option is a question nobody should be asked. */
       #dest.solo { display: none; }
@@ -230,28 +219,25 @@
          a button with hidden arguments. -->
     <div id="plan">—</div>
 
+    <!-- Everything visible, nothing behind a disclosure. A storefront tab fills
+         these in by itself, so the collapsed version was hiding fields that
+         were already correct — but it also hid the shop about to be walked,
+         the keyword filtering it, and which database the rows land in, which
+         is the whole of what the button is about to do. -->
+    <input type="text" id="shop" placeholder="toko — username / URL" />
+    <input type="text" id="keyword" placeholder="kata kunci (opsional)" />
+
+    <div class="row">
+      <label for="target">jumlah produk</label>
+      <input type="number" id="target" min="1" max="5000" step="10" value="2000" />
+    </div>
+
+    <div id="dest">
+      <button id="dlocal" data-destination="local">Lokal</button>
+      <button id="dneon" data-destination="neon">Neon</button>
+    </div>
+
     <button class="primary" id="scrape">Mulai scrape</button>
-
-    <!-- The three inputs the first version led with. They are still the whole
-         control surface, but a storefront tab fills all three by itself, so
-         leading with them asked every user to re-state what the tab already
-         said. Open once and it stays open for that popup. -->
-    <details id="opts">
-      <summary>Opsi</summary>
-
-      <input type="text" id="shop" placeholder="toko — username / URL" />
-      <input type="text" id="keyword" placeholder="kata kunci (opsional)" />
-
-      <div class="row">
-        <label for="target">jumlah produk</label>
-        <input type="number" id="target" min="1" max="5000" step="10" value="2000" />
-      </div>
-
-      <div id="dest">
-        <button id="dlocal" data-destination="local">Lokal</button>
-        <button id="dneon" data-destination="neon">Neon</button>
-      </div>
-    </details>
 
     <div id="resume">
       <span id="rtext">—</span>
