@@ -30,6 +30,9 @@ let paired = false;
 //: redrawn as the user types without re-asking the server — that answer costs a
 //: /health and a /stats round trip, and it does not change between keystrokes.
 let lastContext = null;
+//: True while a sweep owns the worker. The single-shop button is meaningless
+//: then — one job at a time — and the sweep button becomes the way to stop.
+let sweeping = false;
 
 function setResult(text, kind = 'muted') {
   $('result').textContent = text;
@@ -82,11 +85,61 @@ function scrapeLabel(context) {
   return 'Scrape halaman ini';
 }
 
+/**
+ * The queue: where it is, what it has done, and what it is doing now.
+ *
+ * The per-shop list is the part worth keeping on screen. A sweep that reports
+ * only "12/20" hides the two shops that were skipped, and a skipped shop with
+ * no reason attached is indistinguishable from one that had nothing to file.
+ */
+function renderSweep(state) {
+  sweeping = Boolean(state?.running);
+  const bar = $('sweepbar');
+
+  if (!state) {
+    bar.classList.remove('on');
+    $('sweep').textContent = 'Scrape semua toko';
+    $('sweep').disabled = running;
+    return;
+  }
+
+  bar.classList.add('on');
+  $('sweep').textContent = sweeping ? 'Batal semua' : 'Scrape semua toko';
+  $('sweep').disabled = false;
+
+  const done = state.results.length;
+  $('stext').textContent = state.current
+    ? `toko ${Math.min(state.index + 1, state.total)}/${state.total} · ${state.current.username} · ${state.status}`
+    : `${done}/${state.total} toko · ${state.status}`;
+  $('sbar').firstElementChild.style.width = `${Math.round((done / Math.max(1, state.total)) * 100)}%`;
+
+  $('slist').replaceChildren(
+    ...state.results
+      .slice()
+      .reverse()
+      .map((row) => {
+        const li = document.createElement('li');
+        li.className = row.ok ? '' : 'bad';
+        const name = document.createElement('span');
+        name.textContent = row.username;
+        const outcome = document.createElement('span');
+        outcome.textContent = row.ok ? `${row.unique ?? 0} produk` : row.reason || 'gagal';
+        li.append(name, outcome);
+        return li;
+      }),
+  );
+}
+
 function renderJob(job) {
   running = Boolean(job?.running);
 
   $('scrape').textContent = running ? 'Batal' : 'Mulai scrape';
   $('scrape').classList.toggle('stop', running);
+  // During a sweep the queue owns the worker, and cancelling its current walk
+  // would end the whole sweep — so there is one stop button, and it is the one
+  // that says so.
+  $('scrape').disabled = sweeping || !lastContext?.marketplace;
+  $('scrape').title = sweeping ? 'sapuan sedang berjalan — pakai "Batal semua"' : '';
   for (const id of ['keyword', 'shop', 'target']) $(id).disabled = running;
   // Locked while a job runs, because the job's destination is fixed at its
   // start: a control that moved but changed nothing would be a lie.
@@ -228,7 +281,18 @@ async function refresh() {
     $('resume').classList.remove('on');
   }
 
+  // Sweep first: it decides whether the single-shop button is even meaningful,
+  // and `renderJob` reads that.
+  renderSweep(context.sweep);
   renderJob(context.job);
+  // An interrupted sweep is offered, not restarted: it knows which shops it
+  // already walked, and starting over would file them twice.
+  if (!context.sweep && context.sweepResume) {
+    $('sweepbar').classList.add('on');
+    $('stext').textContent =
+      `sapuan tertunda di toko ${context.sweepResume.index + 1}/${context.sweepResume.total}`;
+    $('sweep').textContent = 'Lanjutkan sapuan';
+  }
   // After renderJob, which owns the running/cancel state and would otherwise
   // overwrite the label with the generic one.
   $('scrape').textContent = scrapeLabel(context);
@@ -301,6 +365,28 @@ for (const id of ['dlocal', 'dneon']) {
     refresh();
   });
 }
+
+$('sweep').addEventListener('click', async () => {
+  if (sweeping) {
+    await chrome.runtime.sendMessage({ type: 'sweep-stop' });
+    return;
+  }
+
+  const resume = $('sweep').textContent === 'Lanjutkan sapuan';
+  setResult(resume ? 'melanjutkan sapuan…' : 'mengambil daftar toko…', 'muted');
+  const answer = await chrome.runtime.sendMessage({
+    type: 'sweep-start',
+    resume,
+    keyword: $('keyword').value.trim(),
+    target: Number($('target').value) || undefined,
+  });
+  if (!answer?.ok) {
+    setResult(answer?.error || 'sapuan gagal dimulai', 'bad');
+    return;
+  }
+  setResult(`sapuan dimulai — ${answer.total} toko`, 'ok');
+  refresh();
+});
 
 $('gear').addEventListener('click', () => {
   $('settings').classList.toggle('open');
@@ -426,6 +512,14 @@ async function applyServer(state) {
 }
 
 chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === 'sweep') {
+    renderSweep(message.sweep);
+    // The totals move as shops finish, and a sweep is the one case where they
+    // move without the popup having asked for anything.
+    if (!message.sweep?.running) refresh();
+    return;
+  }
+
   if (message?.type === 'server') {
     // Ignore an answer to a question that has since been asked again. Without
     // this, saving a token showed "tersimpan" and then, a second later, the

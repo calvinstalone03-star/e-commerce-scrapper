@@ -196,6 +196,11 @@ let keepAlive = null;
 //: is waiting for. Server state arrives out of band and the requests are not
 //: cancellable, so ordering has to be stated rather than assumed.
 let contextSeq = 0;
+//: Resolved when the running job finishes, so a sweep can await a walk it did
+//: not start inline. The job itself deliberately runs detached — `start` answers
+//: the popup immediately and the walk outlives it — so "wait for this one" needs
+//: somewhere to hang.
+let jobDone = null;
 
 function newJob(keyword, target, mode, shopInput) {
   return {
@@ -1065,10 +1070,22 @@ async function runJob(tabId, site, resume = null) {
   }
 }
 
-async function startJob({ keyword, shop, target }, resume = null) {
+async function startJob({ keyword, shop, target }, resume = null, presetTabId = null) {
   if (job?.running) return { ok: false, error: 'masih ada scrape yang berjalan' };
 
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  // The popup means "the tab I am looking at"; a sweep names the tab it opened
+  // for the shop it is on. Reading the active tab during a sweep would follow
+  // the user around their browser mid-walk.
+  let tab = null;
+  if (presetTabId !== null) {
+    try {
+      tab = await chrome.tabs.get(presetTabId);
+    } catch (err) {
+      return { ok: false, error: 'tab toko sudah ditutup' };
+    }
+  } else {
+    [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  }
   if (!tab?.id) return { ok: false, error: 'tidak ada tab aktif' };
 
   let site = null;
@@ -1138,6 +1155,12 @@ async function startJob({ keyword, shop, target }, resume = null) {
       if (!job.error && !job.cancelled) await clearResume();
       stopKeepAlive();
       broadcast();
+      // Whoever is waiting for this walk to end — a sweep, in practice.
+      if (jobDone) {
+        const settle = jobDone;
+        jobDone = null;
+        settle(snapshot());
+      }
     }
   })();
 
@@ -1151,6 +1174,256 @@ async function resumeJob() {
     { keyword: resume.keyword, shop: resume.shopInput, target: resume.target },
     resume,
   );
+}
+
+
+// ---------------------------------------------------------------------------
+// Sweep: one click, every shop
+// ---------------------------------------------------------------------------
+//
+// Twenty shops used to be twenty rounds of the same four actions — open the
+// storefront, open the popup, press the button, wait. Nothing about those
+// rounds needed a person; the decisions were all made before the first one.
+//
+// So a sweep is a queue over the walk that already exists. It does not
+// reimplement scraping: it opens each storefront in one reused tab and runs
+// `startJob` against it, exactly as the button does, then waits for that walk
+// to end before moving on. One job at a time stays true, which is what keeps
+// the extension's own "masih ada scrape yang berjalan" guard meaningful.
+
+//: Between shops. Long enough that twenty storefronts in a row do not arrive as
+//: a metronome — the pattern anti-bot systems read most easily — and the next
+//: shop's first page has time to render before anything is asked of it.
+const SWEEP_GAP_MS = 10_000;
+const SWEEP_GAP_JITTER_MS = 10_000;
+
+//: Consecutive failures that end a sweep. One shop failing is ordinary: a
+//: CAPTCHA, a storefront that has moved, a slug that no longer resolves. Three
+//: in a row is not about the shops — it is the session, or the site deciding it
+//: has seen enough — and walking into it seventeen more times makes it worse.
+const SWEEP_GIVE_UP_AFTER = 3;
+
+const SWEEP_KEY = 'sweep';
+
+let sweep = null;
+
+function sweepSnapshot() {
+  if (!sweep) return null;
+  return {
+    running: sweep.running,
+    index: sweep.index,
+    total: sweep.shops.length,
+    current: sweep.shops[sweep.index] || null,
+    results: sweep.results,
+    status: sweep.status,
+    stopping: sweep.stopping,
+  };
+}
+
+function broadcastSweep() {
+  chrome.runtime.sendMessage({ type: 'sweep', sweep: sweepSnapshot() }).catch(() => {});
+}
+
+async function saveSweep() {
+  if (!sweep) return;
+  try {
+    await chrome.storage.local.set({
+      [SWEEP_KEY]: {
+        shops: sweep.shops,
+        index: sweep.index,
+        results: sweep.results,
+        keyword: sweep.keyword,
+        target: sweep.target,
+        savedAt: Date.now(),
+      },
+    });
+  } catch (err) {
+    /* storage full: the sweep still runs, it just cannot be resumed */
+  }
+}
+
+//: The shops to walk, oldest reading first — the order the server decides, so
+//: an interrupted sweep leaves behind the ones that were freshest anyway.
+async function fetchShops() {
+  const { endpoint, token, destination } = await getConfig();
+  const response = await fetch(`${endpoint}/stores`, {
+    headers: { 'X-Ingest-Token': token, 'X-Ingest-Target': destination },
+  });
+  if (response.status === 401) throw new Error('token ingest ditolak');
+  if (!response.ok) throw new Error(`server balas HTTP ${response.status} untuk /stores`);
+  const body = await response.json();
+  const shops = (body?.stores || []).filter((shop) => shop.username && shop.marketplace);
+  if (!shops.length) throw new Error('server tidak punya daftar toko');
+  return shops;
+}
+
+function storefrontUrl(shop) {
+  return shop.marketplace === 'tokopedia'
+    ? `https://www.tokopedia.com/${encodeURIComponent(shop.username)}`
+    : `https://shopee.co.id/${encodeURIComponent(shop.username)}`;
+}
+
+//: One tab for the whole sweep, navigated from shop to shop. Twenty tabs would
+//: be twenty renderers holding twenty marketplace pages, and closing them
+//: afterwards would be one more thing to get wrong.
+async function sweepTab(tabId, url) {
+  if (tabId !== null) {
+    try {
+      await chrome.tabs.get(tabId);
+      const navigated = await navigateAndWait(tabId, url);
+      return navigated.ok ? tabId : null;
+    } catch (err) {
+      /* the tab went away between shops; open another below */
+    }
+  }
+  const tab = await chrome.tabs.create({ url, active: false });
+  const deadline = Date.now() + 45_000;
+  while (Date.now() < deadline) {
+    await sleep(500);
+    let current;
+    try {
+      current = await chrome.tabs.get(tab.id);
+    } catch (err) {
+      return null;
+    }
+    if (current.status === 'complete') return tab.id;
+  }
+  return null;
+}
+
+async function runSweep(shops, { keyword, target }, startIndex = 0, results = []) {
+  sweep = {
+    running: true,
+    shops,
+    index: startIndex,
+    results,
+    keyword,
+    target,
+    status: 'menyiapkan…',
+    stopping: false,
+    tabId: null,
+  };
+  broadcastSweep();
+  startKeepAlive();
+
+  let consecutiveFailures = 0;
+
+  try {
+    for (; sweep.index < shops.length; sweep.index += 1) {
+      if (sweep.stopping) break;
+      const shop = shops[sweep.index];
+
+      sweep.status = `membuka ${shop.username}…`;
+      broadcastSweep();
+      await saveSweep();
+
+      const tabId = await sweepTab(sweep.tabId, storefrontUrl(shop));
+      sweep.tabId = tabId;
+      if (tabId === null) {
+        sweep.results.push({ ...shop, ok: false, reason: 'tab toko tidak bisa dibuka' });
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= SWEEP_GIVE_UP_AFTER) break;
+        continue;
+      }
+
+      // The walk itself, and the wait for it. `startJob` answers as soon as the
+      // job is accepted — that is what lets a popup close mid-walk — so the
+      // sweep waits on the job's own completion instead of on this call.
+      const finished = new Promise((resolve) => {
+        jobDone = resolve;
+      });
+      const accepted = await startJob({ keyword, shop: shop.username, target }, null, tabId);
+      if (!accepted?.ok) {
+        jobDone = null;
+        sweep.results.push({ ...shop, ok: false, reason: accepted?.error || 'gagal dimulai' });
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= SWEEP_GIVE_UP_AFTER) break;
+        continue;
+      }
+
+      sweep.status = `menelusuri ${shop.username}…`;
+      broadcastSweep();
+
+      const outcome = await finished;
+      // A walk that filed nothing and said why is a failure; one that filed
+      // rows and then hit something is a partial success, and the rows are
+      // already in the database either way.
+      const filed = outcome?.unique || 0;
+      const failed = Boolean(outcome?.error) && filed === 0;
+      sweep.results.push({
+        ...shop,
+        ok: !failed,
+        unique: filed,
+        reason: outcome?.error || null,
+      });
+      consecutiveFailures = failed ? consecutiveFailures + 1 : 0;
+
+      if (outcome?.cancelled) {
+        // Cancelling the walk cancels the sweep. The button says "Batal semua"
+        // while a sweep runs, and a cancel that only skipped a shop would be a
+        // button that does not do what it says.
+        sweep.stopping = true;
+        break;
+      }
+      if (consecutiveFailures >= SWEEP_GIVE_UP_AFTER) {
+        sweep.status = `berhenti setelah ${SWEEP_GIVE_UP_AFTER} kegagalan berturut-turut`;
+        break;
+      }
+
+      if (sweep.index + 1 < shops.length && !sweep.stopping) {
+        sweep.status = 'jeda sebelum toko berikutnya…';
+        broadcastSweep();
+        await sleep(SWEEP_GAP_MS + Math.random() * SWEEP_GAP_JITTER_MS);
+      }
+    }
+  } finally {
+    const done = sweep.index >= shops.length;
+    sweep.running = false;
+    sweep.status = sweep.stopping ? 'dihentikan' : done ? 'selesai' : sweep.status;
+    stopKeepAlive();
+    if (done || sweep.stopping) await chrome.storage.local.remove(SWEEP_KEY).catch(() => {});
+    else await saveSweep();
+    broadcastSweep();
+  }
+}
+
+async function startSweep({ keyword, target }, resume = null) {
+  if (sweep?.running) return { ok: false, error: 'sapuan sudah berjalan' };
+  if (job?.running) return { ok: false, error: 'masih ada scrape yang berjalan' };
+
+  let shops;
+  try {
+    shops = resume ? resume.shops : await fetchShops();
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+
+  runSweep(shops, { keyword, target }, resume?.index || 0, resume?.results || []);
+  return { ok: true, total: shops.length };
+}
+
+function stopSweep() {
+  if (!sweep?.running) return { ok: false, error: 'tidak ada sapuan yang berjalan' };
+  sweep.stopping = true;
+  sweep.status = 'menghentikan…';
+  if (job?.running) job.cancelled = true;
+  broadcastSweep();
+  return { ok: true };
+}
+
+async function getSweepResume() {
+  try {
+    const stored = await chrome.storage.local.get([SWEEP_KEY]);
+    const saved = stored[SWEEP_KEY];
+    if (!saved?.shops?.length) return null;
+    if (saved.index >= saved.shops.length) return null;
+    // Same twelve hours a single walk's resume is worth: prices move, and
+    // finishing yesterday's sweep today would file two readings as one.
+    if (Date.now() - (saved.savedAt || 0) > RESUME_MAX_AGE_MS) return null;
+    return saved;
+  } catch (err) {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,6 +1441,25 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'resume') {
     resumeJob().then(sendResponse);
     return true;
+  }
+
+  if (message?.type === 'sweep-start') {
+    // `resume: true` continues where an interrupted sweep stopped, keeping the
+    // shops it had already walked out of the queue.
+    (async () => {
+      const saved = message.resume ? await getSweepResume() : null;
+      if (message.resume && !saved) {
+        sendResponse({ ok: false, error: 'tidak ada sapuan yang bisa dilanjutkan' });
+        return;
+      }
+      sendResponse(await startSweep(message, saved));
+    })();
+    return true;
+  }
+
+  if (message?.type === 'sweep-stop') {
+    sendResponse(stopSweep());
+    return false;
   }
 
   if (message?.type === 'pair') {
@@ -1235,6 +1527,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       // user's call, not a decision to make on their behalf while they were
       // away.
       const resume = job?.running ? null : await getResume();
+      // A sweep interrupted by an evicted worker or a closed browser; offered
+      // the same way a single walk is, and for the same reason.
+      const sweepResume = sweep?.running ? null : await getSweepResume();
 
       sendResponse({
         endpoint,
@@ -1248,6 +1543,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         destination: showing,
         seq,
         job: snapshot(),
+        sweep: sweepSnapshot(),
+        sweepResume: sweepResume
+          ? { index: sweepResume.index, total: sweepResume.shops.length }
+          : null,
         resume: resume
           ? {
               shopInput: resume.shopInput,

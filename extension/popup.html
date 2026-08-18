@@ -88,6 +88,49 @@
         cursor: pointer;
       }
       button.primary:disabled { opacity: 0.45; cursor: default; }
+      button.secondary {
+        width: 100%;
+        margin-top: 7px;
+        padding: 8px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: transparent;
+        color: var(--fg);
+        font: inherit;
+        cursor: pointer;
+      }
+      button.secondary:disabled { opacity: 0.45; cursor: default; }
+      #sweepbar {
+        display: none;
+        margin-top: 9px;
+        font-size: 11px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      #sweepbar.on { display: block; }
+      #sbar {
+        height: 3px;
+        margin-top: 5px;
+        border-radius: 2px;
+        background: var(--line);
+        overflow: hidden;
+      }
+      #sbar > i {
+        display: block;
+        height: 100%;
+        width: 0%;
+        background: var(--accent);
+        transition: width 0.25s ease;
+      }
+      #slist {
+        margin: 6px 0 0;
+        padding: 0;
+        list-style: none;
+        max-height: 108px;
+        overflow-y: auto;
+      }
+      #slist li { display: flex; justify-content: space-between; gap: 8px; padding: 1px 0; }
+      #slist li.bad { color: var(--bad); }
       button.primary.stop { background: transparent; color: var(--fg); border: 1px solid var(--line); }
       /* Offered, not urged: continuing an interrupted walk is usually right, but
          a run left half-finished on purpose must not look like an error. */
@@ -238,6 +281,16 @@
     </div>
 
     <button class="primary" id="scrape">Mulai scrape</button>
+
+    <!-- The queue button. Deliberately second and quieter: one shop is the
+         common case and the deliberate one, twenty is the standing chore. -->
+    <button class="secondary" id="sweep">Scrape semua toko</button>
+
+    <div id="sweepbar">
+      <span id="stext">—</span>
+      <div id="sbar"><i></i></div>
+      <ul id="slist"></ul>
+    </div>
 
     <div id="resume">
       <span id="rtext">—</span>

@@ -1080,6 +1080,66 @@ def build_app(
         )
         return {**result.as_dict(), "target": target}
 
+    @app.get("/stores")
+    def stores(
+        x_ingest_token: str | None = Header(default=None),
+        x_ingest_target: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """The shops to sweep, oldest reading first.
+
+        The extension can walk twenty storefronts off one click, but it cannot
+        ask a database which twenty. This is that list, from the same database
+        the run will write to — asking Neon while filing locally would sweep
+        shops the local database has never heard of.
+
+        Ordered by how long it has been since anything was captured for each
+        shop, nulls first. A sweep that is interrupted — a closed laptop, a
+        wall of verification, a browser restart — leaves behind whatever it did
+        not reach, and this makes that remainder the shops that were freshest
+        already. Alphabetical order would strand the same tail every time.
+        """
+        _authorise(x_ingest_token)
+        target, chosen = _resolve(x_ingest_target)
+        from sqlalchemy import func, select
+        from scraper.db import PriceSnapshotRow, ProductRow, StoreRow
+        from scraper.db import session_scope as _scope
+
+        with _scope(chosen.database_url) as session:
+            newest = (
+                select(
+                    ProductRow.shop_ref.label("shop_ref"),
+                    func.max(PriceSnapshotRow.scraped_at).label("last_seen"),
+                )
+                .join(PriceSnapshotRow, PriceSnapshotRow.product_ref == ProductRow.id)
+                .group_by(ProductRow.shop_ref)
+                .subquery()
+            )
+            rows = session.execute(
+                select(
+                    StoreRow.marketplace,
+                    StoreRow.username,
+                    StoreRow.name,
+                    StoreRow.is_own,
+                    newest.c.last_seen,
+                )
+                .outerjoin(newest, newest.c.shop_ref == StoreRow.id)
+                .order_by(newest.c.last_seen.asc().nulls_first(), StoreRow.username.asc())
+            ).all()
+
+        return {
+            "target": target,
+            "stores": [
+                {
+                    "marketplace": getattr(row.marketplace, "value", row.marketplace),
+                    "username": row.username,
+                    "name": row.name,
+                    "isOwn": bool(row.is_own),
+                    "lastSeen": row.last_seen.isoformat() if row.last_seen else None,
+                }
+                for row in rows
+            ],
+        }
+
     @app.get("/stats")
     def stats(
         x_ingest_token: str | None = Header(default=None),

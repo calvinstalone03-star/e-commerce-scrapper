@@ -756,6 +756,35 @@ deployment.
 
 Suitable for cron: `1` means "look at the log", `2` means "the setup is broken".
 
+## Sweeping every shop from one click
+
+The collector walks one shop per press. Twenty shops meant twenty rounds of
+open-storefront, open-popup, press, wait — and none of those rounds decided
+anything: the keyword, the target and the destination were settled before the
+first one.
+
+**Scrape semua toko** is a queue over that same walk. It asks the ingest server
+for the shop list (`GET /stores`, token-gated like `/stats`), opens each
+storefront in one reused tab, runs the ordinary walk against it, and moves on
+when that walk ends. Still one job at a time, still the browser making every
+request a person clicking "next" would have made.
+
+The list arrives **oldest reading first**. A sweep that is cut short — a closed
+laptop, a wall of verification — leaves behind whatever it did not reach, and
+this makes that remainder the shops that were freshest already. Alphabetical
+order would strand the same tail on every interrupted run.
+
+One shop failing does not end the sweep: it is recorded with its reason and the
+queue continues. **Three consecutive failures do** end it — that is no longer
+about the shops, it is the session or the site, and walking into it seventeen
+more times makes it worse. Between shops the sweep waits ten to twenty seconds,
+which is both the pace a person browses at and the time the next storefront
+needs to render.
+
+An interrupted sweep is offered back rather than restarted, the same way a
+single walk is: it knows which shops it already filed, and starting over would
+read them twice.
+
 ## 9. Deploy the ingest server (optional, for other people's machines)
 
 The ingest server is a local service by default, and for your own machine it

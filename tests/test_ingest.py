@@ -1029,3 +1029,74 @@ def test_named_extension_is_allowed_across_origins(settings, monkeypatch) -> Non
 
     assert allowed.headers["access-control-allow-origin"] == origin
     assert "access-control-allow-origin" not in {k.lower() for k in other.headers}
+
+
+# ----------------------------------------------------------------------
+# The sweep list
+# ----------------------------------------------------------------------
+
+
+def test_stores_needs_a_token(client) -> None:
+    """It names every shop in the database; that is not public."""
+    http, _service = client
+
+    assert http.get("/stores").status_code == 401
+
+
+def test_stores_lists_shops_oldest_reading_first(settings, monkeypatch, tmp_path) -> None:
+    """The order is the feature: an interrupted sweep should strand the freshest.
+
+    Alphabetical would leave the same tail unswept every time the run is cut
+    short — a closed laptop, a wall of verification — and those shops would
+    drift further behind on every attempt.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from fastapi.testclient import TestClient
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from scraper.db import Base, PriceSnapshotRow, ProductRow, StoreRow
+
+    url = f"sqlite:///{tmp_path / 'sweep.db'}"
+    engine = create_engine(url, future=True)
+    Base.metadata.create_all(engine)
+    now = datetime.now(tz=timezone.utc)
+
+    with sessionmaker(bind=engine, future=True)() as session:
+        for index, (username, hours) in enumerate((("fresh", 1), ("stale", 72)), start=1):
+            store = StoreRow(
+                marketplace="shopee", shop_id=index, username=username, is_own=False
+            )
+            session.add(store)
+            session.flush()
+            product = ProductRow(marketplace="shopee", item_id=hours, shop_ref=store.id)
+            session.add(product)
+            session.flush()
+            session.add(
+                PriceSnapshotRow(
+                    # Stated because SQLite will not generate a BIGINT primary
+                    # key on its own, and Postgres owns the sequence in real use.
+                    id=index,
+                    product_ref=product.id,
+                    price=1000,
+                    scraped_at=now - timedelta(hours=hours),
+                )
+            )
+        # Never captured at all: it has waited longest of anyone.
+        session.add(
+            StoreRow(marketplace="shopee", shop_id=99, username="never", is_own=False)
+        )
+        session.commit()
+
+    monkeypatch.setenv("INGEST_TOKEN", "test-token")
+    # The route reads the chosen target's own URL, the way /stats does, so the
+    # stub has to name a database rather than the settings pointing at one.
+    service = RecordingService()
+    service.database_url = url
+    http = TestClient(build_app(settings, service=service))
+
+    body = http.get("/stores", headers={"X-Ingest-Token": "test-token"}).json()
+
+    assert [row["username"] for row in body["stores"]] == ["never", "stale", "fresh"]
+    assert body["stores"][0]["lastSeen"] is None
