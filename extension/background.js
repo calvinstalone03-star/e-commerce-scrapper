@@ -23,7 +23,7 @@
 // So the worker now owns a job object, answers 'start' immediately, and streams
 // progress to whichever popup happens to be open.
 
-importScripts('sites.js');
+importScripts('sites.js', 'batch.js');
 
 const ENDPOINT_KEY = 'endpoint';
 const TOKEN_KEY = 'token';
@@ -232,7 +232,13 @@ function snapshot() {
 
 function broadcast() {
   // Fails when no popup is open, which is the normal case for a long job.
-  chrome.runtime.sendMessage({ type: 'progress', job: snapshot() }).catch(() => {});
+  //
+  // Both halves travel together: a sweep and the shop it is walking change on
+  // the same events, and sending them separately let the popup paint "toko 7/20"
+  // beside the page counter of shop 6.
+  chrome.runtime
+    .sendMessage({ type: 'progress', job: snapshot(), batch: batchRunner?.snapshot() ?? null })
+    .catch(() => {});
 }
 
 function setStatus(text) {
@@ -1065,21 +1071,24 @@ async function runJob(tabId, site, resume = null) {
   }
 }
 
-async function startJob({ keyword, shop, target }, resume = null) {
+/**
+ * Run one job to completion.
+ *
+ * Split out of `startJob` for the batch queue, which is the one caller that has
+ * to know when a shop has *finished* — the popup never did, because a job
+ * outlives it. Everything about how a shop is walked is unchanged; this is the
+ * same body, awaited instead of abandoned.
+ *
+ * @param spec What to scrape. `keyword`/`shop`/`target`, as the popup sends.
+ * @param context.site Which marketplace, already resolved. A single scrape reads
+ *   it off the tab; a batch is told which site each shop lives on.
+ * @param context.tabId The tab to drive.
+ * @param context.resume A saved place, or null.
+ * @returns The finished job snapshot — including `error`, which is how a caller
+ *   learns the run failed. This never rejects for a scraping failure.
+ */
+async function beginJob({ keyword, shop, target }, { site, tabId, resume = null }) {
   if (job?.running) return { ok: false, error: 'masih ada scrape yang berjalan' };
-
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id) return { ok: false, error: 'tidak ada tab aktif' };
-
-  let site = null;
-  try {
-    site = globalThis.ecomSiteForHost(new URL(tab.url).hostname);
-  } catch (err) {
-    /* not a marketplace tab; reported below */
-  }
-  if (!site) {
-    return { ok: false, error: 'buka tab Shopee atau Tokopedia dulu, lalu cari dari sini' };
-  }
 
   const typed = String(keyword || '').trim();
   const shopInput = String(shop || '').trim();
@@ -1087,7 +1096,13 @@ async function startJob({ keyword, shop, target }, resume = null) {
   // No keyword and no shop typed? Use the term already in the address bar, so a
   // search the user ran by hand can still be paginated. With a shop named, the
   // address bar is not what the user meant, so it is ignored.
-  const fromTab = shopInput ? '' : globalThis.ecomKeywordFromUrl(tab.url || '');
+  let tabUrl = '';
+  try {
+    tabUrl = (await chrome.tabs.get(tabId)).url || '';
+  } catch (err) {
+    return { ok: false, error: 'tab ditutup' };
+  }
+  const fromTab = shopInput ? '' : globalThis.ecomKeywordFromUrl(tabUrl);
   const term = typed || fromTab;
 
   // A named shop is the strongest instruction: walk that shop's grid, and treat
@@ -1124,9 +1139,9 @@ async function startJob({ keyword, shop, target }, resume = null) {
   broadcast();
   startKeepAlive();
 
-  (async () => {
+  const done = (async () => {
     try {
-      await runJob(tab.id, site, resume);
+      await runJob(tabId, site, resume);
     } catch (err) {
       job.error = String(err?.message || err);
     } finally {
@@ -1136,11 +1151,89 @@ async function startJob({ keyword, shop, target }, resume = null) {
       // continue from. One that stopped on an error or a cancel does, and that
       // is exactly when the saved place earns its keep.
       if (!job.error && !job.cancelled) await clearResume();
-      stopKeepAlive();
+      // A sweep is still going after one of its shops ends, and the worker has
+      // to stay alive for the next one. Without this check the keep-alive died
+      // between every pair of shops, which is where MV3 evicts.
+      if (!batchRunner.isRunning()) stopKeepAlive();
       broadcast();
     }
+    return snapshot();
   })();
 
+  return { ok: true, done };
+}
+
+/**
+ * Which tab a run should drive, and which marketplace it is on.
+ *
+ * @param marketplace Name a batch was handed, or null to read the active tab.
+ */
+async function resolveRunTab(marketplace = null) {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+
+  if (marketplace) {
+    const site = globalThis.ecomSiteFor(marketplace);
+    if (!site) return { ok: false, error: `marketplace tidak dikenal: ${marketplace}` };
+
+    // The tab this sweep is already driving, before anything else is considered.
+    // A sweep that opened its own tab opened it in the background, so from the
+    // second shop on it is not the active tab any more — and without this the
+    // check below found no marketplace tab under the user, opened another, and
+    // a twenty-shop list left twenty tabs behind.
+    if (batchTabId !== null) {
+      try {
+        await chrome.tabs.get(batchTabId);
+        return { ok: true, site, tabId: batchTabId };
+      } catch (err) {
+        batchTabId = null; // closed mid-sweep: fall through and open a fresh one
+      }
+    }
+
+    // Any tab will do — the storefront walk navigates to an absolute URL before
+    // it reads anything, so the tab does not have to be on that site already.
+    // Reusing the active marketplace tab keeps a sweep to one tab; anything else
+    // gets a tab of its own rather than having the page under the user replaced.
+    let current = null;
+    try {
+      current = globalThis.ecomSiteForHost(new URL(tab?.url || '').hostname);
+    } catch (err) {
+      /* not a marketplace tab */
+    }
+    if (tab?.id && current) return { ok: true, site, tabId: tab.id };
+
+    const opened = await chrome.tabs.create({ url: site.homeUrl, active: false });
+    return { ok: true, site, tabId: opened.id, opened: true };
+  }
+
+  if (!tab?.id) return { ok: false, error: 'tidak ada tab aktif' };
+  let site = null;
+  try {
+    site = globalThis.ecomSiteForHost(new URL(tab.url).hostname);
+  } catch (err) {
+    /* not a marketplace tab; reported below */
+  }
+  if (!site) {
+    return { ok: false, error: 'buka tab Shopee atau Tokopedia dulu, lalu cari dari sini' };
+  }
+  return { ok: true, site, tabId: tab.id };
+}
+
+/**
+ * Start a job and answer immediately. What the popup's button calls.
+ *
+ * The job outlives the popup, so waiting for it would mean answering a window
+ * that has since closed. `beginJob` hands back the promise; this drops it.
+ */
+async function startJob({ keyword, shop, target }, resume = null) {
+  const target_ = await resolveRunTab();
+  if (!target_.ok) return { ok: false, error: target_.error };
+
+  const started = await beginJob(
+    { keyword, shop, target },
+    { site: target_.site, tabId: target_.tabId, resume },
+  );
+  if (!started.ok) return started;
+  started.done.catch(() => {}); // beginJob records failures on the job itself
   return { ok: true };
 }
 
@@ -1151,6 +1244,125 @@ async function resumeJob() {
     { keyword: resume.keyword, shop: resume.shopInput, target: resume.target },
     resume,
   );
+}
+
+// ---------------------------------------------------------------------------
+// The batch: every shop on the server's list, one after another
+// ---------------------------------------------------------------------------
+
+//: Where a sweep's place is kept. Its own key, separate from RESUME_KEY: the two
+//: answer different questions — "which shop" and "which page of it" — and a
+//: sweep needs both to continue where it stopped.
+const BATCH_KEY = 'batch';
+
+//: The tab a sweep drives, held for its whole run so twenty shops share one tab
+//: rather than opening twenty. Reset when the sweep ends; a tab the user closed
+//: mid-sweep is reported by `beginJob` as "tab ditutup" and costs one shop.
+let batchTabId = null;
+
+/** Ask the ingest server which shops to walk. */
+async function fetchShopList() {
+  const { endpoint, token } = await getConfig();
+  if (!token) return { ok: false, error: 'belum ada token — buka pengaturan dan pasangkan dulu' };
+
+  let response;
+  try {
+    response = await fetch(`${endpoint}/shops`, { headers: { 'X-Ingest-Token': token } });
+  } catch (err) {
+    return { ok: false, error: `tidak bisa menghubungi ${endpoint} — server ingest jalan?` };
+  }
+  if (response.status === 401) return { ok: false, error: 'token ditolak server ingest' };
+  if (response.status === 404) {
+    // An older server. Said plainly, because the fix is on the machine running
+    // it and nothing in the extension can do anything about it.
+    return { ok: false, error: 'server ingest ini belum punya /shops — perbarui lalu restart' };
+  }
+  if (!response.ok) return { ok: false, error: `server menjawab HTTP ${response.status}` };
+
+  const body = await response.json().catch(() => null);
+  const shops = Array.isArray(body?.shops) ? body.shops : [];
+  if (!shops.length && body?.detail) return { ok: false, error: body.detail };
+  return { ok: true, shops };
+}
+
+const batchRunner = globalThis.ecomCreateBatchRunner({
+  fetchShops: fetchShopList,
+
+  //: One shop, start to finish. The queue awaits this; everything about *how* a
+  //: storefront is walked is the same code a single scrape runs.
+  runShop: async ({ marketplace, slug, target, useResume }) => {
+    const tab = await resolveRunTab(marketplace);
+    if (!tab.ok) throw new Error(tab.error);
+    batchTabId = tab.tabId;
+
+    const resume = useResume ? await getResume() : null;
+    const started = await beginJob(
+      { keyword: '', shop: slug, target },
+      { site: tab.site, tabId: tab.tabId, resume },
+    );
+    if (!started.ok) throw new Error(started.error);
+    return started.done;
+  },
+
+  cancelShop: () => {
+    if (job?.running) {
+      job.cancelled = true;
+      setStatus('menghentikan…');
+    }
+  },
+
+  saveState: async (state) => {
+    try {
+      if (state === null) {
+        await chrome.storage.local.remove(BATCH_KEY);
+        batchTabId = null;
+      } else {
+        await chrome.storage.local.set({ [BATCH_KEY]: state });
+      }
+    } catch (err) {
+      /* storage full or unavailable: the sweep continues, it just cannot resume */
+    }
+  },
+
+  loadState: async () => {
+    try {
+      return (await chrome.storage.local.get([BATCH_KEY]))[BATCH_KEY] || null;
+    } catch (err) {
+      return null;
+    }
+  },
+
+  //: Whether `background.js` is holding a mid-shop place. The queue asks before
+  //: handing one to the first shop of a resumed sweep — see `useResumeOnce`.
+  hasShopResume: () => Boolean(pendingShopResume),
+
+  onChange: () => broadcast(),
+  sleep,
+  now: () => Date.now(),
+});
+
+//: Read once when the popup asks to resume, because `hasShopResume` has to
+//: answer synchronously and `getResume` does not. Refreshed on every resume
+//: request, so it never outlives the run it describes.
+let pendingShopResume = false;
+
+async function startBatch({ target }) {
+  const wanted = Number(target);
+  const capped =
+    Number.isFinite(wanted) && wanted > 0 ? Math.min(Math.floor(wanted), 5_000) : DEFAULT_TARGET;
+  pendingShopResume = false;
+  startKeepAlive();
+  const answer = await batchRunner.start({ target: capped });
+  if (!answer.ok) stopKeepAlive();
+  return answer;
+}
+
+async function resumeBatch() {
+  pendingShopResume = Boolean(await getResume());
+  startKeepAlive();
+  const answer = await batchRunner.resume();
+  if (!answer.ok) stopKeepAlive();
+  return answer;
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,8 +1387,31 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === 'startBatch') {
+    startBatch(message).then(sendResponse);
+    return true;
+  }
+
+  if (message?.type === 'resumeBatch') {
+    resumeBatch().then(sendResponse);
+    return true;
+  }
+
+  if (message?.type === 'retryFailed') {
+    batchRunner.retryFailed().then((answer) => {
+      if (answer.ok) startKeepAlive();
+      sendResponse(answer);
+    });
+    return true;
+  }
+
   if (message?.type === 'cancel') {
-    if (job?.running) {
+    // One button, and it means "stop what is running". During a sweep that is
+    // the sweep — cancelling only the shop would have the queue start the next
+    // one a second later, which reads as a cancel that did not work.
+    if (batchRunner.isRunning()) {
+      batchRunner.cancel();
+    } else if (job?.running) {
       job.cancelled = true;
       setStatus('menghentikan…');
     }
@@ -1248,6 +1483,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         destination: showing,
         seq,
         job: snapshot(),
+        batch: batchRunner.snapshot(),
+        // An interrupted sweep, offered the same way an interrupted shop is:
+        // continuing navigates twenty storefronts, and that is not something to
+        // start on someone's behalf because they happened to open the popup.
+        batchResume: await batchRunner.offer(),
         resume: resume
           ? {
               shopInput: resume.shopInput,

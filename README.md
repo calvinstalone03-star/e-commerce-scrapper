@@ -195,6 +195,36 @@ Counting is by distinct product, so the repeats both sites sprinkle between
 pages do not inflate the total, and the last page is trimmed rather than
 overshot: asking for 100 files 100.
 
+### Every shop in one press
+
+**Scrape semua toko** walks the whole list instead of one storefront. The list is
+`config/stores.txt` on the machine running the ingest server, which hands it over
+at `GET /shops`; the extension holds no list of its own, so changing the file
+changes what the button does with no reload and no rebuild. **jumlah produk**
+applies to each shop in turn.
+
+The sweep is deliberately half-manual. The database knows every seller a scrape
+has walked past, and a list that grew itself from that would sweep shops nobody
+chose — so the dashboard's Toko screen offers **Unduh stores.txt**, a draft built
+from the shops already in the database and ordered by how many products each has.
+Trim it, save it to `config/stores.txt`, and that is the list.
+
+A shop that fails does not end the sweep: it is recorded, the next shop starts,
+and the popup lists what each shop filed with the failures marked. **Ulangi toko
+yang gagal** re-runs only those. Pressing **Batal** stops the sweep, not just the
+storefront in flight.
+
+Twenty catalogues take hours, and MV3 evicts an idle service worker, so the place
+is saved before each shop starts and after each page is filed. Re-open the popup
+after an eviction and it offers to continue — at the shop it stopped in, on the
+page after the last one already in the database. Nothing continues on its own:
+the sweep navigates a tab through storefront after storefront, and starting that
+because someone opened a popup would be a decision this extension does not make.
+
+The pause between shops (4–8s) is longer than the pause between pages (1.2–2.7s).
+Twenty storefronts in a row is a more conspicuous pattern than one person paging
+through one shop, and a run measured in hours can afford it.
+
 Fill in **toko** as well and the run walks that shop's products instead of the
 site's search results, on either marketplace. The box takes a username, a pasted
 storefront URL, or the shop's display name — a display name is only a guess at a
@@ -300,6 +330,8 @@ is locked while a job is running.
 | `extension/sites.js` | Per-marketplace config: hosts, product-link shape, and how the site numbers result pages (Shopee from 0, Tokopedia from 1). |
 | `extension/dom-scraper.js` | Generic extractor: wait for the first card, scroll the grid, find product links, walk out to the card, read the text. |
 | `extension/background.js` | Owns the job — navigate, scrape, POST, next page — and streams progress to the popup. |
+| `extension/batch.js` | Owns the queue above that job: which shop is next, what happened to the last one, where to pick up after an eviction. |
+| `scraper/shops.py` | Parses `config/stores.txt` into `(marketplace, slug)`. One parser for the CLI and the extension both. |
 | `scraper/ingest.py` | Turns cards into rows, reusing `models.parse_sold` rather than a second copy in JS. |
 
 The one genuinely site-specific piece is how a product link identifies itself:
@@ -849,6 +881,7 @@ Real environment variables win over `.env`.
 | `MAX_DELAY` | `5.0` | Upper bound. Must be >= `MIN_DELAY` or startup fails |
 | `COOKIES_PATH` | `cookies.json` | Where the cookie jar is persisted. Always written `0600`; `.gitignore` covers `*cookies*.json`, so a path outside that pattern is yours to add |
 | `NEON_DATABASE_URL` | _(unset)_ | The hosted database (section 7). Target of `ecom-scraper sync`, and the second destination the extension can pick. Use the direct, non-pooler endpoint |
+| `STORES_FILE` | `config/stores.txt` | The shop list `--mode store` and the extension's batch run both walk. A relative path is resolved against the repository root, not the working directory, because the ingest server is started by launchd and by Vercel |
 
 The dashboard reads its own environment, not this one — see
 `dashboard/.env.example`. `NOTIFY_MIN_GAP_HOURS` (12) lives there: it is how old
@@ -859,6 +892,12 @@ Target files (`config/keywords.txt`, `config/stores.txt`): one entry per line,
 blank lines and `#` comment lines ignored, duplicates collapsed. A `#` only
 starts a comment at the beginning of a line, since Indonesian listing titles can
 contain one.
+
+`config/stores.txt` names its marketplace: `shopee/erigostore`,
+`tokopedia/eiger-official`, or a pasted storefront URL. A line with no
+marketplace is Shopee, so a file written before Tokopedia support still means
+what it did. `--mode store` walks the Shopee entries — that path has no other
+adapter — while the extension's batch run walks both.
 
 ## Scheduling
 

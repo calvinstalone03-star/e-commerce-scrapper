@@ -47,13 +47,39 @@ export default async function StoresPage({
 
   return (
     <div className="space-y-6">
-      <header className="space-y-1">
-        <h1 className="text-2xl font-semibold tracking-tight text-foreground">Toko</h1>
-        <p className="max-w-2xl text-sm text-muted">
-          Setiap penjual yang pernah muncul di hasil scrape, dengan jumlah produk dan rentang
-          harganya. Lokasi hanya terisi bila marketplace menampilkannya, jadi kolom kosong bukan
-          berarti tokonya tanpa alamat.
-        </p>
+      <header className="flex flex-wrap items-start justify-between gap-3">
+        <div className="space-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight text-foreground">Toko</h1>
+          <p className="max-w-2xl text-sm text-muted">
+            Setiap penjual yang pernah muncul di hasil scrape, dengan jumlah produk dan rentang
+            harganya. Lokasi hanya terisi bila marketplace menampilkannya, jadi kolom kosong bukan
+            berarti tokonya tanpa alamat.
+          </p>
+        </div>
+
+        {/*
+          A plain link, not a button with state: this is a download, and the
+          response carries its own filename. `download` is a hint the browser
+          mostly ignores for an attachment, but it keeps the file named right
+          when someone middle-clicks it.
+
+          The instruction travels in the file's own header as well — a
+          stores.txt sitting in ~/Downloads is inert, and the thing that makes
+          it work is knowing where to put it.
+        */}
+        <div className="text-right">
+          <a
+            href="/api/stores/export"
+            download="stores.txt"
+            className="inline-flex h-9 items-center rounded-md border border-line px-3 text-sm text-foreground transition-colors hover:bg-surface-muted"
+          >
+            Unduh stores.txt
+          </a>
+          <p className="mt-1 max-w-64 text-xs text-muted">
+            Daftar toko untuk disimpan ke <code>config/stores.txt</code>. Itu yang dijalankan
+            tombol “Scrape semua toko” di extension.
+          </p>
+        </div>
       </header>
 
       {/*

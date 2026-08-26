@@ -1,11 +1,12 @@
 {
-  "version": "0.5.0",
+  "version": "0.6.0",
   "files": {
-    "background.js": "45545479530b4002265cf2fd9524bd412a196dac121ed3d1171329394319ee9f",
-    "dom-scraper.js": "56efdc475ac2e3ddae98c84c557e310071d0315ca36ce716ceb6eee16a7ef896",
-    "manifest.json": "5f4c344d2171850458cf29d1e6cc33b3cd182fd30ac6b61cf255659d8dcf6aeb",
-    "popup.html": "5a8f9e20c9c43af0a22cdbcbfb14524e8a0e94e496c8477e046aa418e27dd902",
-    "popup.js": "41ad09b66ad593ed05d9013bf4071955914b0c2ea378585b85c75c8f0bb5b1ca",
-    "sites.js": "66d0018f2b2ddde9160637559797f04b3434969db93e559bd1720bab166758c2"
+    "background.js": "6d1834f19395a28a3eb630eef530083800c065a1724be3820101551abf15c563",
+    "batch.js": "1969eb92ccd44e7bc0aef6d8703c3a3af9dfc6b08be3fd17c14863b28af2d68f",
+    "dom-scraper.js": "b3438b1b7d5557bbba104f07c7051ce7c2f6cc14023180b0cd8d77ad9284984b",
+    "manifest.json": "12c8cc7b488848cda40a5d1b0e88a506037f47e389f8aa20fd1431d967ba2000",
+    "popup.html": "f9362917062c8145a43f610589b84efc84cba4194a3de1a9c56bfc21e96eac2f",
+    "popup.js": "4aab50b6375ea79f4c7b236c42d1c530f2358312ccd5d0965059d669bbd64595",
+    "sites.js": "f6539e2843a4b9d24a99860a88d820877a32d7c2017131cfe90acd185fb10d68"
   }
 }

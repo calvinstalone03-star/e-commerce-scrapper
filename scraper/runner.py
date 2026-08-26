@@ -92,10 +92,10 @@ from scraper.config import (
     dedupe,
     get_settings,
     load_keywords,
-    load_stores,
     normalise_store_entry,
 )
 from scraper.models import Marketplace, RunMode, RunStatus, ScrapeRun, Store, utcnow
+from scraper.shops import load_shop_entries
 
 __all__ = [
     "RunResult",
@@ -695,9 +695,11 @@ def resolve_targets(
 
     Precedence: ``inline`` wins outright when non-empty; otherwise the file for
     the given mode is read via :func:`scraper.config.load_keywords` or
-    :func:`scraper.config.load_stores`, defaulting to ``config/keywords.txt`` /
-    ``config/stores.txt``. Duplicates are removed while preserving first-seen
-    order, so a repeated keyword is not scraped twice in one invocation.
+    :func:`scraper.shops.load_shop_entries`, defaulting to
+    ``config/keywords.txt`` / ``config/stores.txt``. Store mode keeps only the
+    Shopee entries, because that is the only adapter this path has. Duplicates
+    are removed while preserving first-seen order, so a repeated keyword is not
+    scraped twice in one invocation.
 
     Args:
         mode: Which kind of target to resolve.
@@ -724,7 +726,14 @@ def resolve_targets(
     elif mode is RunMode.KEYWORD:
         targets = load_keywords(keywords_file) if keywords_file else load_keywords()
     else:
-        targets = load_stores(stores_file) if stores_file else load_stores()
+        # Shopee entries only. The file is shared with the extension, which walks
+        # both marketplaces; this path has a Shopee adapter and nothing else, and
+        # handing it a Tokopedia slug would scrape a Shopee shop of that name if
+        # one happened to exist and fail confusingly if it did not.
+        entries = load_shop_entries(stores_file) if stores_file else load_shop_entries()
+        targets = [
+            entry.slug for entry in entries if entry.marketplace is Marketplace.SHOPEE
+        ]
 
     targets = dedupe([target for target in targets if target])
     if not targets:
