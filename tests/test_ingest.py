@@ -1029,3 +1029,69 @@ def test_named_extension_is_allowed_across_origins(settings, monkeypatch) -> Non
 
     assert allowed.headers["access-control-allow-origin"] == origin
     assert "access-control-allow-origin" not in {k.lower() for k in other.headers}
+
+
+# ----------------------------------------------------------------------
+# GET /shops — the list the extension's batch run walks
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture()
+def shop_list_client(settings, monkeypatch, tmp_path):
+    """A client whose `/shops` reads a file this test controls."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("INGEST_TOKEN", "test-token")
+    path = tmp_path / "stores.txt"
+    settings = settings.model_copy(update={"stores_file": path})
+    app = build_app(settings, service=RecordingService())
+    return TestClient(app), path
+
+
+def test_shops_needs_a_token(shop_list_client) -> None:
+    """The list says which shops this user watches. That is not public."""
+    http, path = shop_list_client
+    path.write_text("shopee/erigostore\n", encoding="utf-8")
+
+    assert http.get("/shops").status_code == 401
+
+
+def test_shops_returns_the_file_in_order(shop_list_client) -> None:
+    http, path = shop_list_client
+    path.write_text(
+        "# watched\nshopee/erigostore\ntokopedia/eiger-official\n", encoding="utf-8"
+    )
+
+    response = http.get("/shops", headers={"X-Ingest-Token": "test-token"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["shops"] == [
+        {"marketplace": "shopee", "slug": "erigostore"},
+        {"marketplace": "tokopedia", "slug": "eiger-official"},
+    ]
+    assert body["count"] == 2
+
+
+def test_a_missing_list_is_an_empty_list_not_an_error(shop_list_client) -> None:
+    """"No shops chosen yet" is a state the popup can explain. A 404 is not."""
+    http, _path = shop_list_client
+
+    response = http.get("/shops", headers={"X-Ingest-Token": "test-token"})
+
+    assert response.status_code == 200
+    assert response.json()["shops"] == []
+    assert "stores.txt" in response.json()["detail"]
+
+
+def test_the_file_is_re_read_on_every_request(shop_list_client) -> None:
+    """Editing the list must not need a server restart — `stale` in /health is
+    this project's memory of what caching a file on disk costs."""
+    http, path = shop_list_client
+    headers = {"X-Ingest-Token": "test-token"}
+    path.write_text("shopee/erigostore\n", encoding="utf-8")
+    assert http.get("/shops", headers=headers).json()["count"] == 1
+
+    path.write_text("shopee/erigostore\nshopee/eigerindostore\n", encoding="utf-8")
+
+    assert http.get("/shops", headers=headers).json()["count"] == 2

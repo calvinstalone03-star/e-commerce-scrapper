@@ -111,6 +111,96 @@
         font: inherit;
         cursor: pointer;
       }
+      /* The batch button: same width as the primary one, none of its weight. */
+      #batch {
+        width: 100%;
+        margin-top: 7px;
+        padding: 7px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: transparent;
+        color: var(--fg);
+        font: inherit;
+        cursor: pointer;
+      }
+      #batch:disabled { opacity: 0.45; cursor: default; }
+      #bhint { margin-top: 4px; font-size: 11px; }
+      #bresume {
+        display: none;
+        margin-top: 9px;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+      #bresume.on { display: block; }
+      #bresume button {
+        margin-top: 6px;
+        padding: 5px 10px;
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        background: transparent;
+        color: var(--fg);
+        font: inherit;
+        cursor: pointer;
+      }
+      #bprogress {
+        display: none;
+        margin-top: 10px;
+        font-size: 11px;
+        color: var(--fg);
+        font-variant-numeric: tabular-nums;
+      }
+      #bprogress.on { display: block; }
+      #bbar {
+        height: 3px;
+        margin-top: 5px;
+        border-radius: 2px;
+        background: var(--line);
+        overflow: hidden;
+      }
+      #bbar > i {
+        display: block;
+        height: 100%;
+        width: 0%;
+        background: var(--fg);
+        transition: width 0.25s ease;
+      }
+      /* Scrolls rather than growing: twenty shops is taller than a popup, and a
+         popup that grows past the screen loses its own buttons. */
+      #blist {
+        display: none;
+        max-height: 132px;
+        overflow-y: auto;
+        margin-top: 8px;
+        font-size: 11px;
+        line-height: 1.5;
+      }
+      #blist.on { display: block; }
+      #blist div {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 1px 0;
+      }
+      #blist span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #blist span:last-child { flex: none; font-variant-numeric: tabular-nums; }
+      #blist .now { color: var(--fg); font-weight: 600; }
+      #bretry {
+        display: none;
+        width: 100%;
+        margin-top: 7px;
+        padding: 6px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: transparent;
+        color: var(--fg);
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      #bretry.on { display: block; }
       #result { margin-top: 10px; min-height: 32px; font-size: 12px; }
       .ok { color: var(--ok); }
       .bad { color: var(--bad); }
@@ -239,10 +329,33 @@
 
     <button class="primary" id="scrape">Mulai scrape</button>
 
+    <!-- The second button is deliberately quieter than the first. One shop is
+         the common thing; twenty shops is the occasional thing, and it navigates
+         the tab for however long the list takes. -->
+    <button id="batch">Scrape semua toko</button>
+    <div id="bhint" class="muted">daftar dari config/stores.txt di server ingest</div>
+
     <div id="resume">
       <span id="rtext">—</span>
       <button id="rgo">Lanjutkan</button>
     </div>
+
+    <div id="bresume">
+      <span id="brtext">—</span>
+      <button id="brgo">Lanjutkan batch</button>
+    </div>
+
+    <!-- The sweep's own line, above the shop's. Two scales of the same run:
+         which shop of twenty, and which page of that shop. -->
+    <div id="bprogress">
+      <span id="bptext">—</span>
+      <div id="bbar"><i></i></div>
+    </div>
+
+    <!-- One row per shop, filled in as the sweep goes. A list of twenty is not
+         something a single status line can report. -->
+    <div id="blist"></div>
+    <button id="bretry">Ulangi toko yang gagal</button>
 
     <div id="progress">
       <span id="ptext">—</span>

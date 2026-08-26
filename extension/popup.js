@@ -23,6 +23,10 @@ const isLocal = (endpoint) =>
   /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(String(endpoint || ''));
 
 let running = false;
+//: Whether a sweep over the whole shop list is under way. Separate from
+//: `running`, which is about the one shop being walked right now: during a
+//: sweep both are true, and between two shops only this one is.
+let sweeping = false;
 //: One pairing attempt per popup. A refused window would otherwise be retried
 //: on every re-render the pairing failure itself triggers.
 let paired = false;
@@ -34,6 +38,38 @@ let lastContext = null;
 function setResult(text, kind = 'muted') {
   $('result').textContent = text;
   $('result').className = kind;
+  // What a run said about itself, not a diagnostic. Clearing the flag is what
+  // stops the next server answer from wiping a finished run's totals.
+  delete $('result').dataset.diagnostic;
+}
+
+/**
+ * Say what is wrong with the setup, in the same place a run reports itself.
+ *
+ * Two kinds of message share one line because they are never both true and
+ * worth reading at once: a run's own result, and the reason there can be no
+ * run. The distinction is kept in a flag rather than in a second element, so
+ * that `clearDiagnostic` can retract "server tidak bisa dihubungi" without
+ * also erasing "412 produk · 88 baru" from the scrape that just finished.
+ *
+ * These two were called from `applyServer` in seven places and defined in none,
+ * which threw `ReferenceError` on the first line after every server answer —
+ * taking pairing, the token placeholder and the totals down with it. That is
+ * the "extension error" this fixes.
+ */
+function setDiagnostic(text, kind = 'muted') {
+  $('result').textContent = text;
+  $('result').className = kind;
+  $('result').dataset.diagnostic = '1';
+}
+
+function clearDiagnostic() {
+  // Only ever retracts its own message. A run's result is not this function's
+  // to erase.
+  if ($('result').dataset.diagnostic !== '1') return;
+  $('result').textContent = '';
+  $('result').className = 'muted';
+  delete $('result').dataset.diagnostic;
 }
 
 /**
@@ -85,9 +121,14 @@ function scrapeLabel(context) {
 function renderJob(job) {
   running = Boolean(job?.running);
 
-  $('scrape').textContent = running ? 'Batal' : 'Mulai scrape';
-  $('scrape').classList.toggle('stop', running);
-  for (const id of ['keyword', 'shop', 'target']) $(id).disabled = running;
+  // A sweep counts as running even in the seconds between two shops, when no
+  // job exists. Without this the button flipped back to "Mulai scrape" during
+  // every pause — and pressing it then would have started a single scrape
+  // inside a sweep, in the tab the sweep was about to navigate.
+  const busy = running || sweeping;
+  $('scrape').textContent = busy ? 'Batal' : 'Mulai scrape';
+  $('scrape').classList.toggle('stop', busy);
+  for (const id of ['keyword', 'shop', 'target']) $(id).disabled = busy;
   // Locked while a job runs, because the job's destination is fixed at its
   // start: a control that moved but changed nothing would be a lie.
   for (const id of ['dlocal', 'dneon']) $(id).disabled = running || $(id).dataset.off === '1';
@@ -173,6 +214,102 @@ function renderDestination(context) {
   $('tlabel').textContent = `isi database ${DESTINATION_LABEL[chosen] || chosen}`;
 }
 
+//: One shop's row in the sweep list: what it filed, or why it did not.
+function shopLine(result) {
+  if (!result) return '…';
+  if (!result.ok) return result.cancelled ? 'dibatalkan' : 'gagal';
+  return `${result.unique} produk`;
+}
+
+/**
+ * The sweep, drawn above the shop.
+ *
+ * Two scales of one run: which shop of twenty, and which page of that shop.
+ * The shop's own progress line is untouched — it still reports the storefront
+ * being walked right now, which during a sweep is the row highlighted here.
+ */
+function renderBatch(batch) {
+  sweeping = Boolean(batch?.running);
+
+  // Disabled rather than hidden while a run is on: a control that vanishes
+  // mid-run takes the explanation of what is happening with it.
+  $('batch').disabled = running || sweeping;
+  $('bhint').style.display = batch ? 'none' : '';
+
+  if (!batch) {
+    $('bprogress').classList.remove('on');
+    $('blist').classList.remove('on');
+    $('bretry').classList.remove('on');
+    return;
+  }
+
+  $('bprogress').classList.add('on');
+  $('blist').classList.add('on');
+
+  const done = Math.min(batch.index, batch.total);
+  const where = batch.current ? ` · ${batch.current.slug}` : '';
+  const state = batch.running ? '' : batch.cancelled ? ' · dibatalkan' : ' · selesai';
+  $('bptext').textContent =
+    `toko ${Math.min(done + (batch.running ? 1 : 0), batch.total)}/${batch.total}${where}` +
+    ` · ${batch.unique} produk${state}`;
+  $('bbar').firstElementChild.style.width = `${Math.round((done / batch.total) * 100)}%`;
+
+  // Rebuilt rather than patched: twenty rows is nothing to redraw, and a diff
+  // is one more thing that can disagree with the worker.
+  const list = $('blist');
+  list.textContent = '';
+  for (let index = 0; index < batch.total; index += 1) {
+    const result = batch.results[index];
+    const row = document.createElement('div');
+    if (batch.running && index === batch.index) row.className = 'now';
+
+    const name = document.createElement('span');
+    name.textContent =
+      index === batch.index && batch.running && batch.current
+        ? `${batch.current.marketplace}/${batch.current.slug}`
+        : result
+          ? `${result.marketplace}/${result.slug}`
+          : '—';
+    // The error is the only thing that explains a failed row, and there is no
+    // room for it inline.
+    if (result?.error) name.title = result.error;
+
+    const value = document.createElement('span');
+    value.textContent = result
+      ? shopLine(result)
+      : batch.running && index === batch.index
+        ? 'berjalan…'
+        : '';
+    if (result && !result.ok) value.className = 'bad';
+
+    row.append(name, value);
+    list.append(row);
+  }
+
+  // Offered only once the sweep has stopped: retrying while it walks would mean
+  // two sweeps in one tab.
+  $('bretry').classList.toggle('on', !batch.running && batch.failed > 0);
+  if (!batch.running && batch.failed > 0) {
+    $('bretry').textContent = `Ulangi ${batch.failed} toko yang gagal`;
+  }
+}
+
+/**
+ * Draw the run, both scales of it.
+ *
+ * The two halves read each other's flag — the shop's button says "Batal" while
+ * a sweep pauses between shops, and the sweep's button is disabled while a
+ * single shop runs — so both flags are set before either draws. Letting each
+ * function set its own on the way past left whichever ran first reading the
+ * previous message's answer.
+ */
+function renderRun(job, batch) {
+  running = Boolean(job?.running);
+  sweeping = Boolean(batch?.running);
+  renderJob(job);
+  renderBatch(batch);
+}
+
 async function refresh() {
   const context = await chrome.runtime.sendMessage({ type: 'context' });
   if (!context) return;
@@ -186,7 +323,10 @@ async function refresh() {
   } else {
     site.textContent = 'buka tab Shopee / Tokopedia';
     site.className = 'off';
-    $('scrape').disabled = true;
+    // Unless a sweep is running: then this button is the only way to stop it,
+    // and a sweep opens its own tab, so the tab in front of the user says
+    // nothing about whether it can be cancelled.
+    $('scrape').disabled = !context.batch?.running;
   }
 
   // Pre-fill from the tab: if the user is already looking at a search or a
@@ -228,8 +368,21 @@ async function refresh() {
     $('resume').classList.remove('on');
   }
 
-  renderJob(context.job);
-  // After renderJob, which owns the running/cancel state and would otherwise
+  // An interrupted sweep, offered rather than continued: it navigates the tab
+  // through however many storefronts are left, and that is not something to
+  // start because someone opened the popup.
+  if (context.batchResume && !context.batch?.running) {
+    const next = context.batchResume.next;
+    $('brtext').textContent =
+      `Batch berhenti di toko ${context.batchResume.index + 1}/${context.batchResume.total}` +
+      ` (${next.marketplace}/${next.slug}).`;
+    $('bresume').classList.add('on');
+  } else {
+    $('bresume').classList.remove('on');
+  }
+
+  renderRun(context.job, context.batch);
+  // After renderRun, which owns the running/cancel state and would otherwise
   // overwrite the label with the generic one.
   $('scrape').textContent = scrapeLabel(context);
 }
@@ -251,9 +404,11 @@ async function start() {
 }
 
 // One button, two jobs: the same click that starts a scrape stops it. Anything
-// else needs a second control that is disabled 95% of the time.
+// else needs a second control that is disabled 95% of the time. During a sweep
+// the same click stops the sweep — the worker decides which, because it is the
+// one that knows what is running.
 $('scrape').addEventListener('click', () => {
-  if (running) {
+  if (running || sweeping) {
     chrome.runtime.sendMessage({ type: 'cancel' });
   } else {
     start();
@@ -301,6 +456,33 @@ for (const id of ['dlocal', 'dneon']) {
     refresh();
   });
 }
+
+// The whole list, from the server, in one press. The keyword and shop boxes are
+// not read: a sweep walks the shops the list names, and letting a stale box
+// filter twenty catalogues would be a filter nobody could see they had set.
+$('batch').addEventListener('click', async () => {
+  const target = Number($('target').value) || 2000;
+  setResult('mengambil daftar toko…');
+  const answer = await chrome.runtime.sendMessage({ type: 'startBatch', target });
+  if (!answer?.ok) {
+    setResult(answer?.error || 'gagal memulai batch', 'bad');
+    return;
+  }
+  setResult(`batch dimulai — ${answer.count} toko`, 'muted');
+});
+
+$('brgo').addEventListener('click', async () => {
+  $('bresume').classList.remove('on');
+  setResult('melanjutkan batch…');
+  const answer = await chrome.runtime.sendMessage({ type: 'resumeBatch' });
+  if (!answer?.ok) setResult(answer?.error || 'gagal melanjutkan batch', 'bad');
+});
+
+$('bretry').addEventListener('click', async () => {
+  setResult('mengulang toko yang gagal…');
+  const answer = await chrome.runtime.sendMessage({ type: 'retryFailed' });
+  if (!answer?.ok) setResult(answer?.error || 'gagal mengulang', 'bad');
+});
 
 $('gear').addEventListener('click', () => {
   $('settings').classList.toggle('open');
@@ -361,18 +543,18 @@ async function applyServer(state) {
   // developer could fill. The server answers while its pairing window is open;
   // when it refuses it says why, and that sentence is more useful than an empty
   // field. Guarded so a closed window cannot loop: one attempt per popup.
-  if (!state.hasToken && state.pairing && !paired) {
+  if (!context.hasToken && state.pairing && !paired) {
     paired = true;
     const answer = await chrome.runtime.sendMessage({ type: 'pair' });
     if (answer?.ok) return refresh();
     setDiagnostic(answer?.error || 'gagal mengambil token');
-  } else if (!state.hasToken && !state.pairing) {
+  } else if (!context.hasToken && !state.pairing) {
     // Two different servers, two different answers. Loopback can hand the token
     // over by itself and just refused, so `pair` is the fix; a hosted server
     // never will, and telling that user to run a command they do not have is
     // how a working install looks broken.
     setDiagnostic(
-      isLocal(state.endpoint)
+      isLocal(context.endpoint)
         ? 'extension belum berpasangan — jalankan `ecom-scraper pair`, lalu buka popup ini lagi'
         : 'belum ada token — ambil di halaman Panduan dashboard, lalu tempel lewat ikon ⚙',
     );
@@ -407,13 +589,13 @@ async function applyServer(state) {
     if (!$('result').textContent) {
       if (!state.serverUp) {
         setDiagnostic(
-          isLocal(state.endpoint)
+          isLocal(context.endpoint)
             ? 'server ingest tidak bisa dihubungi — jalankan: ecom-scraper serve'
-            : `tidak bisa menghubungi ${state.endpoint}`,
+            : `tidak bisa menghubungi ${context.endpoint}`,
         );
       } else if (state.statsStatus === 401) {
         setDiagnostic(
-          isLocal(state.endpoint)
+          isLocal(context.endpoint)
             ? 'token ingest belum ada atau ditolak — jalankan: ecom-scraper pair, lalu buka popup ini lagi'
             : 'token ingest belum ada atau ditolak — ambil di halaman Panduan dashboard, lalu tempel lewat ikon ⚙',
         );
@@ -435,10 +617,11 @@ chrome.runtime.onMessage.addListener((message) => {
     return;
   }
   if (message?.type !== 'progress') return;
-  renderJob(message.job);
+  renderRun(message.job, message.batch);
   // The totals only move when a page has been filed, so refreshing them per
-  // page is enough and keeps the popup off the server between pages.
-  if (!message.job?.running) refresh();
+  // page is enough and keeps the popup off the server between pages. During a
+  // sweep the gap between two shops is the same moment for the same reason.
+  if (!message.job?.running && !message.batch?.running) refresh();
 });
 
 refresh();

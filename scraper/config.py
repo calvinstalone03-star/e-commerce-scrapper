@@ -145,6 +145,13 @@ class Settings(BaseSettings):
         "*cookies*.json — point this somewhere else and it is on you to add that "
         "path to .gitignore too.",
     )
+    stores_file: Path = Field(
+        default=DEFAULT_STORES_FILE,
+        description="The shop list `--mode store` and the extension's batch run both "
+        "walk. A relative path is resolved against the repository root rather than "
+        "the working directory: the ingest server is started by launchd and by "
+        "Vercel, neither of which runs it from the checkout.",
+    )
     neon_database_url: str | None = Field(
         default=None,
         # repr=False for the same reason as database_url: it embeds a password.

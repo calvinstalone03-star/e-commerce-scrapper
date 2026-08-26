@@ -970,3 +970,30 @@ export async function getFilterOptions(): Promise<FilterOptions> {
     priceRange: { min: range[0]?.min ?? null, max: range[0]?.max ?? null },
   });
 }
+
+/**
+ * Every shop the database knows, as the extension would have to navigate to it.
+ *
+ * Not `getStores`: that one paginates and aggregates for a table, and an export
+ * wants all the rows and only two columns. Ordered by product count so the
+ * shops with the most behind them sit at the top — the list is meant to be
+ * trimmed from the bottom, and the bottom is where the shop one scrape saw once
+ * ends up.
+ */
+export async function getStoresForExport(): Promise<
+  Array<{ marketplace: string; username: string }>
+> {
+  const rows = await sql`
+    SELECT s.marketplace, s.username, count(p.id) AS "productCount"
+    FROM stores s
+    LEFT JOIN products p ON p.shop_ref = s.id
+    WHERE s.username <> ''
+    GROUP BY s.id
+    ORDER BY "productCount" DESC, s.username ASC
+  `;
+
+  return rows.map((row) => ({
+    marketplace: String(row.marketplace),
+    username: String(row.username),
+  }));
+}

@@ -34,6 +34,13 @@
       label: 'Shopee',
       hosts: ['shopee.co.id'],
 
+      //: Where a tab opened for this site starts. Only the batch run needs it:
+      //: it may have to open a tab of its own, and a tab created on the new-tab
+      //: page carries none of the site's cookies until it navigates. Every
+      //: storefront visit navigates to an absolute URL anyway, so this is a
+      //: starting point rather than a destination.
+      homeUrl: 'https://shopee.co.id/',
+
       //: Hosts a *listing* can live on, matched exactly — not `hosts`, which
       //: matches subdomains so the extension activates on any of them.
       //: See the Tokopedia entry for what that difference cost.
@@ -166,6 +173,9 @@
       label: 'Tokopedia',
       hosts: ['tokopedia.com', 'www.tokopedia.com'],
 
+      //: See the Shopee entry.
+      homeUrl: 'https://www.tokopedia.com/',
+
       //: Storefront hosts only, and exactly. `hosts` matches any subdomain,
       //: which is right for deciding "is this a Tokopedia tab" and wrong for
       //: deciding "is this link a product": `seller.tokopedia.com/edu/
@@ -291,6 +301,15 @@
     );
   }
 
+  //: The other direction: a marketplace named rather than a tab observed. A
+  //: single scrape reads its site off the tab the user is looking at, and has
+  //: no need for this; a batch run is handed `shopee/erigostore` by the server
+  //: and has no tab to read — it navigates one *to* the site instead.
+  function siteForMarketplace(name) {
+    const wanted = String(name || '').toLowerCase();
+    return SITES.find((site) => site.marketplace === wanted) || null;
+  }
+
   //: Query parameters each marketplace puts the search term in. Same list as
   //: scraper/ingest.py's `_SEARCH_PARAMS` — the server is still the one that
   //: records the keyword, this copy only lets the popup pre-fill and lets a
@@ -346,5 +365,6 @@
   globalThis.ecomShopSlugs = shopSlugsFor;
   globalThis.ECOM_SITES = SITES;
   globalThis.ecomSiteForHost = siteForHost;
+  globalThis.ecomSiteFor = siteForMarketplace;
   globalThis.ecomKeywordFromUrl = keywordFromUrl;
 })();

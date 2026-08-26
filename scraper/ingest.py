@@ -1009,6 +1009,50 @@ def build_app(
         log.info("paired an extension over loopback")
         return {"token": token, "targets": {name: chosen is not None for name, chosen in services.items()}}
 
+    @app.get("/shops")
+    def shops(x_ingest_token: str | None = Header(default=None)) -> dict[str, Any]:
+        """The shop list the extension's batch run walks, from ``config/stores.txt``.
+
+        Behind the token, unlike ``/health``: which shops someone watches is a
+        statement about their business, and the file is the one place that
+        statement is written down.
+
+        Read on every request rather than cached. The list is twenty lines, and
+        this project has already paid for the other choice once — see ``stale``
+        in ``/health``, which exists because a long-lived process serving what it
+        read at startup makes an edit look like it did nothing.
+
+        A missing file answers 200 with an empty list. "No shops chosen yet" is a
+        real state with a real next step, and the popup can say it; a 404 would
+        read as "this server is too old to know about /shops", which is a
+        different problem with a different fix.
+        """
+        _authorise(x_ingest_token)
+        from scraper.shops import load_shop_entries, resolve_stores_path
+
+        path = resolve_stores_path(settings.stores_file)
+        try:
+            entries = load_shop_entries(path)
+        except FileNotFoundError:
+            return {
+                "shops": [],
+                "count": 0,
+                "source": str(settings.stores_file),
+                "detail": (
+                    f"{settings.stores_file} tidak ada. Unduh daftar toko dari "
+                    "halaman Toko di dashboard, simpan ke config/stores.txt."
+                ),
+            }
+
+        return {
+            "shops": [
+                {"marketplace": entry.marketplace.value, "slug": entry.slug}
+                for entry in entries
+            ],
+            "count": len(entries),
+            "source": str(settings.stores_file),
+        }
+
     @app.post("/ingest")
     def ingest(
         body: dict[str, Any] = Body(...),
