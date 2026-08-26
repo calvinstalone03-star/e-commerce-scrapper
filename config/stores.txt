@@ -1,5 +1,29 @@
-# One Shopee shop username per line (the slug in https://shopee.co.id/<username>).
-# Blank lines and lines starting with # are ignored.
-# Used by `ecom-scraper run --mode store --stores-file config/stores.txt`
-erigostore
-eigerindostore
+# Daftar toko, diekspor dari dashboard pada 2026-08-26.
+# 20 toko dari database.
+#
+# Simpan file ini sebagai config/stores.txt di folder ecom-scraper.
+# Hapus baris toko yang tidak ingin dipantau — daftar inilah yang dijalankan
+# tombol "Scrape semua toko" di extension, dari atas ke bawah.
+#
+# Format: marketplace/slug. Baris tanpa marketplace dianggap Shopee.
+# Baris kosong dan baris diawali # diabaikan.
+tokopedia/menta-hobbies
+shopee/inspoint
+tokopedia/inspoint
+shopee/i_bricks
+tokopedia/i-bricks
+shopee/cupliss.kelapagading
+tokopedia/kenjiro13
+shopee/lego.indonesia
+tokopedia/brickzproject
+tokopedia/luxasia-lego-auth-distributor
+tokopedia/cupliss
+shopee/brickzproject
+shopee/kaveshop
+tokopedia/kaveshop
+shopee/kenjiro_13
+tokopedia/toyskingdom
+shopee/kidzstationofficial
+shopee/toyskingdomofficial
+shopee/menta.toys
+tokopedia/menta-toys
