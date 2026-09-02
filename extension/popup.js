@@ -215,10 +215,20 @@ function renderDestination(context) {
 }
 
 //: One shop's row in the sweep list: what it filed, or why it did not.
+//: What ended a shop's walk, for the row that reports it. Only the two answers
+//: a reader has to act on are spelled out: a shop that ran out is the whole
+//: shop and needs nothing, and a shop that hit the page ceiling is the one to
+//: run again. Reaching the target says itself — the number is right there.
+const ENDED_LABEL = {
+  exhausted: 'semua produk',
+  budget: 'batas halaman',
+};
+
 function shopLine(result) {
   if (!result) return '…';
   if (!result.ok) return result.cancelled ? 'dibatalkan' : 'gagal';
-  return `${result.unique} produk`;
+  const why = ENDED_LABEL[result.ended];
+  return why ? `${result.unique} produk · ${why}` : `${result.unique} produk`;
 }
 
 /**
