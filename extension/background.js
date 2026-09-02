@@ -222,6 +222,16 @@ function newJob(keyword, target, mode, shopInput) {
     unchanged: 0,
     skipped: 0,
     status: 'menyiapkan…',
+    // Why the walk stopped, once it has: 'target' (the number asked for was
+    // reached), 'exhausted' (the shop ran out of products first), 'budget' (the
+    // page ceiling was hit with neither of those true). Null while running, and
+    // for a run that ended on `error` or a cancel — those say it themselves.
+    //
+    // The number alone cannot say this. A sweep asked for 2,000 products a shop
+    // and a row reading "250 produk" is either a shop with 250 products or a
+    // walk that stopped early for a reason nobody was told, and those want
+    // different reactions from whoever reads the list.
+    ended: null,
     error: null,
   };
 }
@@ -509,6 +519,17 @@ const SHOP_MAJORITY = 0.6;
 //: miss this is not lost: the run falls back to the shop's full grid.
 const PROBE_WAIT_MS = 9_000;
 
+//: Cards enough to settle which shop a storefront is. The probe wants an
+//: identity — a name, a username, and on Shopee a numeric id read off the
+//: product links — and the first handful of cards carries all three.
+const SHOP_PROBE_ENOUGH = 8;
+
+//: How long the scrolling second pass over a storefront waits for its first
+//: card. Short on purpose: the pass before it already spent the full card
+//: timeout on the same page, so anything still missing is behind the scroll
+//: rather than behind the network.
+const SHOP_PROBE_WAIT_MS = 3_000;
+
 //: Products read beyond the number asked for. Both sites repeat listings
 //: between pages and sprinkle sponsored rows, so a page that holds exactly the
 //: remaining count usually yields slightly fewer once deduplicated.
@@ -565,7 +586,29 @@ async function openShopGrid(tabId, site, slug) {
     if (!navigated.ok) return null;
   }
 
-  const page = await scrapeTab(tabId, { autoScroll: false });
+  let page = await scrapeTab(tabId, { autoScroll: false });
+
+  // An empty first pass is not proof the slug is wrong. Shopee's storefront
+  // opens on its home tab, where the shop's own grid sits under the banners and
+  // vouchers and renders only once it is scrolled near — so a shop that is
+  // plainly open reads as zero cards, `resolveShop` runs out of candidates, and
+  // the run reports "toko tidak ditemukan" for a link that was correct all
+  // along. Tokopedia does not show this: the same call lands on `/<slug>/product`,
+  // which is the grid itself.
+  //
+  // So scroll once before believing it. Only the identity is wanted here, hence
+  // the handful of cards rather than a catalogue, and only a short wait for the
+  // first one: the pass above already spent the full card timeout on this very
+  // page, and what this adds is the scrolling, not more waiting.
+  if (page?.ok && !page.items.length) {
+    setStatus(`menggulir toko ${slug}…`);
+    page = await scrapeTab(tabId, {
+      autoScroll: true,
+      enough: SHOP_PROBE_ENOUGH,
+      waitMs: SHOP_PROBE_WAIT_MS,
+    });
+  }
+
   return page?.ok && page.items.length ? { page, url } : null;
 }
 
@@ -1051,7 +1094,10 @@ async function runJob(tabId, site, resume = null) {
     if (job.mode !== 'page') await saveResume({ shop, template, tokens, seen });
 
     if (job.mode === 'page') break; // a single page is the whole job
-    if (job.unique >= job.target) break;
+    if (job.unique >= job.target) {
+      job.ended = 'target';
+      break;
+    }
 
     // Nothing at all on the very first page is a broken run, not the end of the
     // results — say so rather than quietly walking further pages of the same
@@ -1061,13 +1107,34 @@ async function runJob(tabId, site, resume = null) {
       break;
     }
 
-    // A page with nothing new twice running is the end of the results: both
-    // sites keep serving pages past the last real one, filled with the same
-    // recommendations.
+    // A page past the first with no cards on it at all is the end of the
+    // catalogue, and one of them is proof enough: the content script does not
+    // answer zero until it has waited the full card timeout, so this is an
+    // empty page rather than a slow one. Confirming it with a second load —
+    // another navigation, another scroll budget — is the better part of half a
+    // minute spent per shop learning what this page already said.
+    if (!page.items.length) {
+      job.ended = 'exhausted';
+      break;
+    }
+
+    // A page that has cards but nothing new needs the second look, because that
+    // is what the far end of both sites looks like: they keep serving pages past
+    // the last real one, filled with the same recommendations.
     barrenPages = fresh.length ? 0 : barrenPages + 1;
-    if (barrenPages >= 2) break;
+    if (barrenPages >= 2) {
+      job.ended = 'exhausted';
+      break;
+    }
 
     await sleep(PAGE_DELAY_MS + Math.random() * PAGE_JITTER_MS);
+  }
+
+  // Ran to the page ceiling with the target unmet and nothing wrong: a shop
+  // bigger than `pageBudget` allowed for. Worth distinguishing from a shop that
+  // ran out, because the answer to it is a second run rather than a shrug.
+  if (!job.ended && !job.error && !job.cancelled && job.mode !== 'page') {
+    job.ended = 'budget';
   }
 }
 
@@ -1146,7 +1213,13 @@ async function beginJob({ keyword, shop, target }, { site, tabId, resume = null 
       job.error = String(err?.message || err);
     } finally {
       job.running = false;
-      job.status = job.cancelled ? 'dibatalkan' : 'selesai';
+      job.status = job.cancelled
+        ? 'dibatalkan'
+        : job.ended === 'exhausted'
+          ? 'selesai — semua produk toko ini'
+          : job.ended === 'budget'
+            ? 'selesai — berhenti di batas halaman'
+            : 'selesai';
       // A run that reached its target or ran out of results has nowhere left to
       // continue from. One that stopped on an error or a cancel does, and that
       // is exactly when the saved place earns its keep.

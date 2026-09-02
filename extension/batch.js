@@ -130,6 +130,10 @@
         filtered: job?.filtered || 0,
         pages: job?.pagesDone || 0,
         cancelled: Boolean(job?.cancelled),
+        // Why this shop's walk stopped. A sweep asks every shop for the same
+        // number, so most rows come back under it — and without this the list
+        // cannot tell "that is the whole shop" from "it stopped early".
+        ended: job?.ended || null,
         error: job?.error || null,
       };
     }

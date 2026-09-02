@@ -44,7 +44,13 @@ function loadFactory() {
       running: boolean;
       index: number;
       total: number;
-      results: Array<{ slug: string; ok: boolean; unique: number; error: string | null }>;
+      results: Array<{
+      slug: string;
+      ok: boolean;
+      unique: number;
+      ended: string | null;
+      error: string | null;
+    }>;
       failed: number;
       unique: number;
     } | null;
@@ -181,6 +187,36 @@ describe.runIf(existsSync(SOURCE))('extension batch queue', () => {
       ok: false,
       error: 'tab ditutup',
     });
+  });
+
+  test('why a shop stopped short of the target is carried onto its row', async () => {
+    // Every shop is asked for the same number, so most rows come back under it.
+    // "250 produk" alone cannot say whether that is the whole shop or a walk
+    // that gave up, and those want different reactions from the reader.
+    const short = buildHarness({
+      run: async ({ slug }) =>
+        slug === 'dua'
+          ? job({ unique: 250, ended: 'exhausted' })
+          : job({ unique: 2_000, ended: 'target' }),
+    });
+
+    await short.runner.start({ target: 2_000 });
+    await settle();
+
+    expect(short.runner.snapshot()?.results.map((result) => result.ended)).toEqual([
+      'target',
+      'exhausted',
+      'target',
+    ]);
+  });
+
+  test('a shop whose worker says nothing about why it stopped reads as null', async () => {
+    // An older worker, or a run that ended on an error: the row says the count
+    // and nothing more, rather than inventing a reason for it.
+    await harness.runner.start({ target: 100 });
+    await settle();
+
+    expect(harness.runner.snapshot()?.results[0].ended).toBeNull();
   });
 
   test('totals across the sweep are summed, not the last shop only', async () => {
