@@ -105,8 +105,15 @@ function pageBudget(target) {
 
 //: Pause between page loads. A person clicking through results does not do it in
 //: 200ms, and neither should this.
-const PAGE_DELAY_MS = 1_200;
-const PAGE_JITTER_MS = 1_500;
+//:
+//: 0.6–1.5s, down from 1.2–2.7s. The sweep of 2026-09-01 walked 495 pages, so
+//: the old pause alone was about sixteen minutes of a seventy-seven minute run
+//: — a fifth of it spent asleep. Halved deliberately and with the risk named:
+//: this pause is the only thing that makes the request pattern look like a
+//: person reading a catalogue, and Shopee's refusal costs far more than the
+//: eight minutes it buys back. Raise it again at the first sign of one.
+const PAGE_DELAY_MS = 600;
+const PAGE_JITTER_MS = 900;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -555,6 +562,20 @@ function belongsToShop(items, shopKey) {
   return mine >= Math.max(1, items.length * SHOP_MAJORITY);
 }
 
+/**
+ * Visit a storefront and read enough of it to say which shop it is.
+ *
+ * @returns `{ ok: true, page, url }`, or `{ ok: false, error }` where `error` is
+ *   the reason the visit failed and `null` means the plainest one: the page
+ *   answered, and had no products on it.
+ *
+ *   The distinction is the whole point of the return shape. This used to answer
+ *   `null` for every failure alike, so a storefront that never became ready —
+ *   Shopee behind a CAPTCHA or a login wall, a redirect to an address that is
+ *   not the one asked for — came out of `resolveShop` looking exactly like a
+ *   slug that names no shop, and the run told the user their link was wrong when
+ *   the link was fine.
+ */
 async function openShopGrid(tabId, site, slug) {
   // Read, but do not walk. This visit exists to answer three questions — is
   // this slug a shop, what is its numeric id, what is it called — and all three
@@ -583,7 +604,7 @@ async function openShopGrid(tabId, site, slug) {
     url = current;
   } else {
     const navigated = await navigateAndWait(tabId, url);
-    if (!navigated.ok) return null;
+    if (!navigated.ok) return { ok: false, error: navigated.error };
   }
 
   let page = await scrapeTab(tabId, { autoScroll: false });
@@ -609,7 +630,11 @@ async function openShopGrid(tabId, site, slug) {
     });
   }
 
-  return page?.ok && page.items.length ? { page, url } : null;
+  // A page that could not be read at all states why; a page that was read and
+  // held nothing has nothing to add beyond that, and says so with a null reason.
+  if (!page?.ok) return { ok: false, error: page?.error || 'halaman tidak bisa dibaca' };
+  if (!page.items.length) return { ok: false, error: null };
+  return { ok: true, page, url };
 }
 
 async function shopCatalogue(tabId, grid) {
@@ -734,6 +759,15 @@ async function searchInsideShop(tabId, keyword) {
   return null;
 }
 
+/**
+ * Which shop these candidate slugs name, and where its products are listed.
+ *
+ * @returns `{ ok: true, shop, page, template, searched }`, or `{ ok: false,
+ *   error }`. A null `error` means every candidate was tried and none held
+ *   products — the answer the "tempel URL tokonya" message is written for.
+ *   Anything else is why the last candidate could not be read, kept verbatim so
+ *   a storefront behind a CAPTCHA is not reported as a slug that names no shop.
+ */
 async function resolveShop(tabId, site, slugs) {
   // Two questions, in order: which storefront is this, and does that shop have
   // a searchable route.
@@ -761,8 +795,13 @@ async function resolveShop(tabId, site, slugs) {
   // product name works over the full grid just the same, only across more pages.
   // Reporting "shop not found" for a shop that is visibly open was the more
   // confusing of the two failures.
+  // Why the last candidate failed, when it failed for something other than
+  // holding no products. Kept across the loop so a display name that expanded
+  // into three guesses still reports the refusal rather than the guessing.
+  let reason = null;
+
   for (const slug of slugs) {
-    if (job.cancelled) return null;
+    if (job.cancelled) return { ok: false, error: null };
 
     // Tokopedia keys its shop search on the slug the user already gave, so the
     // storefront visit is skipped there and the search is asked for directly —
@@ -774,7 +813,10 @@ async function resolveShop(tabId, site, slugs) {
     if (!job.keyword || site.shopSearchNeedsShopKey || site.searchInsideShopPage) {
       setStatus(`membuka toko ${slug}…`);
       grid = await openShopGrid(tabId, site, slug);
-      if (!grid) continue;
+      if (!grid.ok) {
+        reason = grid.error || reason;
+        continue;
+      }
       shop = {
         slug,
         shopKey: grid.page.shop?.shopKey || dominantShopKey(grid.page.items),
@@ -789,6 +831,7 @@ async function resolveShop(tabId, site, slugs) {
         setStatus(`membuka daftar produk ${slug}…`);
         const catalogue = await shopCatalogue(tabId, grid);
         return {
+          ok: true,
           shop: { ...shop, name: shop.name || catalogue.page.shop?.name || null },
           searched: false,
           ...catalogue,
@@ -803,7 +846,7 @@ async function resolveShop(tabId, site, slugs) {
     if (!attempts.length) continue;
 
     for (const attempt of attempts) {
-      if (job.cancelled) return null;
+      if (job.cancelled) return { ok: false, error: null };
       setStatus(`mencari "${job.keyword}" di ${slug}…`);
 
       let url;
@@ -835,6 +878,7 @@ async function resolveShop(tabId, site, slugs) {
       // A search route that is itself a shop page — Tokopedia's — states the
       // shop, and that is better than the slug this started from.
       return {
+        ok: true,
         shop: {
           ...shop,
           shopKey: shop.shopKey || page.shop?.shopKey || dominantShopKey(page.items),
@@ -852,7 +896,10 @@ async function resolveShop(tabId, site, slugs) {
     if (!grid) {
       setStatus(`membuka toko ${slug}…`);
       grid = await openShopGrid(tabId, site, slug);
-      if (!grid) continue;
+      if (!grid.ok) {
+        reason = grid.error || reason;
+        continue;
+      }
       shop = {
         slug,
         shopKey: grid.page.shop?.shopKey || dominantShopKey(grid.page.items),
@@ -864,12 +911,14 @@ async function resolveShop(tabId, site, slugs) {
     setStatus(`membuka daftar produk ${slug}…`);
     const catalogue = await shopCatalogue(tabId, grid);
     return {
+      ok: true,
       shop: { ...shop, name: shop.name || catalogue.page.shop?.name || null },
       searched: false,
       ...catalogue,
     };
   }
-  return null;
+
+  return { ok: false, error: reason };
 }
 
 //: Where an interrupted job leaves its place. A run of 1600 products is the
@@ -965,10 +1014,16 @@ async function runJob(tabId, site, resume = null) {
   } else if (job.mode === 'shop') {
     const slugs = globalThis.ecomShopSlugs(site, job.shopInput);
     const resolved = await resolveShop(tabId, site, slugs);
-    if (!resolved) {
+    if (!resolved.ok) {
+      // The storefront's own reason wins where there is one. "Tidak ditemukan"
+      // is the answer to a slug that names nothing, and printing it over a
+      // CAPTCHA or a page that never became ready sent the user to check a link
+      // that was correct — the one failure this run reports that they cannot
+      // act on, because it describes the wrong problem.
       job.error = job.cancelled
         ? null
-        : `toko "${job.shopInput}" tidak ditemukan atau tidak punya produk — tempel URL tokonya`;
+        : resolved.error ||
+          `toko "${job.shopInput}" tidak ditemukan atau tidak punya produk — tempel URL tokonya`;
       return;
     }
     shop = resolved.shop;
